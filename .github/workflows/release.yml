@@ -26,16 +26,16 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: '20.20.2'
 
       # Run semantic-release directly instead of the third-party
       # cycjimmy/semantic-release-action wrapper. Top-level packages are
@@ -107,17 +107,14 @@ jobs:
             goarch: amd64
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.25'
-
-      - name: Prepare embedded config
-        run: cp .plumber.yaml internal/defaultconfig/default.yaml
+          go-version: '1.25.11'
 
       - name: Build binary
         env:
@@ -164,7 +161,7 @@ jobs:
 
       - name: Attest build provenance
         id: attest
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: dist/plumber-*
 
@@ -205,25 +202,33 @@ jobs:
     if: needs.release.outputs.new_release_published == 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          # The action defaults to the mutable :latest tag for this
+          # privileged image; pin it by digest.
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          # The docker-container driver otherwise boots the mutable
+          # moby/buildkit:buildx-stable-1 tag; pin it by digest.
+          driver-opts: image=docker.io/moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
 
       - name: Login to Docker Hub
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: getplumber/plumber
           tags: |
@@ -232,20 +237,37 @@ jobs:
             type=semver,pattern={{major}},value=${{ needs.release.outputs.new_release_version }}
             type=raw,value=latest
 
+      # Same timestamp format as the release binaries' BUILD_DATE above.
+      - name: Compute build date
+        id: build_date
+        run: echo "date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         id: push
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Stamp version metadata into the binary (Dockerfile ARGs feeding
+          # -X ldflags on cmd/version.go); without these the image reports
+          # "plumber version dev" (getplumber/plumber#425).
+          build-args: |
+            VERSION=${{ needs.release.outputs.new_release_version }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.build_date.outputs.date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Always rebuild the `runtime` stage so `apk upgrade` re-runs and pulls
+          # current OS security fixes; the cached `builder` stage keeps Go builds
+          # fast. Without this the runtime layer is restored from gha cache release
+          # after release and ships stale openssl/curl/git.
+          no-cache-filters: runtime
 
       - name: Attest Docker image
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: docker.io/getplumber/plumber
           subject-digest: ${{ steps.push.outputs.digest }}
@@ -274,7 +296,7 @@ jobs:
           echo "linux_amd64=$(grep 'plumber-linux-amd64$' checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
 
       - name: Checkout Homebrew tap
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: getplumber/homebrew-plumber
           path: homebrew-tap
@@ -296,7 +318,7 @@ jobs:
           # frozen_string_literal: true
 
           class Plumber < Formula
-            desc "CI/CD compliance scanner for GitLab pipelines"
+            desc "CI/CD security scanner for GitLab and GitHub pipelines"
             homepage "https://getplumber.io"
             version "VERSION_PLACEHOLDER"
             license "MPL-2.0"
@@ -366,7 +388,7 @@ jobs:
           # frozen_string_literal: true
 
           class PlumberAT${VERSION_UNDERSCORE} < Formula
-            desc "CI/CD compliance scanner for GitLab pipelines"
+            desc "CI/CD security scanner for GitLab and GitHub pipelines"
             homepage "https://getplumber.io"
             version "${VERSION}"
             license "MPL-2.0"
@@ -451,17 +473,22 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
       - name: Checkout main
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
           fetch-tags: true
-          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
 
+      # The app token is supplied at push time through a credential helper
+      # that reads it from the step env (same pattern as the homebrew job):
+      # .git/config only ever stores the literal helper script, never the
+      # token, so no credential outlives this step.
       - name: Pin README SHA and template image digest
         env:
           VERSION: ${{ needs.release.outputs.new_release_version }}
           DIGEST: ${{ needs.docker.outputs.digest }}
+          RELEASE_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           # The release tag points at the chore(release) commit; pin to it so
@@ -474,6 +501,22 @@ jobs:
           fi
           git config user.name "plumber-release-bot[bot]"
           git config user.email "plumber-release-bot[bot]@users.noreply.github.com"
+          git config credential.helper '!f() { echo "username=x-access-token"; echo "password=${RELEASE_APP_TOKEN}"; }; f'
           git add README.md templates/plumber.yml
           git commit -m "ci(release): pin v${VERSION} refs [skip ci]"
           git push origin HEAD:main
+
+  propagate:
+    name: Propagate Release
+    needs: [release, docker, upload-release, pin-refs]
+    if: needs.release.outputs.new_release_published == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/propagate.yml
+    with:
+      version: ${{ needs.release.outputs.new_release_version }}
+      digest: ${{ needs.docker.outputs.digest }}
+    secrets:
+      GITLAB_COMPONENT_TOKEN: ${{ secrets.GITLAB_COMPONENT_TOKEN }}
+      RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+      RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}

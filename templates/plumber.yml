@@ -24,21 +24,27 @@ spec:
       default: $CI_CONFIG_PATH
 
     # Control configuration
-    # Default conf can be found at https://gitlab.com/getplumber/plumber/-/blob/main/.plumber.yaml
-    # Priority: 1) config_file input (if set), 2) .plumber.yaml in repo (if exists), 3) default config
+    # Default conf can be found at https://gitlab.com/getplumber/plumber/-/blob/main/defaultConfig/.plumber.yaml
+    # Priority: 1) config_file input (if set), 2) .plumber.yaml in repo (if present), 3) the default config embedded in the binary
     config_file:
-      description: Path to Plumber config file (relative to repo root). If not set, local `.plumber.yaml` if present, then global config `/.plumber.yaml` if present, then default plumber config.
+      description: Path to Plumber config file (relative to repo root). If not set, uses the repo's `.plumber.yaml` when present, otherwise the default config embedded in the binary.
       default: ""
 
-    # Compliance configuration
+    # Gate configuration
+    min_points:
+      description: "Minimum Plumber Score points required to pass (0-100). Default: 100 — any finding fails, same as the previous default behavior. Leave empty to keep the default."
+      default: ""
+    min_score:
+      description: "Minimum Plumber Score letter required to pass (A-E), e.g. B fails on C, D, E. When set without min_points, the letter alone gates."
+      default: ""
     threshold:
-      description: Minimum compliance percentage required to pass (0-100)
+      description: "Deprecated: minimum percentage of passing controls (0-100). Use min_points / min_score to gate on the Plumber Score instead. The default (100) is equivalent to the default score gate and is treated as unset."
       type: number
       default: 100
 
     # Output configuration
     print_output:
-      description: Print text output to stdout
+      description: Print the human-readable analysis report in the job log. Does not affect log verbosity (see verbose) or file outputs (output_file, sarif_file, ...).
       type: boolean
       default: true
     output_file:
@@ -60,17 +66,17 @@ spec:
       default: .pre
     image:
       description: "Docker image to use for the job"
-      default: "getplumber/plumber@sha256:7eb046fed07e1b3fcd9b9e6b2aa789d41b32c054554b4861a569e282ab5396e9" #v0.3.72
+      default: "getplumber/plumber@sha256:de2ce9f239f2069ecb97be599abffd0a2fbbccd89a4e40d5061f31d9bcddd6fc" #v0.4.51
     allow_failure:
       description: Allow the job to fail without failing the pipeline
       default: false
       type: boolean
     verbose:
-      description: Enable verbose/debug output for troubleshooting
+      description: Enable debug logging (level=debug lines on stderr) for troubleshooting. Independent of print_output, which controls the report.
       default: false
       type: boolean
     mr_comment:
-      description: Post/update a compliance summary comment on the merge request (requires api scope on the token)
+      description: Post/update a Plumber summary comment on the merge request (requires api scope on the token)
       default: false
       type: boolean
     badge:
@@ -85,6 +91,16 @@ spec:
       description: "Add the full points breakdown table to stdout and the MR comment (the score banner is shown by default)"
       default: false
       type: boolean
+    score_push:
+      description: "Publish this repo's Plumber Score to the hosted badge service (score.getplumber.io). Uses CI-native OIDC (no secret needed)."
+      default: false
+      type: boolean
+    score_endpoint:
+      description: "Score service base URL. Override only for a self-hosted score service; the OIDC audience follows this value so it always matches the target."
+      default: "https://score.getplumber.io"
+    platform:
+      description: "Plumber platform base URL. Setting it pushes this run's full results there over CI OIDC, and takes precedence over score_push. The default is a placeholder (RFC 2606 .invalid) that never enables a push — GitLab requires the id_tokens audience to be non-empty, so this input cannot default to empty."
+      default: "https://platform.invalid"
     controls:
       description: Run only listed controls (comma-separated control names). Cannot be used with skip_controls.
       default: ""
@@ -99,7 +115,7 @@ spec:
 ---
 
 # Plumber Component
-# Analyzes GitLab CI/CD pipelines for compliance issues
+# Analyzes GitLab CI/CD pipelines for security issues
 #
 # Prerequisites:
 #   1. Create a GitLab token (PAT or Project/Group Access Token) with:
@@ -111,29 +127,29 @@ spec:
 # Configuration file priority:
 #   1. If config_file input is set → uses $CI_PROJECT_DIR/<config_file>
 #   2. If .plumber.yaml exists in repo root → uses $CI_PROJECT_DIR/.plumber.yaml
-#   3. Otherwise → uses default config embedded in the container
+#   3. Otherwise → uses the default config embedded in the binary
 #
 # Usage in .gitlab-ci.yml:
 #   include:
-#     - component: gitlab.com/getplumber/plumber/plumber@~latest
+#     - component: gitlab.com/getplumber/plumber/plumber@<version>
 #
 # With custom config file:
 #   include:
-#     - component: gitlab.com/getplumber/plumber/plumber@v0.3.4
+#     - component: gitlab.com/getplumber/plumber/plumber@<version>
 #       inputs:
 #         config_file: "configs/my-plumber.yaml"  # relative to repo root
 #
 # With a custom CI configuration file path (or override $CI_CONFIG_PATH in project CI/CD variables):
 #   include:
-#     - component: gitlab.com/getplumber/plumber/plumber@v0.3.4
+#     - component: gitlab.com/getplumber/plumber/plumber@<version>
 #       inputs:
 #         ci_config_path: "my-custom-ci.yml"
 #
 # With other custom inputs:
 #   include:
-#     - component: gitlab.com/getplumber/plumber/plumber@v0.3.4
+#     - component: gitlab.com/getplumber/plumber/plumber@<version>
 #       inputs:
-#         threshold: 80
+#         min_points: 80
 #         output_file: results.json
 #         gitlab_token: $MY_CUSTOM_TOKEN_VAR
 
@@ -142,6 +158,21 @@ spec:
   image:
     name: $[[ inputs.image ]]
     entrypoint: [""]  # Override ENTRYPOINT to allow shell script execution
+  id_tokens:
+    # OIDC id-token for the Plumber Score push. The audience MUST equal the
+    # score service URL (the service validates `aud`), so it follows the
+    # score_endpoint input. Minted regardless of score_push so enabling the
+    # push is a one-line change; the CLI only uses it when push is on.
+    PLUMBER_ANALYZE_SCORE_TOKEN:
+      aud: $[[ inputs.score_endpoint ]]
+    # OIDC id-token for the platform push. Audience MUST equal the platform
+    # URL (the platform validates `aud`), so it follows the platform input.
+    # Minted on every run, matching the score token above, using the same
+    # `platform` input that also carries the sentinel default — the CLI
+    # decides whether to push, not this block. The CLI treats the literal
+    # value "https://platform.invalid" as "not configured" and skips the push.
+    PLUMBER_ANALYZE_PLATFORM_TOKEN:
+      aud: $[[ inputs.platform ]]
   variables:
     # Use intermediate variable to avoid self-reference when default is $GITLAB_TOKEN
     # GITLAB_TOKEN is exported in script (not here) to avoid a circular variable
@@ -152,6 +183,8 @@ spec:
     PLUMBER_ANALYZE_GITLAB_URL: $[[ inputs.server_url ]]
     PLUMBER_ANALYZE_PROJECT: $[[ inputs.project_path ]]
     PLUMBER_ANALYZE_BRANCH: $[[ inputs.branch ]]
+    PLUMBER_ANALYZE_MIN_POINTS: $[[ inputs.min_points ]]
+    PLUMBER_ANALYZE_MIN_SCORE: $[[ inputs.min_score ]]
     PLUMBER_ANALYZE_THRESHOLD: $[[ inputs.threshold ]]
     PLUMBER_ANALYZE_PRINT: $[[ inputs.print_output ]]
     PLUMBER_ANALYZE_OUTPUT: $[[ inputs.output_file ]]
@@ -162,6 +195,13 @@ spec:
     PLUMBER_ANALYZE_BADGE: $[[ inputs.badge ]]
     PLUMBER_ANALYZE_SCORE: $[[ inputs.score ]]
     PLUMBER_ANALYZE_SCORE_POINT: $[[ inputs.score_point ]]
+    PLUMBER_ANALYZE_SCORE_PUSH: $[[ inputs.score_push ]]
+    PLUMBER_ANALYZE_SCORE_ENDPOINT: $[[ inputs.score_endpoint ]]
+    # Non-empty (the sentinel default) on every run; the CLI is the one that
+    # decides whether that constitutes "configured" (see platformSentinelURL
+    # in cmd/platform_push.go), so this passthrough alone never turns the push
+    # on for everyone.
+    PLUMBER_ANALYZE_PLATFORM: $[[ inputs.platform ]]
     PLUMBER_ANALYZE_CONTROLS: $[[ inputs.controls ]]
     PLUMBER_ANALYZE_SKIP_CONTROLS: $[[ inputs.skip_controls ]]
     PLUMBER_ANALYZE_FAIL_WARNINGS: $[[ inputs.fail_warnings ]]
@@ -172,6 +212,11 @@ spec:
     # already expanded to the real token value, avoiding the circular reference
     # that occurs if GITLAB_TOKEN is set from $PLUMBER_TOKEN in variables.
     - export GITLAB_TOKEN="$PLUMBER_TOKEN"
+    # threshold is deprecated; its typed default (100) is exactly equivalent
+    # to the default score gate (min-points 100), so treat it as unset. Only
+    # a custom threshold reaches the CLI (and triggers the deprecation
+    # warning there).
+    - if [ "${PLUMBER_ANALYZE_THRESHOLD:-}" = "100" ]; then unset PLUMBER_ANALYZE_THRESHOLD; fi
     - plumber analyze
   artifacts:
     paths:

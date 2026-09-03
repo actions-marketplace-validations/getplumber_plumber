@@ -1,13 +1,28 @@
 package configuration
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
+	"strings"
 
+	defaultconfig "github.com/getplumber/plumber/defaultConfig"
+	"github.com/getplumber/plumber/utils"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
+
+// ErrConfigNotFound is returned (wrapped) by LoadPlumberConfig when the config
+// file does not exist. Callers that fall back to the embedded default on a
+// missing file test for it with errors.Is, rather than substring-matching the
+// error text, so a reworded message can never silently break the fallback.
+var ErrConfigNotFound = errors.New("config file not found")
+
+// maxConfigFileBytes bounds a .plumber.yaml read. The config is read from the
+// analyzed repository, so its size is not trusted.
+const maxConfigFileBytes = 2 << 20 // 2 MiB
 
 // validControlSchema maps each known control name to its valid sub-keys.
 // When adding a new control, add its entry here to enable validation.
@@ -16,12 +31,38 @@ var validControlSchema = map[string][]string{
 		"enabled", "tags", "containerImagesMustBePinnedByDigest",
 	},
 	"containerImageMustComeFromAuthorizedSources": {
-		"enabled", "trustedUrls", "trustDockerHubOfficialImages",
+		"enabled", "trustedUrls", "trustDockerHubOfficialImages", "includePlumberDefaults",
 	},
 	"branchMustBeProtected": {
 		"enabled", "namePatterns", "defaultMustBeProtected",
 		"allowForcePush", "codeOwnerApprovalRequired",
 		"minMergeAccessLevel", "minPushAccessLevel",
+	},
+	"mergeRequestApprovalRulesMustRequireMinimumApprovals": {
+		"enabled", "minimumRequiredApprovals",
+	},
+	"mergeRequestApprovalRulesMustCoverAllProtectedBranches": {
+		"enabled",
+	},
+	"mergeRequestApprovalSettingsMustBeCompliant": {
+		"enabled", "preventApprovalByAuthor", "preventApprovalsByCommitters",
+		"preventEditingApprovalRulesInMR", "requireReAuthToApprove",
+		"behaviorWhenCommitIsAdded",
+	},
+	"mergeRequestSettingsMustBeCompliant": {
+		"enabled", "mergeMethod", "squashOption", "mergePipelinesEnabled",
+		"mergeTrainsEnabled", "allowMergeOnSkippedPipeline",
+		"resolveOutdatedDiffDiscussions", "printingMergeRequestLinkEnabled",
+		"removeSourceBranchAfterMerge",
+	},
+	"cicdVariablesMustBeProtected": {
+		"enabled",
+	},
+	"cicdVariablesMustBeMasked": {
+		"enabled",
+	},
+	"projectMustHaveSecurityPolicySource": {
+		"enabled", "expectedProjectId", "expectedProjectPath",
 	},
 	"pipelineMustNotIncludeHardcodedJobs": {
 		"enabled",
@@ -64,9 +105,12 @@ var validControlSchema = map[string][]string{
 		"enabled", "trustedOwners",
 	},
 	"githubActionMustComeFromAuthorizedSources": {
-		"enabled", "trustGithubOfficialActions", "trustSameOrgActions", "minimumStars", "trustedGithubActions",
+		"enabled", "trustGithubOfficialActions", "trustSameOrgActions", "minimumStars", "trustedGithubActions", "includePlumberDefaults",
 	},
 	"workflowMustNotInjectUserInputInScripts": {
+		"enabled",
+	},
+	"workflowMustNotWriteUntrustedContentToGitHubEnv": {
 		"enabled",
 	},
 	"workflowMustNotUseDangerousTriggers": {
@@ -75,10 +119,16 @@ var validControlSchema = map[string][]string{
 	"pullRequestTargetMustNotCheckoutHead": {
 		"enabled",
 	},
+	"checkoutMustNotPersistCredentials": {
+		"enabled",
+	},
 	"workflowsMustDeclarePermissions": {
 		"enabled",
 	},
 	"reusableWorkflowsMustNotInheritSecrets": {
+		"enabled",
+	},
+	"workflowMustNotExportEntireSecretsContext": {
 		"enabled",
 	},
 	"workflowMustNotGrantPermissionsWriteAll": {
@@ -87,14 +137,20 @@ var validControlSchema = map[string][]string{
 	"actionsMustNotBeArchived": {
 		"enabled",
 	},
+	"actionRefsMustExistUpstream": {
+		"enabled",
+	},
 	"actionsMustNotCarryKnownCVEs": {
 		"enabled",
 	},
+	"actionsMustNotExecuteMutableRemoteCode": {
+		"enabled",
+	},
+	"releaseWorkflowsMustNotRestoreUntrustedCache": {
+		"enabled", "publishActions", "cacheActions", "publishScriptPatterns", "publishScriptExcludePatterns", "allowedJobs",
+	},
 	"workflowMustIncludeRequiredActions": {
 		"enabled", "required", "requiredGroups",
-	},
-	"pipelineMustNotLeakSecretsInConfig": {
-		"enabled", "gitleaksPath", "gitleaksConfigPath",
 	},
 }
 
@@ -145,6 +201,12 @@ type PlumberConfig struct {
 	// Missing version is tolerated and treated as legacy.
 	Version string `yaml:"version,omitempty"`
 
+	// Extends selects overlay mode. The only supported value is
+	// "plumber:default": the file is then a sparse overlay merged onto
+	// the embedded baseline. Absent (the default) keeps legacy full
+	// replace behavior. See configuration/resolve.go.
+	Extends string `yaml:"extends,omitempty"`
+
 	// GitLab provider section (v2 schema). Holds GitLab-specific auth,
 	// the enabledControls allowlist, and the per-control configuration map.
 	GitLab *ProviderConfig `yaml:"gitlab,omitempty"`
@@ -156,7 +218,23 @@ type PlumberConfig struct {
 	// After a v2 load this is the zero value; after a v1 load convertV1ToV2
 	// moves these into GitLab.Controls and clears this field.
 	Controls ControlsConfig `yaml:"controls,omitempty"`
+
+	// Raw is the verbatim text of the config that produced this run, captured
+	// at load. The self-describing `plumberConfig` block in the JSON report
+	// parses it into a structured object (the verbatim text is never shipped).
+	// Not serialized into the config itself.
+	Raw string `yaml:"-"`
+	// Source is the path the config was loaded from, or "default" when no
+	// file was present and the embedded default was used. Not serialized.
+	Source string `yaml:"-"`
 }
+
+// DefaultScoreEndpoint is the built-in hosted Plumber Score badge service.
+// A self-hosted score service is selected with the --score-endpoint flag /
+// PLUMBER_ANALYZE_SCORE_ENDPOINT env (surfaced by the CI integration input),
+// not from the config file; the OIDC audience the CLI mints then follows that
+// value.
+const DefaultScoreEndpoint = "https://score.getplumber.io"
 
 // ProviderConfig is the per-provider configuration block introduced in
 // schema v2. One instance per provider section in .plumber.yaml.
@@ -211,6 +289,46 @@ type ControlsConfig struct {
 	// BranchMustBeProtected control configuration
 	BranchMustBeProtected *BranchProtectionControlConfig `yaml:"branchMustBeProtected,omitempty"`
 
+	// MergeRequestApprovalRulesMustRequireMinimumApprovals control
+	// configuration (GitLab only). Flags approval rules covering all
+	// protected branches that require fewer approvals than the configured
+	// minimum (ISSUE-502).
+	MergeRequestApprovalRulesMustRequireMinimumApprovals *MRApprovalRulesMinApprovalsControlConfig `yaml:"mergeRequestApprovalRulesMustRequireMinimumApprovals,omitempty"`
+
+	// MergeRequestApprovalRulesMustCoverAllProtectedBranches control
+	// configuration (GitLab only). Flags a project where no approval rule
+	// applies to all protected branches (ISSUE-504). Config-free beyond
+	// `enabled`.
+	MergeRequestApprovalRulesMustCoverAllProtectedBranches *EnabledOnlyControlConfig `yaml:"mergeRequestApprovalRulesMustCoverAllProtectedBranches,omitempty"`
+
+	// CicdVariablesMustBeProtected control configuration (GitLab only).
+	// Flags project CI/CD settings variables that are not marked
+	// protected, so they are exposed to pipelines running on unprotected
+	// branches (ISSUE-201). Config-free; toggle via `enabled`.
+	CicdVariablesMustBeProtected *EnabledOnlyControlConfig `yaml:"cicdVariablesMustBeProtected,omitempty"`
+
+	// CicdVariablesMustBeMasked control configuration (GitLab only).
+	// Flags project CI/CD settings variables that are not masked, so
+	// their values print verbatim in every job log a project member can
+	// read (ISSUE-202). Config-free; toggle via `enabled`.
+	CicdVariablesMustBeMasked *EnabledOnlyControlConfig `yaml:"cicdVariablesMustBeMasked,omitempty"`
+
+	// MergeRequestApprovalSettingsMustBeCompliant control configuration
+	// (GitLab only). Checks the project's merge-request approval settings
+	// against per-setting optional expectations (ISSUE-503).
+	MergeRequestApprovalSettingsMustBeCompliant *MRApprovalSettingsControlConfig `yaml:"mergeRequestApprovalSettingsMustBeCompliant,omitempty"`
+
+	// MergeRequestSettingsMustBeCompliant control configuration (GitLab only).
+	// Checks the project's merge-request/merge settings (merge method, squash,
+	// merge trains, source-branch removal, etc.) against per-setting optional
+	// expectations for exact equality (ISSUE-506).
+	MergeRequestSettingsMustBeCompliant *MRSettingsControlConfig `yaml:"mergeRequestSettingsMustBeCompliant,omitempty"`
+
+	// ProjectMustHaveSecurityPolicySource control configuration (GitLab only).
+	// Requires the project to link the expected GitLab security policy project
+	// (ISSUE-601). Requires GitLab Ultimate.
+	ProjectMustHaveSecurityPolicySource *SecurityPolicyControlConfig `yaml:"projectMustHaveSecurityPolicySource,omitempty"`
+
 	// PipelineMustNotIncludeHardcodedJobs control configuration
 	PipelineMustNotIncludeHardcodedJobs *HardcodedJobsControlConfig `yaml:"pipelineMustNotIncludeHardcodedJobs,omitempty"`
 
@@ -236,9 +354,6 @@ type ControlsConfig struct {
 
 	// PipelineMustNotEnableDebugTrace control configuration
 	PipelineMustNotEnableDebugTrace *DebugTraceControlConfig `yaml:"pipelineMustNotEnableDebugTrace,omitempty"`
-
-	// PipelineMustNotLeakSecretsInConfig control configuration
-	PipelineMustNotLeakSecretsInConfig *SecretDetectionControlConfig `yaml:"pipelineMustNotLeakSecretsInConfig,omitempty"`
 
 	// PipelineMustNotUseUnsafeVariableExpansion control configuration
 	PipelineMustNotUseUnsafeVariableExpansion *VariableInjectionControlConfig `yaml:"pipelineMustNotUseUnsafeVariableExpansion,omitempty"`
@@ -268,6 +383,10 @@ type ControlsConfig struct {
 	// Config-free; toggle via `enabled`.
 	WorkflowMustNotInjectUserInputInScripts *EnabledOnlyControlConfig `yaml:"workflowMustNotInjectUserInputInScripts,omitempty"`
 
+	// WorkflowMustNotWriteUntrustedContentToGitHubEnv control configuration (GitHub Actions only).
+	// Config-free; toggle via `enabled`.
+	WorkflowMustNotWriteUntrustedContentToGitHubEnv *EnabledOnlyControlConfig `yaml:"workflowMustNotWriteUntrustedContentToGitHubEnv,omitempty"`
+
 	// WorkflowMustNotUseDangerousTriggers control configuration (GitHub Actions only).
 	// Config-free; toggle via `enabled`.
 	WorkflowMustNotUseDangerousTriggers *EnabledOnlyControlConfig `yaml:"workflowMustNotUseDangerousTriggers,omitempty"`
@@ -279,6 +398,13 @@ type ControlsConfig struct {
 	// Config-free; toggle via `enabled`.
 	PullRequestTargetMustNotCheckoutHead *EnabledOnlyControlConfig `yaml:"pullRequestTargetMustNotCheckoutHead,omitempty"`
 
+	// CheckoutMustNotPersistCredentials control configuration (GitHub
+	// Actions only). Flags an `actions/checkout` step that omits
+	// `persist-credentials: false`, leaving the GITHUB_TOKEN in
+	// `.git/config` where a later step can exfiltrate it.
+	// Config-free; toggle via `enabled`.
+	CheckoutMustNotPersistCredentials *EnabledOnlyControlConfig `yaml:"checkoutMustNotPersistCredentials,omitempty"`
+
 	// WorkflowsMustDeclarePermissions control configuration (GitHub Actions only).
 	// Config-free; toggle via `enabled`.
 	WorkflowsMustDeclarePermissions *EnabledOnlyControlConfig `yaml:"workflowsMustDeclarePermissions,omitempty"`
@@ -286,6 +412,12 @@ type ControlsConfig struct {
 	// ReusableWorkflowsMustNotInheritSecrets control configuration (GitHub Actions only).
 	// Config-free; toggle via `enabled`.
 	ReusableWorkflowsMustNotInheritSecrets *EnabledOnlyControlConfig `yaml:"reusableWorkflowsMustNotInheritSecrets,omitempty"`
+
+	// WorkflowMustNotExportEntireSecretsContext control configuration (GitHub Actions only).
+	// Flags a job that serialises the whole `secrets` context via toJson(secrets)
+	// into a run script, env binding, or action `with:` input. Config-free; toggle
+	// via `enabled`.
+	WorkflowMustNotExportEntireSecretsContext *EnabledOnlyControlConfig `yaml:"workflowMustNotExportEntireSecretsContext,omitempty"`
 
 	// WorkflowMustNotGrantPermissionsWriteAll control configuration (GitHub
 	// Actions only). Flags workflows or jobs whose effective `permissions:`
@@ -301,6 +433,15 @@ type ControlsConfig struct {
 	// collect time. Config-free; toggle via `enabled`.
 	ActionsMustNotBeArchived *EnabledOnlyControlConfig `yaml:"actionsMustNotBeArchived,omitempty"`
 
+	// ActionRefsMustExistUpstream control configuration (GitHub Actions
+	// only). Flags `uses: owner/repo@<sha>` references pinned to a 40-char
+	// commit SHA that the upstream repository confirms does not exist — a
+	// typo or an impostor-commit attack. Fires only on a definitive 404
+	// from a readable repo; a SHA that could not be verified stays silent.
+	// Driven by per-action API metadata enriched at collect time.
+	// Config-free; toggle via `enabled`.
+	ActionRefsMustExistUpstream *EnabledOnlyControlConfig `yaml:"actionRefsMustExistUpstream,omitempty"`
+
 	// ActionsMustNotCarryKnownCVEs control configuration (GitHub Actions
 	// only). Flags `uses: owner/repo@ref` references whose upstream
 	// repository carries at least one published advisory in GitHub's
@@ -308,6 +449,20 @@ type ControlsConfig struct {
 	// action API metadata enriched at collect time. Config-free; toggle
 	// via `enabled`.
 	ActionsMustNotCarryKnownCVEs *EnabledOnlyControlConfig `yaml:"actionsMustNotCarryKnownCVEs,omitempty"`
+
+	// ActionsMustNotExecuteMutableRemoteCode control configuration (GitHub
+	// Actions only). Flags a third-party action whose own source fetches
+	// and executes a script from a moving ref at runtime, so a SHA pin on
+	// the action does not make its execution immutable. Driven by the
+	// collector's per-action source analysis. Config-free; toggle via
+	// `enabled`.
+	ActionsMustNotExecuteMutableRemoteCode *EnabledOnlyControlConfig `yaml:"actionsMustNotExecuteMutableRemoteCode,omitempty"`
+
+	// ReleaseWorkflowsMustNotRestoreUntrustedCache control configuration (GitHub
+	// Actions only). Flags a release/publish job that restores a build cache
+	// whose key is not scoped to the release ref, so a PR-populated cache can be
+	// injected into the published output. Config-free; toggle via `enabled`.
+	ReleaseWorkflowsMustNotRestoreUntrustedCache *CachePoisoningControlConfig `yaml:"releaseWorkflowsMustNotRestoreUntrustedCache,omitempty"`
 
 	// WorkflowMustIncludeRequiredActions control configuration (GitHub
 	// Actions only). The GitHub counterpart of
@@ -326,6 +481,37 @@ type ControlsConfig struct {
 // drops their findings via FilterFindingsByEnabledControls.
 type EnabledOnlyControlConfig struct {
 	Enabled *bool `yaml:"enabled,omitempty"`
+}
+
+// SecurityPolicyControlConfig configures the GitLab security-policy-project
+// linkage check (ISSUE-601). GitLab-only, requires Ultimate. When
+// ExpectedProjectId is set, the linked policy project must be exactly that
+// project. When it is unset, any linked policy project passes and the control
+// fails only when none is linked.
+type SecurityPolicyControlConfig struct {
+	// Enabled controls whether this check runs.
+	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// ExpectedProjectId is the numeric GitLab project ID the security policy
+	// project must match. Unset => require only that some policy project is
+	// linked.
+	ExpectedProjectId *int `yaml:"expectedProjectId,omitempty"`
+
+	// ExpectedProjectPath is the full path (namespace/project) the linked
+	// security policy project must match — a human-friendly alternative to the
+	// numeric ID, compared case-insensitively. Ignored when ExpectedProjectId is
+	// also set (the ID is authoritative). Unset (and no ID) => require only that
+	// some policy project is linked.
+	ExpectedProjectPath *string `yaml:"expectedProjectPath,omitempty"`
+}
+
+// IsEnabled reports whether the control is enabled. Returns false when the
+// wrapper or the field is nil — same convention as every other IsEnabled().
+func (c *SecurityPolicyControlConfig) IsEnabled() bool {
+	if c == nil || c.Enabled == nil {
+		return false
+	}
+	return *c.Enabled
 }
 
 // IsEnabled reports whether the control is enabled. Returns false when
@@ -355,6 +541,74 @@ type ActionsPinnedByShaControlConfig struct {
 
 // IsEnabled returns whether the control is enabled
 func (c *ActionsPinnedByShaControlConfig) IsEnabled() bool {
+	if c == nil || c.Enabled == nil {
+		return false
+	}
+	return *c.Enabled
+}
+
+// CachePoisoningControlConfig configures the release cache-poisoning
+// check (ISSUE-705). The action and script INVENTORIES are configurable
+// so an org can add its own publish actions, cache actions, or publish
+// commands without a plumber release. The built-in cache SEMANTICS
+// (which setup-* actions cache by default vs on opt-in, and the
+// github.ref* scope tokens) stay in code — that is GitHub behaviour, not
+// org policy.
+type CachePoisoningControlConfig struct {
+	// Enabled controls whether this check runs.
+	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// PublishActions are `uses:` owner/repo prefixes that mark a job as
+	// release intent (running one restores into a published build).
+	PublishActions []string `yaml:"publishActions,omitempty"`
+
+	// CacheActions is the full inventory of cache-restoring actions with
+	// their per-action semantics. The rego is a pure engine over this
+	// list — nothing about which actions cache (or how) is hardcoded.
+	CacheActions []CacheActionSpec `yaml:"cacheActions,omitempty"`
+
+	// PublishScriptPatterns are regexes matched against `run:` scripts to
+	// mark a job as release intent (e.g. `cargo publish`).
+	PublishScriptPatterns []string `yaml:"publishScriptPatterns,omitempty"`
+
+	// PublishScriptExcludePatterns are regexes that veto a
+	// PublishScriptPatterns match on the same `run:` block —
+	// verification-only forms that never publish (e.g.
+	// `npm publish --dry-run`, gradle `publishToMavenLocal`).
+	PublishScriptExcludePatterns []string `yaml:"publishScriptExcludePatterns,omitempty"`
+
+	// AllowedJobs are glob patterns matched against the namespaced job
+	// name (`<workflow>/<job>`). A job that matches is exempt from this
+	// control — the escape hatch for reviewed/accepted release jobs.
+	AllowedJobs []string `yaml:"allowedJobs,omitempty"`
+}
+
+// CacheActionSpec describes one cache-restoring action and when it
+// actually restores a cache. Mode is "always" (restores whenever
+// present), "default" (restores unless DisableInput holds DisableValue),
+// or "opt-in" (restores only when EnableInput names a manager).
+type CacheActionSpec struct {
+	// Action is the `uses:` owner/repo prefix (e.g. "actions/setup-go").
+	Action string `yaml:"action"`
+	// Mode is "always", "default", or "opt-in".
+	Mode string `yaml:"mode"`
+	// DisableInput / DisableValue apply to mode "default": the action's
+	// `with:` input whose value turns caching off (e.g. cache=false for
+	// setup-go, cache-disabled=true for setup-gradle).
+	DisableInput string `yaml:"disableInput,omitempty"`
+	DisableValue *bool  `yaml:"disableValue,omitempty"`
+	// EnableInput applies to mode "opt-in": the `with:` input that, when
+	// set to a package manager, turns caching on (e.g. cache=npm).
+	EnableInput string `yaml:"enableInput,omitempty"`
+	// EnableContains additionally requires EnableInput's value to contain
+	// this substring (case-insensitive) for the cache to count as active —
+	// e.g. build-push-action restores a GitHub Actions cache only when
+	// cache-from contains "type=gha".
+	EnableContains string `yaml:"enableContains,omitempty"`
+}
+
+// IsEnabled reports whether the control is enabled.
+func (c *CachePoisoningControlConfig) IsEnabled() bool {
 	if c == nil || c.Enabled == nil {
 		return false
 	}
@@ -392,6 +646,12 @@ type ActionAuthorizedSourcesControlConfig struct {
 	// Each entry is either an exact `owner/repo` (e.g. `jdx/mise-action`)
 	// or an `owner/*` wildcard trusting a whole org (e.g. `mycompany/*`).
 	TrustedGithubActions []string `yaml:"trustedGithubActions,omitempty"`
+
+	// IncludePlumberDefaults, in overlay mode (extends: plumber:default),
+	// unions Plumber's curated default trusted list with TrustedGithubActions.
+	// Defaults to true. Set false to trust only the entries listed here.
+	// Ignored in legacy (no-extends) mode.
+	IncludePlumberDefaults *bool `yaml:"includePlumberDefaults,omitempty"`
 }
 
 // IsEnabled returns whether the control is enabled
@@ -400,6 +660,15 @@ func (c *ActionAuthorizedSourcesControlConfig) IsEnabled() bool {
 		return false
 	}
 	return *c.Enabled
+}
+
+// IsIncludePlumberDefaults reports whether the curated default trusted
+// list is unioned in. Defaults to true when the config or field is nil.
+func (c *ActionAuthorizedSourcesControlConfig) IsIncludePlumberDefaults() bool {
+	if c == nil || c.IncludePlumberDefaults == nil {
+		return true
+	}
+	return *c.IncludePlumberDefaults
 }
 
 // ImageForbiddenTagsControlConfig configuration for the forbidden image tags control
@@ -433,9 +702,189 @@ type ImageAuthorizedSourcesControlConfig struct {
 
 	// TrustDockerHubOfficialImages trusts official Docker Hub images (e.g., nginx, alpine)
 	TrustDockerHubOfficialImages *bool `yaml:"trustDockerHubOfficialImages,omitempty"`
+
+	// IncludePlumberDefaults, in overlay mode (extends: plumber:default),
+	// unions Plumber's curated default trusted list with TrustedUrls.
+	// Defaults to true. Set false to trust only the entries listed here.
+	// Ignored in legacy (no-extends) mode.
+	IncludePlumberDefaults *bool `yaml:"includePlumberDefaults,omitempty"`
 }
 
 // BranchProtectionControlConfig configuration for the branch protection control
+// MRApprovalRulesMinApprovalsControlConfig configures the GitLab
+// merge-request approval-rules minimum-approvals check (ISSUE-502).
+// GitLab-only.
+type MRApprovalRulesMinApprovalsControlConfig struct {
+	// Enabled controls whether this check runs.
+	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// MinimumRequiredApprovals is the fewest approvals a rule covering all
+	// protected branches must require; a covering rule below it is flagged.
+	// When unset (nil) the control asserts nothing (treated as 0).
+	//
+	// Platform migration: this key was named minimumRequiredApprovalAllProtectedBranches
+	// on the backend2 platform. It is deliberately shortened to
+	// minimumRequiredApprovals in the CLI (the "all protected branches" scope is
+	// already implied by the control). A platform-config importer must map the
+	// old key to this one.
+	MinimumRequiredApprovals *int `yaml:"minimumRequiredApprovals,omitempty"`
+}
+
+// IsEnabled reports whether the control is enabled. Returns false when the
+// wrapper or the field is nil — same convention as every other IsEnabled().
+func (c *MRApprovalRulesMinApprovalsControlConfig) IsEnabled() bool {
+	if c == nil || c.Enabled == nil {
+		return false
+	}
+	return *c.Enabled
+}
+
+// MRApprovalSettingsControlConfig configures the GitLab merge-request
+// approval-settings check (ISSUE-503). GitLab-only. Every expectation is
+// optional: an unset field is not checked. The booleans check only when set
+// true — an explicit false is the same as unset, matching the legacy
+// platform's conf semantics (there is no "expect the unsafe setting" mode).
+type MRApprovalSettingsControlConfig struct {
+	// Enabled controls whether this check runs.
+	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// PreventApprovalByAuthor, when true, expects that MR authors cannot
+	// approve their own merge requests.
+	PreventApprovalByAuthor *bool `yaml:"preventApprovalByAuthor,omitempty"`
+
+	// PreventApprovalsByCommitters, when true, expects that users who
+	// committed to an MR cannot approve it.
+	PreventApprovalsByCommitters *bool `yaml:"preventApprovalsByCommitters,omitempty"`
+
+	// PreventEditingApprovalRulesInMR, when true, expects that approval
+	// rules cannot be overridden per merge request.
+	PreventEditingApprovalRulesInMR *bool `yaml:"preventEditingApprovalRulesInMR,omitempty"`
+
+	// RequireReAuthToApprove, when true, expects that approving requires
+	// re-authentication.
+	RequireReAuthToApprove *bool `yaml:"requireReAuthToApprove,omitempty"`
+
+	// BehaviorWhenCommitIsAdded is the MINIMUM required strictness for what
+	// happens to existing approvals when a commit is added to an open MR:
+	// "keep_approvals" < "remove_approvals_by_code_owners" <
+	// "remove_all_approvals". A project below the configured rung is
+	// flagged; any other value fails config validation.
+	BehaviorWhenCommitIsAdded *string `yaml:"behaviorWhenCommitIsAdded,omitempty"`
+}
+
+// IsEnabled reports whether the control is enabled. Returns false when the
+// wrapper or the field is nil — same convention as every other IsEnabled().
+func (c *MRApprovalSettingsControlConfig) IsEnabled() bool {
+	if c == nil || c.Enabled == nil {
+		return false
+	}
+	return *c.Enabled
+}
+
+// mrApprovalBehaviorValues are the accepted behaviorWhenCommitIsAdded
+// expectations, in strictness order. Kept in the configuration package (the
+// validation site) and mirrored by the ir.MRApprovalBehavior* constants the
+// projection emits; TestMRApprovalBehaviorValuesMatchIR pins the two lists
+// together.
+var mrApprovalBehaviorValues = []string{
+	"keep_approvals",
+	"remove_approvals_by_code_owners",
+	"remove_all_approvals",
+}
+
+// validateBehaviorWhenCommitIsAdded rejects a behaviorWhenCommitIsAdded
+// expectation outside the known ladder AT CONFIG LOAD. Load-bearing: the Rego
+// rule looks the value up in its rank map and an unknown string would make
+// that lookup undefined, silently disabling the check — a typo like
+// "keep-approvals" would read as "not checked" forever.
+func (c *MRApprovalSettingsControlConfig) validateBehaviorWhenCommitIsAdded() error {
+	if c == nil || c.BehaviorWhenCommitIsAdded == nil {
+		return nil
+	}
+	if slices.Contains(mrApprovalBehaviorValues, *c.BehaviorWhenCommitIsAdded) {
+		return nil
+	}
+	return fmt.Errorf("mergeRequestApprovalSettingsMustBeCompliant.behaviorWhenCommitIsAdded: unknown value %q (expected one of %s)",
+		*c.BehaviorWhenCommitIsAdded, strings.Join(mrApprovalBehaviorValues, ", "))
+}
+
+// MRSettingsControlConfig configures the GitLab merge-request/merge-settings
+// check (ISSUE-506). GitLab-only. Every expectation is optional: an unset field
+// is not checked, and each set field is compared against the project's actual
+// value for EXACT equality (the legacy platform compared all fields, but always
+// with a fully populated policy — optional here keeps a hand-authored YAML from
+// flagging on a field the operator never set).
+type MRSettingsControlConfig struct {
+	// Enabled controls whether this check runs.
+	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// MergeMethod is the expected merge method: "merge", "ff", or
+	// "rebase_merge". Any other value fails config validation.
+	MergeMethod *string `yaml:"mergeMethod,omitempty"`
+
+	// SquashOption is the expected squash policy: "never", "always",
+	// "default_on", or "default_off". Any other value fails config validation.
+	SquashOption *string `yaml:"squashOption,omitempty"`
+
+	// MergePipelinesEnabled is the expected merged-results-pipelines setting.
+	MergePipelinesEnabled *bool `yaml:"mergePipelinesEnabled,omitempty"`
+
+	// MergeTrainsEnabled is the expected merge-trains setting.
+	MergeTrainsEnabled *bool `yaml:"mergeTrainsEnabled,omitempty"`
+
+	// AllowMergeOnSkippedPipeline is the expected "allow merge when the
+	// pipeline is skipped" setting.
+	AllowMergeOnSkippedPipeline *bool `yaml:"allowMergeOnSkippedPipeline,omitempty"`
+
+	// ResolveOutdatedDiffDiscussions is the expected auto-resolve-outdated-
+	// discussions setting.
+	ResolveOutdatedDiffDiscussions *bool `yaml:"resolveOutdatedDiffDiscussions,omitempty"`
+
+	// PrintingMergeRequestLinkEnabled is the expected print-MR-link-on-push
+	// setting.
+	PrintingMergeRequestLinkEnabled *bool `yaml:"printingMergeRequestLinkEnabled,omitempty"`
+
+	// RemoveSourceBranchAfterMerge is the expected delete-source-branch-after-
+	// merge default.
+	RemoveSourceBranchAfterMerge *bool `yaml:"removeSourceBranchAfterMerge,omitempty"`
+}
+
+// IsEnabled reports whether the control is enabled. Returns false when the
+// wrapper or the field is nil — same convention as every other IsEnabled().
+func (c *MRSettingsControlConfig) IsEnabled() bool {
+	if c == nil || c.Enabled == nil {
+		return false
+	}
+	return *c.Enabled
+}
+
+// mrSettingsMergeMethodValues are the accepted mergeMethod expectations, and
+// mrSettingsSquashOptionValues the accepted squashOption expectations. Kept at
+// the validation site; an unknown value would make the Rego equality check
+// compare against a string GitLab never returns (always deviating), so it is
+// rejected at config load instead.
+var (
+	mrSettingsMergeMethodValues  = []string{"merge", "ff", "rebase_merge"}
+	mrSettingsSquashOptionValues = []string{"never", "always", "default_on", "default_off"}
+)
+
+// validateEnums rejects a mergeMethod or squashOption expectation outside the
+// known set AT CONFIG LOAD.
+func (c *MRSettingsControlConfig) validateEnums() error {
+	if c == nil {
+		return nil
+	}
+	if c.MergeMethod != nil && !slices.Contains(mrSettingsMergeMethodValues, *c.MergeMethod) {
+		return fmt.Errorf("mergeRequestSettingsMustBeCompliant.mergeMethod: unknown value %q (expected one of %s)",
+			*c.MergeMethod, strings.Join(mrSettingsMergeMethodValues, ", "))
+	}
+	if c.SquashOption != nil && !slices.Contains(mrSettingsSquashOptionValues, *c.SquashOption) {
+		return fmt.Errorf("mergeRequestSettingsMustBeCompliant.squashOption: unknown value %q (expected one of %s)",
+			*c.SquashOption, strings.Join(mrSettingsSquashOptionValues, ", "))
+	}
+	return nil
+}
+
 type BranchProtectionControlConfig struct {
 	// Enabled controls whether this check runs
 	Enabled *bool `yaml:"enabled,omitempty"`
@@ -590,26 +1039,6 @@ type DebugTraceControlConfig struct {
 	ForbiddenVariables []string `yaml:"forbiddenVariables,omitempty"`
 }
 
-// SecretDetectionControlConfig configuration for the pipeline secret detection control
-type SecretDetectionControlConfig struct {
-	// Enabled controls whether this check runs
-	Enabled *bool `yaml:"enabled,omitempty"`
-
-	// GitleaksPath is the path to the gitleaks binary; defaults to "gitleaks" (PATH lookup)
-	GitleaksPath string `yaml:"gitleaksPath,omitempty"`
-
-	// GitleaksConfigPath is an optional path to a custom gitleaks config file
-	GitleaksConfigPath string `yaml:"gitleaksConfigPath,omitempty"`
-}
-
-// IsEnabled reports whether the control is enabled
-func (c *SecretDetectionControlConfig) IsEnabled() bool {
-	if c == nil || c.Enabled == nil {
-		return false
-	}
-	return *c.Enabled
-}
-
 // VariableInjectionControlConfig configuration for the unsafe variable expansion control
 type VariableInjectionControlConfig struct {
 	// Enabled controls whether this check runs
@@ -750,28 +1179,64 @@ func LoadPlumberConfig(configPath string) (*PlumberConfig, string, []string, err
 	l = l.WithField("configPath", configPath)
 	l.Info("Loading configuration from file")
 
-	data, err := os.ReadFile(configPath)
+	data, err := utils.ReadFileLimit(configPath, maxConfigFileBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, configPath, nil, fmt.Errorf("config file not found: %s", configPath)
+			return nil, configPath, nil, fmt.Errorf("%w: %s", ErrConfigNotFound, configPath)
 		}
 		l.WithError(err).Error("Failed to read config file")
 		return nil, configPath, nil, err
 	}
 
+	return LoadPlumberConfigFromBytes(data, configPath)
+}
+
+// LoadPlumberConfigFromBytes parses configuration from raw bytes, recording
+// `source` as its origin — a file path when called via LoadPlumberConfig, or a
+// label such as "built-in default" when a caller falls back to the embedded
+// config. It runs the same key validation, schema migration (v1 → v2) and
+// version normalisation as loading from a file, so a fallback config is held to
+// exactly the same contract as a user-supplied one.
+func LoadPlumberConfigFromBytes(data []byte, source string) (*PlumberConfig, string, []string, error) {
+	l := logrus.WithField("action", "LoadPlumberConfigFromBytes").WithField("source", source)
+
 	warnings := ValidateKnownKeys(data)
 
-	config := &PlumberConfig{}
-	if err := yaml.Unmarshal(data, config); err != nil {
-		l.WithError(err).Error("Failed to parse config file")
-		return nil, configPath, warnings, err
+	// Resolve overlay mode (extends: plumber:default) before parsing.
+	// Legacy files with no extends pass through untouched.
+	extendsVal, extErr := detectExtends(data)
+	if extErr != nil {
+		return nil, source, warnings, extErr
 	}
+	effectiveData := data
+	isOverlay := extendsVal == ExtendsPlumberDefault
+	if isOverlay {
+		merged, err := resolveOverlayBytes(data)
+		if err != nil {
+			return nil, source, warnings, err
+		}
+		effectiveData = merged
+	}
+
+	config := &PlumberConfig{}
+	if err := yaml.Unmarshal(effectiveData, config); err != nil {
+		l.WithError(err).Error("Failed to parse config")
+		return nil, source, warnings, err
+	}
+	// Capture the verbatim config + its source so the JSON report can carry
+	// a self-describing `plumberConfig` block (what produced this grade).
+	// In overlay mode, Raw holds the resolved (merged) YAML so the report
+	// reflects what actually ran, and Extends is cleared since resolution
+	// is now complete.
+	config.Raw = string(effectiveData)
+	config.Source = source
+	config.Extends = ""
 
 	// Reject explicitly-set unsupported versions early. Empty version is
 	// allowed (legacy default behaviour) and gets a deprecation warning
 	// from convertV1ToV2. "1.0" is the legacy schema; "2.0" is current.
 	if config.Version != "" && config.Version != "1.0" && config.Version != "2.0" {
-		return nil, configPath, warnings, fmt.Errorf(
+		return nil, source, warnings, fmt.Errorf(
 			"unsupported config version %q; supported: [\"1.0\" (legacy), \"2.0\" (current)]", config.Version)
 	}
 
@@ -803,11 +1268,39 @@ func LoadPlumberConfig(configPath string) (*PlumberConfig, string, []string, err
 	}
 
 	if err := config.validate(); err != nil {
-		return nil, configPath, warnings, fmt.Errorf("configuration validation error: %w", err)
+		return nil, source, warnings, fmt.Errorf("configuration validation error: %w", err)
+	}
+
+	// Overlay mode: the merge above list-replaces (no per-element merge in
+	// deepMergeYAML), so a control's allowlist the overlay mentioned holds
+	// only the overlay's own values at this point. Materialize the real
+	// includePlumberDefaults semantics (union with the curated base list,
+	// or user-only when the toggle is false) now that config is fully
+	// built and v2-shaped. Base and overlay are re-parsed independently
+	// (not from effectiveData) so each side reflects only its own values.
+	if isOverlay {
+		baseCfg := &PlumberConfig{}
+		_ = yaml.Unmarshal(defaultconfig.Get(), baseCfg)
+		overlayCfg := &PlumberConfig{}
+		_ = yaml.Unmarshal(data, overlayCfg)
+		materializeAuthorizedSources(config, baseCfg, overlayCfg)
+
+		// config.Raw was captured above from effectiveData, i.e. before this
+		// materialize step ran. deepMergeYAML list-replaces, so at that
+		// point Raw held only the overlay's own (sparse) allowlist entries,
+		// not the union with the curated base list. Re-marshal now that the
+		// resolved struct carries the real materialized allowlists, so Raw
+		// (which feeds the audit report's self-describing `plumberConfig`
+		// block and its hash) reflects what actually ran.
+		if b, err := yaml.Marshal(config); err == nil {
+			config.Raw = string(b)
+		} else {
+			l.WithError(err).Warn("failed to re-marshal resolved config for Raw; report block may understate materialized allowlists")
+		}
 	}
 
 	l.WithField("config", config).Debug("Configuration loaded successfully")
-	return config, configPath, warnings, nil
+	return config, source, warnings, nil
 }
 
 // validate checks for configuration errors, including expression syntax
@@ -859,6 +1352,12 @@ func validateControlsConfig(c *ControlsConfig) error {
 			return err
 		}
 	}
+	if err := c.MergeRequestApprovalSettingsMustBeCompliant.validateBehaviorWhenCommitIsAdded(); err != nil {
+		return err
+	}
+	if err := c.MergeRequestSettingsMustBeCompliant.validateEnums(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -903,6 +1402,15 @@ func (c *ImageAuthorizedSourcesControlConfig) IsEnabled() bool {
 	return *c.Enabled
 }
 
+// IsIncludePlumberDefaults reports whether the curated default trusted
+// list is unioned in. Defaults to true when the config or field is nil.
+func (c *ImageAuthorizedSourcesControlConfig) IsIncludePlumberDefaults() bool {
+	if c == nil || c.IncludePlumberDefaults == nil {
+		return true
+	}
+	return *c.IncludePlumberDefaults
+}
+
 // GetBranchMustBeProtectedConfig returns the control configuration
 // Returns nil if not configured
 func (c *PlumberConfig) GetBranchMustBeProtectedConfig() *BranchProtectionControlConfig {
@@ -910,6 +1418,57 @@ func (c *PlumberConfig) GetBranchMustBeProtectedConfig() *BranchProtectionContro
 		return nil
 	}
 	return c.ControlsFor("gitlab").BranchMustBeProtected
+}
+
+func (c *PlumberConfig) GetMergeRequestApprovalRulesMustRequireMinimumApprovalsConfig() *MRApprovalRulesMinApprovalsControlConfig {
+	if c == nil {
+		return nil
+	}
+	return c.ControlsFor("gitlab").MergeRequestApprovalRulesMustRequireMinimumApprovals
+}
+
+func (c *PlumberConfig) GetMergeRequestApprovalRulesMustCoverAllProtectedBranchesConfig() *EnabledOnlyControlConfig {
+	if c == nil {
+		return nil
+	}
+	return c.ControlsFor("gitlab").MergeRequestApprovalRulesMustCoverAllProtectedBranches
+}
+
+func (c *PlumberConfig) GetCicdVariablesMustBeProtectedConfig() *EnabledOnlyControlConfig {
+	if c == nil {
+		return nil
+	}
+	return c.ControlsFor("gitlab").CicdVariablesMustBeProtected
+}
+
+func (c *PlumberConfig) GetCicdVariablesMustBeMaskedConfig() *EnabledOnlyControlConfig {
+	if c == nil {
+		return nil
+	}
+	return c.ControlsFor("gitlab").CicdVariablesMustBeMasked
+}
+
+func (c *PlumberConfig) GetMergeRequestApprovalSettingsMustBeCompliantConfig() *MRApprovalSettingsControlConfig {
+	if c == nil {
+		return nil
+	}
+	return c.ControlsFor("gitlab").MergeRequestApprovalSettingsMustBeCompliant
+}
+
+func (c *PlumberConfig) GetMergeRequestSettingsMustBeCompliantConfig() *MRSettingsControlConfig {
+	if c == nil {
+		return nil
+	}
+	return c.ControlsFor("gitlab").MergeRequestSettingsMustBeCompliant
+}
+
+// GetProjectMustHaveSecurityPolicySourceConfig returns the GitLab
+// security-policy-project linkage control configuration (ISSUE-601), or nil.
+func (c *PlumberConfig) GetProjectMustHaveSecurityPolicySourceConfig() *SecurityPolicyControlConfig {
+	if c == nil {
+		return nil
+	}
+	return c.ControlsFor("gitlab").ProjectMustHaveSecurityPolicySource
 }
 
 // IsEnabled returns whether the control is enabled
@@ -1000,16 +1559,6 @@ func (c *PlumberConfig) GetPipelineMustIncludeTemplateConfig() *RequiredTemplate
 		return nil
 	}
 	return c.ControlsFor("gitlab").PipelineMustIncludeTemplate
-}
-
-// GetPipelineMustNotLeakSecretsInConfigConfig returns the control
-// configuration for the given provider ("gitlab" or "github").
-// Returns nil if not configured.
-func (c *PlumberConfig) GetPipelineMustNotLeakSecretsInConfigConfig(provider string) *SecretDetectionControlConfig {
-	if c == nil {
-		return nil
-	}
-	return c.ControlsFor(provider).PipelineMustNotLeakSecretsInConfig
 }
 
 // GetPipelineMustNotEnableDebugTraceConfig returns the control configuration
@@ -1336,6 +1885,12 @@ func validateControlsBlock(controlsRaw interface{}, pathPrefix string) []string 
 	for keyRaw, valueRaw := range controls {
 		controlName, ok := keyRaw.(string)
 		if !ok {
+			continue
+		}
+
+		if msg, removed := removedControls[controlName]; removed {
+			warnings = append(warnings,
+				fmt.Sprintf("Control %q in %s was removed and is now ignored: %s", controlName, pathPrefix, msg))
 			continue
 		}
 

@@ -18,15 +18,10 @@ import (
 // caller skips it so we don't pollute the JSON with empty placeholder
 // blocks (the bug the GitLab-only legacyResultsByName had).
 func buildLegacyResultGitHub(e control.ControlEntry, result *control.AnalysisResult, pc *configuration.PlumberConfig, findings []opaengine.Finding) (string, any) {
-	compliance := 100.0
-	if !e.Skipped && len(findings) > 0 {
-		compliance = 0
-	}
 	common := legacyCommon{
-		Compliance: compliance,
-		CiValid:    result.CiValid,
-		CiMissing:  result.CiMissing,
-		Skipped:    e.Skipped,
+		CiValid:   result.CiValid,
+		CiMissing: result.CiMissing,
+		Skipped:   e.Skipped,
 	}
 
 	switch e.ControlName {
@@ -46,8 +41,14 @@ func buildLegacyResultGitHub(e control.ControlEntry, result *control.AnalysisRes
 		return "securityJobsWeakenedResult", buildSecurityJobsBlockGitHub(common, result, findings)
 	case "workflowMustNotInjectUserInputInScripts":
 		return "templateInjectionResult", buildTemplateInjectionBlock(common, result, findings)
+	case "workflowMustNotWriteUntrustedContentToGitHubEnv":
+		return "githubEnvInjectionResult", buildGitHubEnvInjectionBlock(common, result, findings)
+	case "workflowMustNotExportEntireSecretsContext":
+		return "overprovisionedSecretsResult", buildOverprovisionedSecretsBlock(common, result, findings)
 	case "workflowMustNotUseDangerousTriggers":
 		return "dangerousTriggersResult", buildDangerousTriggersBlock(common, result, findings)
+	case "checkoutMustNotPersistCredentials":
+		return "checkoutCredentialsResult", buildCheckoutCredentialsBlock(common, result, findings)
 	case "pullRequestTargetMustNotCheckoutHead":
 		return "pullRequestTargetHeadCheckoutResult", buildPullRequestTargetHeadCheckoutBlock(common, result, findings)
 	case "workflowsMustDeclarePermissions":
@@ -60,14 +61,18 @@ func buildLegacyResultGitHub(e control.ControlEntry, result *control.AnalysisRes
 		return "refConfusionResult", buildRefConfusionBlock(common, result, findings)
 	case "actionsMustNotBeArchived":
 		return "archivedActionsResult", buildArchivedActionsBlock(common, result, findings)
+	case "actionRefsMustExistUpstream":
+		return "impostorCommitResult", buildImpostorCommitBlock(common, result, findings)
 	case "actionsMustNotCarryKnownCVEs":
 		return "knownVulnerableActionsResult", buildKnownVulnerableActionsBlock(common, result, findings)
+	case "actionsMustNotExecuteMutableRemoteCode":
+		return "mutableRemoteExecResult", buildMutableRemoteExecBlock(common, result, findings)
+	case "releaseWorkflowsMustNotRestoreUntrustedCache":
+		return "cachePoisoningResult", buildCachePoisoningBlock(common, result, findings)
 	case "pipelineMustNotEnableDebugTrace":
 		return "debugTraceResult", buildDebugTraceBlockGitHub(common, result, findings)
 	case "pipelineMustNotExecuteUnverifiedScripts":
 		return "unverifiedScriptsResult", buildUnverifiedScriptsBlockGitHub(common, result, findings)
-	case "pipelineMustNotLeakSecretsInConfig":
-		return "leakedSecretsResult", buildLeakedSecretsBlock(common, result, findings)
 	}
 	return "", nil
 }
@@ -88,17 +93,16 @@ func statsOf(result *control.AnalysisResult) control.GitHubAnalysisStats {
 func buildActionPinningBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
 	s := statsOf(result)
 	return map[string]any{
-		"issues": projectFindings(_sortedFindings(findings), "jobName"),
+		"issues": projectFindings(_sortedFindings(findings), "job"),
 		"metrics": map[string]any{
 			"actionRefsTotal":    s.ActionRefsTotal,
 			"actionRefsUnpinned": s.ActionRefsUnpinned,
 			"actionRefsExempt":   s.ActionRefsExempt,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -131,7 +135,6 @@ func buildImageForbiddenTagsBlockGitHub(c legacyCommon, result *control.Analysis
 			"ciInvalid":          0,
 			"ciMissing":          0,
 		},
-		"compliance":           c.Compliance,
 		"version":              "0.4.0",
 		"ciValid":              c.CiValid,
 		"ciMissing":            c.CiMissing,
@@ -233,10 +236,9 @@ func buildBranchProtectionBlockGitHub(c legacyCommon, result *control.AnalysisRe
 	}
 
 	block := map[string]any{
-		"enabled":    !c.Skipped,
-		"compliance": c.Compliance,
-		"version":    "0.2.0",
-		"data":       data,
+		"enabled": !c.Skipped,
+		"version": "0.2.0",
+		"data":    data,
 		"metrics": map[string]any{
 			"branches":                   len(branches),
 			"branchesToProtect":          totalToProtect,
@@ -283,17 +285,16 @@ func buildDockerInDockerBlockGitHub(c legacyCommon, result *control.AnalysisResu
 		}
 	}
 	return map[string]any{
-		"issues": projectFindings(findings, "jobName"),
+		"issues": projectFindings(findings, "job"),
 		"metrics": map[string]any{
 			"totalJobsChecked":    s.JobsTotal,
 			"dindServicesFound":   s.JobsWithDinD,
 			"insecureDaemonFound": insecure,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -304,16 +305,15 @@ func buildDockerInDockerBlockGitHub(c legacyCommon, result *control.AnalysisResu
 func buildSecurityJobsBlockGitHub(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
 	s := statsOf(result)
 	return map[string]any{
-		"issues": projectFindings(findings, "jobName"),
+		"issues": projectFindings(findings, "job"),
 		"metrics": map[string]any{
 			"securityJobsFound": s.SecurityJobsTotal,
 			"weakenedJobs":      len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -322,16 +322,15 @@ func buildSecurityJobsBlockGitHub(c legacyCommon, result *control.AnalysisResult
 func buildReusableSecretsBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
 	s := statsOf(result)
 	return map[string]any{
-		"issues": projectFindings(findings, "jobName"),
+		"issues": projectFindings(findings, "job"),
 		"metrics": map[string]any{
 			"reusableCalls":               s.ReusableCalls,
 			"reusableCallsSecretsInherit": s.ReusableCallsSecretsInherit,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -340,36 +339,119 @@ func buildReusableSecretsBlock(c legacyCommon, result *control.AnalysisResult, f
 func buildTemplateInjectionBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
 	s := statsOf(result)
 	return map[string]any{
-		"issues": projectFindings(findings, "jobName"),
+		"issues": projectFindings(findings, "job"),
 		"metrics": map[string]any{
 			"workflowsScanned":        s.WorkflowsTotal,
 			"scriptLinesChecked":      s.ScriptLinesTotal,
 			"templateInjectionsFound": len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
+func buildGitHubEnvInjectionBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
+	s := statsOf(result)
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"workflowsScanned":         s.WorkflowsTotal,
+			"scriptLinesChecked":       s.ScriptLinesTotal,
+			"githubEnvInjectionsFound": len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
+// buildOverprovisionedSecretsBlock — ISSUE-309. One finding per job that
+// serialises the whole secrets context via toJson(secrets) into a run
+// script, env binding, or action `with:` input.
+func buildOverprovisionedSecretsBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
+	s := statsOf(result)
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"workflowsScanned":           s.WorkflowsTotal,
+			"secretsContextExportsFound": len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
+// buildCachePoisoningBlock — ISSUE-705. One finding per release/publish
+// job that restores a build cache with a key not scoped to the release ref.
+func buildCachePoisoningBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
+	s := statsOf(result)
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"workflowsScanned":          s.WorkflowsTotal,
+			"unscopedCacheRestoreFound": len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
 // buildDangerousTriggersBlock — ISSUE-802. Denominator is workflows
 // total; numerator is workflows whose trigger set intersects the
 // dangerous-triggers list.
+// buildCheckoutCredentialsBlock — ISSUE-307 / ISSUE-310. One control, two
+// codes graded by exploitability: the credential merely persisting (latent)
+// versus the credential also being packed into a downloadable artifact (a
+// demonstrable leak). The two are counted separately because a consumer
+// triaging this needs to know which of the two it has; a single total would
+// make a hygiene backlog and an exfiltrable token look alike.
+//
+// The counts come from the findings rather than from a stats field: nothing
+// in the collector counts checkout steps, and adding a stat to serve one
+// block would be plumbing for its own sake.
+func buildCheckoutCredentialsBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
+	latent, packed := 0, 0
+	for _, f := range findings {
+		switch f.Code {
+		case string(control.CodeArtipacked):
+			latent++
+		case string(control.CodeArtipackedExfiltrated):
+			packed++
+		}
+	}
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"workflowsScanned":            statsOf(result).WorkflowsTotal,
+			"checkoutsPersistingLatent":   latent,
+			"checkoutsPackedIntoArtifact": packed,
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
 func buildDangerousTriggersBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
 	s := statsOf(result)
 	return map[string]any{
-		"issues": projectFindings(findings, "jobName"),
+		"issues": projectFindings(findings, "job"),
 		"metrics": map[string]any{
 			"workflowsScanned":              s.WorkflowsTotal,
 			"workflowsWithDangerousTrigger": s.WorkflowsWithDangerousTrigger,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -383,16 +465,15 @@ func buildDangerousTriggersBlock(c legacyCommon, result *control.AnalysisResult,
 func buildPullRequestTargetHeadCheckoutBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
 	s := statsOf(result)
 	return map[string]any{
-		"issues": projectFindings(_sortedFindings(findings), "jobName"),
+		"issues": projectFindings(_sortedFindings(findings), "job"),
 		"metrics": map[string]any{
 			"workflowsScanned":           s.WorkflowsTotal,
 			"headCheckoutsUnderPrTarget": len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -401,16 +482,15 @@ func buildPullRequestTargetHeadCheckoutBlock(c legacyCommon, result *control.Ana
 func buildPermissionsBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
 	s := statsOf(result)
 	return map[string]any{
-		"issues": projectFindings(findings, "jobName"),
+		"issues": projectFindings(findings, "job"),
 		"metrics": map[string]any{
 			"workflowsTotal":              s.WorkflowsTotal,
 			"workflowsMissingPermissions": s.WorkflowsMissingPermissions,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -432,17 +512,16 @@ func buildRequiredActionsBlock(c legacyCommon, cfg *configuration.RequiredAction
 	requirementGroups, satisfied := _resolveRequiredActionGroups(groups, result)
 	return map[string]any{
 		"requirementGroups": requirementGroups,
-		"issues":            projectFindings(findings, "job"),
+		"issues":            projectFindings(findings, ""),
 		"metrics": map[string]any{
 			"totalGroups":       len(requirementGroups),
 			"satisfiedGroups":   satisfied,
 			"anySatisfiedGroup": len(requirementGroups) > 0 && satisfied > 0,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -524,11 +603,10 @@ func buildExcessivePermissionsBlock(c legacyCommon, result *control.AnalysisResu
 			"jobsTotal":        s.JobsTotal,
 			"jobsWithWriteAll": len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -550,11 +628,10 @@ func buildAuthorizedActionSourcesBlock(c legacyCommon, result *control.AnalysisR
 			"actionRefsTotal":        s.ActionRefsTotal + s.ActionRefsExempt,
 			"actionRefsUnauthorized": len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -571,11 +648,10 @@ func buildRefConfusionBlock(c legacyCommon, result *control.AnalysisResult, find
 			"actionRefsTotal":     s.ActionRefsTotal,
 			"actionRefsAmbiguous": len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -592,11 +668,53 @@ func buildArchivedActionsBlock(c legacyCommon, result *control.AnalysisResult, f
 			"actionRefsTotal":    s.ActionRefsTotal,
 			"actionRefsArchived": len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
+// buildMutableRemoteExecBlock — ISSUE-714/715/716. Surfaces each action
+// whose own source fetches and runs mutable remote code (plus the
+// producer-side self-action signal) with its code/job/uses/url, so the
+// JSON export carries the finding and its location rather than only a
+// plumberScore.codeLosses line. Denominator is the action-ref count
+// scanned; numerator is the finding count across all three tiers
+// (obfuscated / exec / unverified).
+func buildMutableRemoteExecBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
+	s := statsOf(result)
+	return map[string]any{
+		"issues": projectFindings(_sortedFindings(findings), "job"),
+		"metrics": map[string]any{
+			"actionRefsTotal":              s.ActionRefsTotal,
+			"actionsWithMutableRemoteExec": len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
+// buildImpostorCommitBlock — ISSUE-707. Denominator is the number of
+// action refs scanned (the same denominator the action-pinning block
+// uses); numerator is the finding count, one per (job, SHA) pinned to a
+// commit the upstream repo confirmed does not exist. Only a definitive
+// absence answer (404 / 422) from a readable repo reaches here — refs
+// the API could not verify never become findings (see commitResolves).
+func buildImpostorCommitBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
+	s := statsOf(result)
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"actionRefsTotal":          s.ActionRefsTotal,
+			"actionRefsAbsentUpstream": len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -621,11 +739,10 @@ func buildDebugTraceBlockGitHub(c legacyCommon, result *control.AnalysisResult, 
 			"totalVariablesChecked": total,
 			"forbiddenFound":        len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -643,11 +760,10 @@ func buildKnownVulnerableActionsBlock(c legacyCommon, result *control.AnalysisRe
 			"actionRefsTotal":      s.ActionRefsTotal,
 			"actionRefsVulnerable": len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -660,29 +776,9 @@ func buildUnverifiedScriptsBlockGitHub(c legacyCommon, result *control.AnalysisR
 			"totalScriptLinesChecked": s.ScriptLinesTotal,
 			"unverifiedScriptsFound":  len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
-	}
-}
-
-// buildLeakedSecretsBlock — ISSUE-301. Each finding is one redacted
-// gitleaks hit. There is no meaningful "X of Y" denominator (a hit is
-// either present or it isn't), so the block surfaces only the hit
-// count alongside the standard compliance fields. issues carries the
-// raw finding list including the redacted preview.
-func buildLeakedSecretsBlock(c legacyCommon, _ *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
-	return map[string]any{
-		"issues": projectFindings(findings, "file"),
-		"metrics": map[string]any{
-			"hitsFound": len(findings),
-		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }

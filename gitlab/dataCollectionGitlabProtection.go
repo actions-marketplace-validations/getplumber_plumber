@@ -1,12 +1,22 @@
 package gitlab
 
 import (
-	"strings"
+	"net/http"
 
 	"github.com/getplumber/plumber/configuration"
 	"github.com/sirupsen/logrus"
 	glab "gitlab.com/gitlab-org/api/client-go"
 )
+
+// isPremiumFeatureUnavailable reports whether an approval-rules/settings fetch
+// failed with a 403/404 — the "feature unavailable / token lacks scope" signal
+// that leaves the listing not-evaluable (never a false pass). It reads the
+// typed HTTP status the fetch surfaces, not a substring of the error string,
+// which embeds the request URL and could carry "403"/"404" spuriously (e.g. a
+// project id), so a hard 500 on such a project is not misread as premium-missing.
+func isPremiumFeatureUnavailable(status int) bool {
+	return status == http.StatusForbidden || status == http.StatusNotFound
+}
 
 const (
 	DataCollectionTypeGitlabProtectionVersion = "0.2.0"
@@ -55,12 +65,27 @@ type GitlabProtectionDataBranch struct {
 
 // GitlabProtectionAnalysisData holds all the data needed by protection controls
 type GitlabProtectionAnalysisData struct {
-	Branches           []string                    `json:"branches"`
-	BranchProtections  []BranchProtection          `json:"branchProtections"`
-	MRApprovalRules    []*glab.ProjectApprovalRule `json:"mrApprovalRules"`
-	MRApprovalSettings *glab.ProjectApprovals      `json:"mrApprovalSettings"`
-	MRSettings         *glab.Project               `json:"mrSettings"`
-	ProjectMembers     []GitlabMemberInfo          `json:"projectMembers"`
+	Branches          []string           `json:"branches"`
+	BranchProtections []BranchProtection `json:"branchProtections"`
+	// BranchProtectionsKnown records whether the protection listing was read
+	// authoritatively. False on a 403 or any other failure, so the branch
+	// controls report not-evaluable rather than reading an unreadable
+	// listing as "this project protects nothing" - which is the precise
+	// violation they exist to catch, and so the most damaging thing to
+	// fabricate.
+	//
+	// The branch NAMES survive a protection failure, so the two facts are
+	// tracked separately: the run still knows which branches exist.
+	BranchProtectionsKnown bool                        `json:"branchProtectionsKnown"`
+	MRApprovalRules        []*glab.ProjectApprovalRule `json:"mrApprovalRules"`
+	// MRApprovalRulesKnown records whether the approval-rules listing was
+	// read authoritatively. It stays false on a 403/404 (non-premium
+	// GitLab, or a token without scope), so the approval-rule controls
+	// (ISSUE-502/504) report not-evaluable rather than a false pass: an
+	// unreadable listing must not make a project look compliant.
+	MRApprovalRulesKnown bool                   `json:"mrApprovalRulesKnown"`
+	MRApprovalSettings   *glab.ProjectApprovals `json:"mrApprovalSettings"`
+	MRSettings           *glab.Project          `json:"mrSettings"`
 }
 
 // Run fetches all GitLab protection data needed by the controls
@@ -80,40 +105,57 @@ func (dc *GitlabProtectionDataCollection) Run(
 	returnedData := &GitlabProtectionAnalysisData{}
 	metrics := &GitlabProtectionMetrics{}
 
-	// Get project branches and branch protections together
+	// Get project branches and branch protections together.
+	//
+	// A protection failure is NOT fatal to this collection. It costs the two
+	// branch controls their verdict and nothing else - the approval rules
+	// and settings below are separate endpoints, and aborting here would
+	// take three more controls down with it for a permission this project
+	// may simply not grant.
+	//
+	// A failure with no branches at all IS fatal: with no branch list there
+	// is nothing to report on either way.
 	branches, branchProtections, err := FetchProjectBranchData(project.Path, token, conf.GitlabURL, conf)
-	if err != nil {
+	switch {
+	case err != nil && len(branches) == 0:
 		l.WithError(err).Error("Failed to fetch project branch data")
 		return nil, metrics, err
+	case err != nil:
+		l.WithError(err).Warn("Branch protections unreadable; the branch controls will report not-evaluable")
+		returnedData.Branches = branches
+		returnedData.BranchProtectionsKnown = false
+	default:
+		returnedData.Branches = branches
+		returnedData.BranchProtections = branchProtections
+		returnedData.BranchProtectionsKnown = true
 	}
-	returnedData.Branches = branches
-	returnedData.BranchProtections = branchProtections
 	metrics.Branches = len(branches)
 
-	// Get project MR approval rules (may fail with 403/404 on non-premium GitLab)
-	approvalRules, err := FetchProjectMRApprovalRules(project.ID, token, conf.GitlabURL, conf)
+	// Get project MR approval rules (may 403/404 when the token cannot read them; GitLab Free returns 200 with an empty list)
+	approvalRules, rulesStatus, err := FetchProjectMRApprovalRules(project.ID, token, conf.GitlabURL, conf)
 	if err != nil {
-		errStr := err.Error()
-		if !strings.Contains(errStr, "403") && !strings.Contains(errStr, "404") {
+		if !isPremiumFeatureUnavailable(rulesStatus) {
 			l.WithError(err).Error("Failed to fetch MR approval rules")
 			return nil, metrics, err
 		}
 		l.WithError(err).Warn("MR approval rules not available (may require premium)")
-		// If 403/404 error, MRApprovalRules will be nil which controls can handle
+		// If 403/404 error, MRApprovalRules stays nil and MRApprovalRulesKnown
+		// stays false, so ISSUE-502/504 report not-evaluable, not a false pass.
 	} else {
 		returnedData.MRApprovalRules = approvalRules
+		returnedData.MRApprovalRulesKnown = true
 	}
 
-	// Get project MR approval settings (may fail with 403/404 on non-premium GitLab)
-	approvalSettings, err := FetchProjectMRApprovalSettings(project.ID, token, conf.GitlabURL, conf)
+	// Get project MR approval settings (may 403/404 when the token cannot read them; GitLab Free returns 200 with an empty list)
+	approvalSettings, settingsStatus, err := FetchProjectMRApprovalSettings(project.ID, token, conf.GitlabURL, conf)
 	if err != nil {
-		errStr := err.Error()
-		if !strings.Contains(errStr, "403") && !strings.Contains(errStr, "404") {
+		if !isPremiumFeatureUnavailable(settingsStatus) {
 			l.WithError(err).Error("Failed to fetch MR approval settings")
 			return nil, metrics, err
 		}
 		l.WithError(err).Warn("MR approval settings not available (may require premium)")
-		// If 403/404 error, MRApprovalSettings will be nil which controls can handle
+		// If 403/404 error, MRApprovalSettings stays nil, so ISSUE-503 reports
+		// not-evaluable, not a false pass (the nil pointer is the Known signal).
 	} else {
 		returnedData.MRApprovalSettings = approvalSettings
 	}
@@ -126,19 +168,15 @@ func (dc *GitlabProtectionDataCollection) Run(
 	}
 	returnedData.MRSettings = projectSettings
 
-	// Get project members
-	members, err := FetchProjectMembers(project.ID, token, conf.GitlabURL, conf)
-	if err != nil {
-		l.WithError(err).Warn("Failed to fetch project members")
-		// Continue without members
-	} else {
-		returnedData.ProjectMembers = members
-	}
+	// The project's member list used to be collected here. Nothing read it:
+	// no control, no IR field, no report. It cost one privileged request
+	// per run (GET /projects/:id/members/all), which a CI job token cannot
+	// make, so it was also one of the reasons a run needed a personal token
+	// at all. Collecting data no rule consumes is not free (#368).
 
 	l.WithFields(logrus.Fields{
 		"branchCount":           len(returnedData.Branches),
 		"branchProtectionCount": len(returnedData.BranchProtections),
-		"memberCount":           len(returnedData.ProjectMembers),
 	}).Info("Protection data collection completed")
 
 	return returnedData, metrics, nil

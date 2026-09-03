@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v2"
@@ -33,6 +34,8 @@ func ToNormalizedPipeline(
 	origin *GitlabPipelineOriginData,
 	images *GitlabPipelineImageData,
 	protection *GitlabProtectionAnalysisData,
+	variables *GitlabVariablesAnalysisData,
+	securityPolicy *SecurityPolicyData,
 ) *ir.NormalizedPipeline {
 	pipeline := &ir.NormalizedPipeline{
 		Provider:      ir.ProviderGitLab,
@@ -47,6 +50,11 @@ func ToNormalizedPipeline(
 	pipeline.Includes = buildIncludes(origin, ciConfigPath)
 	pipeline.Jobs = buildJobs(origin, imagesByJob, ciConfigPath, pipeline.Includes)
 	pipeline.Branches = buildBranches(protection)
+	pipeline.MRApprovalRules, pipeline.MRApprovalRulesKnown = buildApprovalRules(protection)
+	pipeline.SettingsVariables, pipeline.SettingsVariablesKnown = buildSettingsVariables(variables)
+	pipeline.MRApprovalSettings = buildApprovalSettings(protection)
+	pipeline.MRSettings = buildMRSettings(protection)
+	pipeline.SecurityPolicyProject = buildSecurityPolicyProject(securityPolicy)
 	if origin != nil && origin.MergedConf != nil {
 		if globals := extractGitLabVariables(origin.MergedConf.GlobalVariables); len(globals) > 0 {
 			pipeline.GlobalVariables = globals
@@ -59,6 +67,137 @@ func ToNormalizedPipeline(
 	}
 
 	return pipeline
+}
+
+// buildApprovalRules projects the collected merge-request approval rules
+// onto the IR. It reads the same protection collection as buildBranches and
+// carries only what the approval-rule controls check: the rule's stable ID
+// (stringified — the ISSUE-502 identity subject), its name (messages only),
+// how many approvals it requires, and its protected-branch coverage. The
+// second return is MRApprovalRulesKnown: false when the listing was
+// unreadable (nil protection, or a 403/404 the collector recorded as
+// MRApprovalRulesKnown=false), so a control keyed on these rules reports
+// not-evaluable rather than a false pass.
+func buildApprovalRules(protection *GitlabProtectionAnalysisData) ([]ir.MRApprovalRule, bool) {
+	if protection == nil || !protection.MRApprovalRulesKnown {
+		return nil, false
+	}
+	out := make([]ir.MRApprovalRule, 0, len(protection.MRApprovalRules))
+	for _, r := range protection.MRApprovalRules {
+		if r == nil {
+			continue
+		}
+		out = append(out, ir.MRApprovalRule{
+			ID:                            strconv.FormatInt(r.ID, 10),
+			Name:                          r.Name,
+			ApprovalsRequired:             int(r.ApprovalsRequired),
+			AppliesToAllProtectedBranches: r.AppliesToAllProtectedBranches,
+			ProtectedBranchCount:          len(r.ProtectedBranches),
+		})
+	}
+	return out, true
+}
+
+// buildSettingsVariables projects the collected settings CI/CD variables onto
+// the IR, carrying identity and flags only — never the value (per the #370
+// variable-sensitivity tiers). The second return is SettingsVariablesKnown:
+// false when the listing was unreadable (nil data, or a 401/403 the collector
+// recorded as Known=false), so a control keyed on these variables reports
+// not-evaluable rather than a false pass.
+func buildSettingsVariables(variables *GitlabVariablesAnalysisData) ([]ir.SettingsVariable, bool) {
+	if variables == nil {
+		return nil, false
+	}
+	out := make([]ir.SettingsVariable, 0, len(variables.Variables))
+	for _, v := range variables.Variables {
+		out = append(out, ir.SettingsVariable{
+			Name:        v.Name,
+			Type:        v.Type,
+			Environment: v.Environment,
+			Protected:   v.Protected,
+			Masked:      v.Masked,
+		})
+	}
+	return out, variables.Known
+}
+
+// buildApprovalSettings projects the collected merge-request approval
+// settings onto the IR in positive-security form: every boolean reads true
+// when the safer choice is in effect, so the polarity GitLab's API uses
+// (merge_requests_author_approval is "author CAN approve") is normalized
+// here, once, and the Rego rule compares like-for-like. The two reset flags
+// collapse into the behaviorWhenCommitIsAdded ladder exactly the way the
+// legacy platform derived it (controlGitlabProtectionMRApprovalSettings.go):
+// keep when neither flag is set, remove-all when only reset_approvals_on_push
+// is, remove-code-owner-approvals whenever selective_code_owner_removals is.
+// Returns nil when the settings were not read (nil protection, or the
+// 401/403 the collector recorded as a nil MRApprovalSettings), so ISSUE-503
+// abstains and reports not-evaluable rather than a false pass.
+func buildApprovalSettings(protection *GitlabProtectionAnalysisData) *ir.MRApprovalSettings {
+	if protection == nil || protection.MRApprovalSettings == nil {
+		return nil
+	}
+	s := protection.MRApprovalSettings
+	behavior := ir.MRApprovalBehaviorKeepApprovals
+	switch {
+	case s.ResetApprovalsOnPush && !s.SelectiveCodeOwnerRemovals:
+		behavior = ir.MRApprovalBehaviorRemoveAllApprovals
+	case s.SelectiveCodeOwnerRemovals:
+		behavior = ir.MRApprovalBehaviorRemoveCodeOwnerApprovals
+	}
+	return &ir.MRApprovalSettings{
+		PreventApprovalByAuthor:         !s.MergeRequestsAuthorApproval,
+		PreventApprovalsByCommitters:    s.MergeRequestsDisableCommittersApproval,
+		PreventEditingApprovalRulesInMR: s.DisableOverridingApproversPerMergeRequest,
+		RequireReAuthToApprove:          s.RequirePasswordToApprove,
+		BehaviorWhenCommitIsAdded:       behavior,
+	}
+}
+
+// buildMRSettings projects the project-level merge-request/merge settings from
+// the collected GitLab project payload onto the IR in raw form, so the
+// mergeRequestSettingsMustBeCompliant control (ISSUE-506) can compare each field
+// against the configured expectation for exact equality. The enum values
+// (MergeMethod, SquashOption) are GitLab typed strings, carried as plain
+// strings. Returns nil when the project payload was not read, so the control
+// abstains and reports not-evaluable rather than a false pass.
+func buildMRSettings(protection *GitlabProtectionAnalysisData) *ir.MRSettings {
+	if protection == nil || protection.MRSettings == nil {
+		return nil
+	}
+	p := protection.MRSettings
+	return &ir.MRSettings{
+		MergeMethod:                     string(p.MergeMethod),
+		SquashOption:                    string(p.SquashOption),
+		MergePipelinesEnabled:           p.MergePipelinesEnabled,
+		MergeTrainsEnabled:              p.MergeTrainsEnabled,
+		AllowMergeOnSkippedPipeline:     p.AllowMergeOnSkippedPipeline,
+		ResolveOutdatedDiffDiscussions:  p.ResolveOutdatedDiffDiscussions,
+		PrintingMergeRequestLinkEnabled: p.PrintingMergeRequestLinkEnabled,
+		RemoveSourceBranchAfterMerge:    p.RemoveSourceBranchAfterMerge,
+	}
+}
+
+// buildSecurityPolicyProject projects the collected security policy project
+// linkage onto the IR. Returns nil when the linkage was not collected (the
+// control disabled) so the rule sees no field and abstains. When collected, the
+// Known flag carries whether the read was authoritative; a Known projection with
+// LinkedProjectID == 0 means "no policy project linked".
+func buildSecurityPolicyProject(data *SecurityPolicyData) *ir.SecurityPolicyProjectState {
+	if data == nil {
+		return nil
+	}
+	// Read failed (auth error, null project, field unavailable): abstain rather
+	// than let an unreadable linkage read as "none linked".
+	if !data.Known && data.Project == nil {
+		return nil
+	}
+	state := &ir.SecurityPolicyProjectState{Known: data.Known}
+	if data.Project != nil {
+		state.LinkedProjectID = data.Project.ID
+		state.LinkedProjectPath = data.Project.FullPath
+	}
+	return state
 }
 
 // buildBranches flattens the GitLab protection API response into
@@ -384,9 +523,10 @@ func imageFromInfo(info GitlabPipelineImageInfo) ir.Image {
 	// info.Link may be "registry/name:tag" or "registry/name@sha256:..."
 	// info.Tag / info.Registry are already split by the collector.
 	img := ir.Image{
-		Name:     info.Name,
-		Tag:      info.Tag,
-		Registry: info.Registry,
+		Name:       info.Name,
+		Tag:        info.Tag,
+		Registry:   info.Registry,
+		Unresolved: info.Unresolved,
 	}
 	if idx := strings.Index(info.Link, "@"); idx >= 0 {
 		img.Digest = info.Link[idx+1:]

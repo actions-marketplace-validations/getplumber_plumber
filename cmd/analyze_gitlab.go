@@ -2,7 +2,10 @@ package cmd
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -10,41 +13,70 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/table"
 	"github.com/getplumber/plumber/configuration"
 	"github.com/getplumber/plumber/control"
-	"github.com/getplumber/plumber/internal/defaultconfig"
+	defaultconfig "github.com/getplumber/plumber/defaultConfig"
 	opaengine "github.com/getplumber/plumber/internal/engine/opa"
 	plumberprovider "github.com/getplumber/plumber/provider"
 	"github.com/getplumber/plumber/utils"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v2"
 )
 
 var (
 	// Flags for analyze command
-	gitlabURL         string
-	githubURL         string
-	providerFlag      string
-	projectPath       string
-	defaultBranch     string
-	outputFile        string
-	printOutput       bool
-	configFile        string
-	threshold         float64
+	gitlabURL     string
+	githubURL     string
+	providerFlag  string
+	projectPath   string
+	defaultBranch string
+	outputFile    string
+	printOutput   bool
+	configFile    string
+	// configExplicitlySet is true when --config (or PLUMBER_ANALYZE_CONFIG)
+	// was supplied. It gates the zero-config fallback: a missing DEFAULT
+	// config path falls back to the embedded default, but a missing
+	// EXPLICITLY-requested path is a user error and still fails.
+	configExplicitlySet bool
+	threshold           float64
+	// thresholdSet is true when the deprecated --threshold was supplied
+	// explicitly (flag or PLUMBER_ANALYZE_THRESHOLD); it switches the gate
+	// back to the legacy passing-controls percentage.
+	thresholdSet bool
+	minScore     string
+	minPoints    float64
+	// minPointsSet distinguishes an explicit --min-points from its default:
+	// when only --min-score is given, the points gate is off.
+	minPointsSet      bool
 	pbomFile          string
 	pbomCycloneDXFile string
 	sarifFile         string
 	glsastFile        string
+	csvFile           string
+	ocsfFile          string
 	mrComment         bool
 	badge             bool
 	showScore         bool
 	showScorePoint    bool
+	pushScore         bool
+	scoreEndpoint     string
+	platformURL       string
 	controlsFilter    string
 	skipControls      string
-	ciConfigPath      string
+	// noControls (--no-controls) turns off control evaluation for the run.
+	// It overrides .plumber.yaml, for the case where the user wants an
+	// artifact (typically the PBOM) and not a verdict. Nothing is
+	// evaluated, so there is no score and no gate.
+	//
+	// It carries a PLUMBER_ANALYZE_NO_CONTROLS fallback like every other
+	// analyze flag. Anyone able to set that variable can already neutralise
+	// the gate through PLUMBER_ANALYZE_MIN_POINTS / _THRESHOLD, so the env
+	// surface is a property of the whole flag set, not of this flag.
+	noControls   bool
+	ciConfigPath string
 )
 
 const (
@@ -59,12 +91,14 @@ var analyzeCmd = &cobra.Command{
 	Use:          "analyze",
 	Short:        "Analyze CI/CD configuration (GitLab via API, or local GitHub Actions when origin is GitHub)",
 	SilenceUsage: true, // Don't print usage on errors (e.g., threshold failures)
-	Long: `Analyze CI/CD configuration for compliance issues.
+	Long: `Analyze CI/CD configuration for security issues.
 
 GitLab path (when the git remote is GitLab, or when you pass --gitlab-url and --project):
   Connects to GitLab, retrieves CI/CD configuration and project settings, and runs
   checks including pipeline origins, images, tags, and branch protection.
-  Required environment variable: GITLAB_TOKEN
+  Required environment variable: GITLAB_TOKEN, unless --platform is set: platform
+  mode reads the configuration and project settings from the platform, so a CI job
+  can run with no GitLab token at all.
 
 GitHub path (when origin is GitHub and --gitlab-url / --project are not set):
   Scans local .github/workflows only (Rego). No GitLab token. Some flags apply only
@@ -76,24 +110,34 @@ Flags (auto-detected from git remote if not specified):
 
 Optional flags:
   --config           Path to .plumber.yaml config file (default: .plumber.yaml)
-  --threshold        Minimum compliance percentage to pass, 0-100 (default: 100)
+  --min-points       Minimum Plumber Score points to pass, 0-100 (default: 100 — any finding fails)
+  --min-score        Minimum Plumber Score letter to pass, A-E (e.g. B fails on C, D, E)
+  --threshold        Deprecated: minimum percentage of passing controls, 0-100; use --min-points / --min-score
   --branch           Branch to analyze (defaults to project's default branch)
-  --print            Print text output to stdout (default: true)
+  --print            Print the human-readable report and, on a terminal, the progress bar (default: true). Log verbosity is controlled by --verbose, file outputs by --output/--sarif/...
   --output           Write JSON results to file (optional)
   --pbom             Write PBOM (Pipeline Bill of Materials) to file (optional)
   --pbom-cyclonedx   Write PBOM in CycloneDX format for integration with security tools
-  --mr-comment       Post/update a compliance comment on the merge request (requires api scope, merge request pipeline only)
-  --badge            Create/update a Plumber compliance badge on the project (requires api scope; only runs on default branch)
+  --mr-comment       Post/update a Plumber comment on the merge request (requires api scope, merge request pipeline only)
+  --badge            Create/update a Plumber letter-score badge on the project (requires api scope; only runs on default branch)
   --score            Letter score, points, bar, and counts in stdout (banner only); points + score in JSON/PBOM/CycloneDX; badge/MR use letter when set (optional)
   --score-point      Same as --score plus full points breakdown in stdout and MR comment (optional; wins if both set)
+  --score-push       Publish this repo's Plumber Score to the hosted badge service (CI only; a local run is a no-op) (optional)
+  --score-endpoint   Score service base URL (default https://score.getplumber.io); override only for a self-hosted score service (optional)
   --controls         Run only listed controls (comma-separated)
   --skip-controls    Skip listed controls (comma-separated)
+  --no-controls      Run no control at all: collect the pipeline, write the requested inventory
+                     artifacts (PBOM, JSON, CSV, OCSF), skip evaluation, withhold the score, exit 0.
+                     Every control reports as skipped, never passed. --sarif / --glsast are NOT
+                     written (an empty security report clears existing alerts). Overrides the
+                     controls enabled in .plumber.yaml; cannot be combined with --controls /
+                     --skip-controls
   --fail-warnings    Treat configuration warnings as errors (exit 2)
   --ci-config-path   Override the CI configuration file path (default: auto-detected from GitLab project settings, usually .gitlab-ci.yml)
 
 Exit codes:
-  0  Analysis passed (compliance >= threshold)
-  1  Compliance failure (compliance < threshold)
+  0  Analysis passed (score gate met, or --no-controls with data collection intact)
+  1  Gate failure (Plumber Score below --min-points / --min-score, or deprecated --threshold not met)
   2  Runtime error (configuration error, network failure, missing token, etc.)
 
 Examples:
@@ -106,14 +150,17 @@ Examples:
   # Analyze a specific project
   plumber analyze --gitlab-url https://gitlab.com --project mygroup/myproject
 
-  # Analyze with custom config and threshold
-  plumber analyze --gitlab-url https://gitlab.com --project mygroup/myproject --config custom.yaml --threshold 80
+  # Analyze with custom config and a relaxed score gate
+  plumber analyze --gitlab-url https://gitlab.com --project mygroup/myproject --config custom.yaml --min-points 80
 
   # Analyze and save JSON to file (no stdout)
   plumber analyze --gitlab-url https://gitlab.com --project mygroup/myproject --print=false --output results.json
 
   # Analyze a project that uses a custom CI configuration file path
   plumber analyze --ci-config-path my-custom-ci.yml
+
+  # PBOM only: no control evaluated, no score, no gate (exit 0 unless collection fails)
+  plumber analyze --pbom-cyclonedx pbom.cdx --no-controls --print=false
 `,
 	RunE: runAnalyze,
 }
@@ -140,20 +187,28 @@ func init() {
 
 	// Optional flags with defaults
 	analyzeCmd.Flags().StringVar(&configFile, "config", ".plumber.yaml", "Path to .plumber.yaml config file")
-	analyzeCmd.Flags().Float64Var(&threshold, "threshold", 100, "Minimum compliance percentage to pass, 0-100")
+	analyzeCmd.Flags().Float64Var(&threshold, "threshold", 100, "Deprecated: minimum percentage of passing controls, 0-100; use --min-points / --min-score instead")
+	analyzeCmd.Flags().StringVar(&minScore, "min-score", "", "Minimum Plumber Score letter to pass, A-E (e.g. B fails on C, D, E)")
+	analyzeCmd.Flags().Float64Var(&minPoints, "min-points", 100, "Minimum Plumber Score points to pass, 0-100 (default 100: any finding fails)")
 	analyzeCmd.Flags().StringVar(&defaultBranch, "branch", "", "Branch to analyze (defaults to project's default branch)")
-	analyzeCmd.Flags().BoolVar(&printOutput, "print", true, "Print text output to stdout")
+	analyzeCmd.Flags().BoolVar(&printOutput, "print", true, "Print the human-readable report (and, on a terminal, the progress bar); JSON/SARIF file outputs are unaffected")
 	analyzeCmd.Flags().StringVarP(&outputFile, "output", "o", "", "Write JSON results to file")
 	analyzeCmd.Flags().StringVar(&pbomFile, "pbom", "", "Write PBOM (Pipeline Bill of Materials) to file")
 	analyzeCmd.Flags().StringVar(&pbomCycloneDXFile, "pbom-cyclonedx", "", "Write PBOM in CycloneDX format (for security tool integration)")
 	analyzeCmd.Flags().StringVar(&sarifFile, "sarif", "", "Write SARIF 2.1.0 results to file (for GitHub Code Scanning / GitLab Security Dashboard)")
 	analyzeCmd.Flags().StringVar(&glsastFile, "glsast", "", "Write a GitLab SAST report (gl-sast-report.json) to file (for the GitLab Security Dashboard / MR widget)")
+	analyzeCmd.Flags().StringVar(&csvFile, "csv", "", "Write CSV results to file")
+	analyzeCmd.Flags().StringVar(&ocsfFile, "ocsf", "", "Write OCSF Compliance Finding results (JSON array) to file (for OCSF-consuming tools and GRC platforms)")
 	analyzeCmd.Flags().BoolVar(&mrComment, "mr-comment", false, "Post/update a compliance comment on the merge request (requires api scope token; only works in merge request pipelines)")
 	analyzeCmd.Flags().BoolVar(&badge, "badge", false, "Create/update a Plumber compliance badge on the project (requires api scope; only runs on default branch)")
 	analyzeCmd.Flags().BoolVar(&showScore, "score", false, "Banner: letter score, points, bar, severity counts on stdout; points + score in JSON, PBOM, CycloneDX; badge shows letter when set")
 	analyzeCmd.Flags().BoolVar(&showScorePoint, "score-point", false, "Like --score plus full points breakdown in stdout and MR comment; overrides --score when both are set")
+	analyzeCmd.Flags().BoolVar(&pushScore, "score-push", false, "Publish this repo's Plumber Score to the hosted badge service (CI only; needs a CI OIDC id-token, so a local run is a no-op)")
+	analyzeCmd.Flags().StringVar(&scoreEndpoint, "score-endpoint", "", "Score service base URL (default https://score.getplumber.io); override only for a self-hosted score service")
+	analyzeCmd.Flags().StringVar(&platformURL, "platform", "", "Plumber platform base URL; turns on platform mode (policies and collected data come from the platform) and pushes this run's full results there over CI OIDC, taking precedence over --score-push")
 	analyzeCmd.Flags().StringVar(&controlsFilter, "controls", "", "Run only listed controls (comma-separated)")
 	analyzeCmd.Flags().StringVar(&skipControls, "skip-controls", "", "Skip listed controls (comma-separated)")
+	analyzeCmd.Flags().BoolVar(&noControls, "no-controls", false, "Run no controls at all: collect the pipeline and write the requested inventory artifacts (PBOM, JSON, CSV, OCSF), skip evaluation, withhold the score, and never fail the gate")
 	analyzeCmd.Flags().BoolVar(&failWarnings, "fail-warnings", false, "Treat configuration warnings as errors (exit 2)")
 	analyzeCmd.Flags().StringVar(&ciConfigPath, "ci-config-path", "", "Override the CI configuration file path (default: auto-detected from GitLab project settings, usually .gitlab-ci.yml)")
 
@@ -185,90 +240,110 @@ func resolveProvider(provider string, gitlabURLFromFlag, githubURLFromFlag bool,
 	}
 }
 
-// printProviderDetection tells the user which provider was selected and why,
-// then always shows how to change it — so a wrong guess (e.g. a GitHub
-// Enterprise Server host mistaken for self-hosted GitLab) is both visible and
-// trivially correctable.
-func printProviderDetection(provider, reason string) {
-	name := "GitLab"
+// providerDisplayName maps the canonical provider id to its human-readable
+// name for the report header.
+func providerDisplayName(provider string) string {
 	if provider == "github" {
-		name = "GitHub"
+		return "GitHub"
 	}
-	fmt.Fprintf(os.Stderr, "Provider: %s (%s)\n", name, reason)
-	fmt.Fprintf(os.Stderr, "  To change: --provider github|gitlab, or --github-url <host> / --gitlab-url <url> to also target a specific host/remote.\n")
+	return "GitLab"
 }
 
-// loadConfigOrOffer loads the Plumber config file. When the file is missing and
-// the terminal is interactive, it prompts the user to generate a config on the
-// spot (via the wizard or the default template) and then reloads it so the
-// calling analyze command can continue uninterrupted.
-func loadConfigOrOffer(cfgFile string) (*configuration.PlumberConfig, string, []string, error) {
+// headerRow is one label/value pair in the run header block.
+type headerRow struct{ label, value string }
+
+// buildRunHeaderRows derives the run-header rows from the provider, analysis
+// result, and configuration. It holds all the condition-dependent logic
+// (platform/host selection, optional config path, CI-config-source mapping) so
+// it can be unit-tested without capturing stdout; renderRunHeader only formats
+// what this returns.
+func buildRunHeaderRows(providerName string, result *control.AnalysisResult, conf *configuration.Configuration) []headerRow {
+	rows := []headerRow{{"Project", result.ProjectPath}}
+
+	platform := providerDisplayName(providerName)
+	switch {
+	case providerName == "gitlab" && conf.GitlabURL != "":
+		platform += " · " + conf.GitlabURL
+	case providerName == "github" && conf.GithubAPIHost != "":
+		platform += " · " + conf.GithubAPIHost
+	}
+	rows = append(rows, headerRow{"Platform", platform})
+
+	if conf.ConfigFilePath != "" {
+		rows = append(rows, headerRow{"Config", conf.ConfigFilePath})
+	}
+	switch result.CIConfigSource {
+	case "local":
+		rows = append(rows, headerRow{"CI config", "local file"})
+	case "remote":
+		rows = append(rows, headerRow{"CI config", "fetched from " + providerDisplayName(providerName)})
+	}
+	// Say it once, in the header, so the report never looks like a scan that
+	// found nothing wrong.
+	if conf.NoControls {
+		rows = append(rows, headerRow{"Controls", "none (--no-controls)"})
+	}
+
+	return rows
+}
+
+// renderRunHeader prints the single structured block that identifies the run:
+// project, platform (with instance URL/host), config file, and CI-config
+// source. It is the one place this metadata is shown — the per-step stderr
+// echoes it used to duplicate have been removed.
+func renderRunHeader(p plumberprovider.Provider, result *control.AnalysisResult, conf *configuration.Configuration) {
+	rows := buildRunHeaderRows(p.Name(), result, conf)
+
+	fmt.Println()
+	for _, r := range rows {
+		fmt.Printf("  %s  %s\n", styleMuted.Render(fmt.Sprintf("%-9s", r.label)), styleTitle.Render(r.value))
+	}
+	fmt.Println()
+}
+
+// builtinDefaultConfigSource labels a config loaded from the binary's embedded
+// default (no local file, no explicit --config). It shows up as the
+// `plumberConfig.source` in the JSON report and after "Using configuration:".
+const builtinDefaultConfigSource = "built-in default"
+
+// loadConfigOrOffer loads the Plumber config. If the file exists it is used.
+// If it is missing:
+//   - configExplicit (a --config path the user asked for) is a hard error —
+//     we do not silently swap in the default for a file they named.
+//   - otherwise this is a zero-config run: fall back to the embedded default
+//     so the scan runs with no setup. No prompt, so a terminal and a CI job
+//     behave identically (a wizard prompt would hang a non-interactive run).
+func loadConfigOrOffer(cfgFile string, configExplicit bool) (*configuration.PlumberConfig, string, []string, error) {
 	pc, path, warnings, err := configuration.LoadPlumberConfig(cfgFile)
 	if err == nil {
 		return pc, path, warnings, nil
 	}
 
-	if !strings.Contains(err.Error(), "config file not found") {
+	if !errors.Is(err, configuration.ErrConfigNotFound) {
 		return nil, "", nil, fmt.Errorf("configuration error: %w", err)
 	}
 
-	// Config file not found — in non-interactive mode just show the hint.
-	if !isInteractiveInit() {
+	// A specific --config path was requested but is absent: user error, fail.
+	if configExplicit {
 		return nil, "", nil, fmt.Errorf(errConfigFileNotFound, err)
 	}
 
-	fmt.Fprintf(os.Stderr, "\nNo configuration file found at %q.\n\n", cfgFile)
-
-	const (
-		choiceWizard   = "Interactive wizard  (plumber config init)"
-		choiceGenerate = "Default template    (plumber config generate)"
-		choiceNo       = "No, exit"
-	)
-
-	var choice string
-	if surveyErr := survey.AskOne(&survey.Select{
-		Message: "Would you like to generate a configuration file now?",
-		Options: []string{choiceWizard, choiceGenerate, choiceNo},
-		Default: choiceWizard,
-	}, &choice); surveyErr != nil || choice == choiceNo {
-		return nil, "", nil, fmt.Errorf(errConfigFileNotFound, err)
-	}
-
-	if genErr := handleConfigGeneration(choice, cfgFile, choiceWizard, choiceGenerate); genErr != nil {
-		return nil, "", nil, genErr
-	}
-
-	// Reload after generation.
-	pc, path, warnings, err = configuration.LoadPlumberConfig(cfgFile)
-	if err != nil {
-		return nil, "", nil, fmt.Errorf("failed to reload config after generation: %w", err)
-	}
-	return pc, path, warnings, nil
+	return loadEmbeddedDefaultConfig()
 }
 
-// handleConfigGeneration runs the wizard or default-template generation path
-// chosen by the user in loadConfigOrOffer.
-func handleConfigGeneration(choice, cfgFile, choiceWizard, choiceGenerate string) error {
-	switch choice {
-	case choiceWizard:
-		state, wizErr := runInitWizard(true) // skip "run analyze after?" — we're already in analyze
-		if wizErr != nil {
-			return fmt.Errorf("config init failed: %w", wizErr)
-		}
-		cfg := state.toPlumberConfig()
-		if writeErr := writeInitConfig(cfg, cfgFile, false, true, "plumber analyze"); writeErr != nil {
-			return fmt.Errorf("config init failed: %w", writeErr)
-		}
-		printInitNextSteps(cfgFile, state.Providers)
-	case choiceGenerate:
-		if writeErr := os.WriteFile(cfgFile, defaultconfig.Get(), 0644); writeErr != nil {
-			return fmt.Errorf("failed to write config file: %w", writeErr)
-		}
-		fmt.Fprintf(os.Stderr, "Generated %s\n", cfgFile)
-	default:
-		return fmt.Errorf("unexpected choice: %s", choice)
+// loadEmbeddedDefaultConfig parses the default .plumber.yaml compiled into the
+// binary and notes on stderr that it is in use, pointing at the commands to
+// author a project-specific config. This is the zero-config path: no local
+// .plumber.yaml and no explicit --config, so Plumber scans with its shipped
+// defaults instead of prompting or refusing to run.
+func loadEmbeddedDefaultConfig() (*configuration.PlumberConfig, string, []string, error) {
+	pc, path, warnings, err := configuration.LoadPlumberConfigFromBytes(defaultconfig.Get(), builtinDefaultConfigSource)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("failed to load built-in default config: %w", err)
 	}
-	return nil
+	fmt.Fprintln(os.Stderr, "No .plumber.yaml found; using Plumber's built-in default configuration.")
+	fmt.Fprintln(os.Stderr, "Generate your own with 'plumber config generate' ('plumber config init' for the interactive wizard); see the default with 'plumber config view'.")
+	return pc, path, warnings, nil
 }
 
 // analyzeFlags bundles the parsed flag-changed booleans so they don't have to
@@ -313,6 +388,11 @@ func validateProviderFlags(flags analyzeFlags) error {
 func parseControlsFilters() (includeOnly, skip []string, err error) {
 	if controlsFilter != "" && skipControls != "" {
 		return nil, nil, fmt.Errorf("--controls and --skip-controls cannot be used together")
+	}
+	// "evaluate nothing" and "evaluate this subset" are contradictory
+	// requests. Letting one silently win would hide a broken CI invocation.
+	if noControls && (controlsFilter != "" || skipControls != "") {
+		return nil, nil, fmt.Errorf("--no-controls cannot be combined with --controls / --skip-controls: it runs no control at all")
 	}
 	includeOnly, err = parseControlsFilter(controlsFilter)
 	if err != nil {
@@ -365,11 +445,9 @@ func resolveGitLabTarget(flags analyzeFlags, remoteInfo *utils.GitRemoteInfo) (g
 		} else {
 			gitlabURL = "https://gitlab.com"
 		}
-		fmt.Fprintf(os.Stderr, "GitLab URL: %s\n", gitlabURL)
 	}
 	if !flags.projectFromFlag && remoteInfo != nil {
 		projectPath = remoteInfo.ProjectPath
-		fmt.Fprintf(os.Stderr, "Project: %s\n", projectPath)
 	}
 
 	if gitlabURL == "" {
@@ -386,6 +464,21 @@ func resolveGitLabToken(flags analyzeFlags) (string, error) {
 	token := os.Getenv("GITLAB_TOKEN")
 	if token != "" {
 		return token, nil
+	}
+	// Platform mode is the case a personal token exists to avoid. The
+	// project's settings, its resolved CI configuration and its policy set
+	// all come from the platform over a CI-native OIDC id-token, so
+	// demanding a GITLAB_TOKEN before the run has even started would refuse
+	// the exact setup #368 is for.
+	//
+	// This is a permission to CONTINUE, not a promise that everything
+	// works. Whatever the migration has not moved yet still tries the API,
+	// fails, and is reported not_evaluable by its own lane - which is the
+	// documented behaviour for a collection that has not been switched
+	// over. A run that produces an honest partial report beats one that
+	// produces nothing.
+	if push, _ := effectivePlatformPush(); push {
+		return "", nil
 	}
 	// Only nudge toward GitHub when GitLab was auto-detected — if the user
 	// picked GitLab explicitly, the GHES hint is just noise.
@@ -410,7 +503,6 @@ func applyConfigWarnings(warnings []string) error {
 	if failWarnings {
 		return fmt.Errorf("configuration has %d warning(s) and --fail-warnings is set", len(warnings))
 	}
-	fmt.Fprintf(os.Stderr, "Please fix the warnings above for best results.\n\n")
 	return nil
 }
 
@@ -429,59 +521,33 @@ func buildGitLabConf(
 	conf.Branch = defaultBranch
 	conf.PlumberConfig = plumberConfig
 	conf.GitRepoRoot = remote.repoRoot
-	conf.ControlsFilter = controlsFilterList
-	conf.SkipControlsFilter = skipControlsList
+	applyControlScope(conf, controlsFilterList, skipControlsList)
 	conf.CIConfigPathOverride = ciConfigPath
 
-	// Local CI file support only applies when the local repo IS the analyzed
-	// project AND the user did not explicitly name a project on the CLI.
-	// Explicit project name = analyse exactly that project, ignore pwd.
-	// (Symmetric CLI semantics with the GitHub path.)
+	// Does the repository in the working directory hold the project being
+	// analyzed? This is a fact about the checkout, and nothing the operator
+	// typed changes it.
+	//
+	// The comparison ignores the URL scheme. ParseGitRemoteURL normalizes
+	// every remote to https://host, so comparing it whole against a plain-http
+	// --gitlab-url (a self-hosted instance without TLS) could never match and
+	// the CI-config digest was silently never computed for such instances.
+	// The scheme is transport, not identity; host, port and project path
+	// still have to agree exactly.
+	checkoutIsProject := remote.repoRoot != "" &&
+		equalIgnoringScheme(remote.remoteURL, cleanGitlabURL) &&
+		remote.projectPath == projectPath
+	conf.CheckoutIsAnalyzedProject = checkoutIsProject
+
+	// Whether to READ the CI configuration from that checkout is a different
+	// question, and naming a project answers it: "analyse exactly that
+	// project, ignore pwd" (symmetric CLI semantics with the GitHub path).
+	// The two conditions are kept apart because platform mode's config
+	// digest needs the first and must not be gated on the second.
 	explicitProject := flags.gitlabURLFromFlag || flags.projectFromFlag
-	if !explicitProject && remote.repoRoot != "" && remote.remoteURL != "" {
-		conf.IsLocalProject = strings.TrimSuffix(remote.remoteURL, "/") == cleanGitlabURL &&
-			remote.projectPath == projectPath
-	}
+	conf.IsLocalProject = checkoutIsProject && !explicitProject
 
-	if verbose {
-		conf.LogLevel = logrus.DebugLevel
-	}
 	return conf
-}
-
-// computeGitLabCompliance returns the overall compliance percentage and the
-// number of non-skipped controls that were evaluated.
-//
-// When the CI config is missing or invalid no findings were produced because
-// nothing could be analysed — not because the project is compliant. Those
-// cases short-circuit to 0 so an absent or broken .gitlab-ci.yml never scores
-// 100% and cannot be used to bypass the gate.
-func computeGitLabCompliance(result *control.AnalysisResult, conf *configuration.Configuration) (compliance float64, controlCount int) {
-	if result.CiMissing || !result.CiValid {
-		return 0.0, 0
-	}
-	findingCountsByControl := map[string]int{}
-	for _, f := range result.Findings {
-		if info := control.LookupCode(control.ErrorCode(f.Code)); info != nil {
-			findingCountsByControl[info.ControlName]++
-		}
-	}
-	passed := 0
-	entries := control.GitLabControls(conf.PlumberConfig)
-	control.MarkSkippedByFilter(entries, conf.ControlsFilter, conf.SkipControlsFilter)
-	for _, e := range entries {
-		if e.Skipped {
-			continue
-		}
-		controlCount++
-		if findingCountsByControl[e.ControlName] == 0 {
-			passed++
-		}
-	}
-	if controlCount > 0 {
-		compliance = float64(passed) * 100.0 / float64(controlCount)
-	}
-	return compliance, controlCount
 }
 
 // envKeys maps each analyze flag to the environment variable that overrides it
@@ -494,29 +560,46 @@ var envKeys = map[string]string{
 	"branch":         "PLUMBER_ANALYZE_BRANCH",
 	"config":         "PLUMBER_ANALYZE_CONFIG",
 	"threshold":      "PLUMBER_ANALYZE_THRESHOLD",
+	"min-score":      "PLUMBER_ANALYZE_MIN_SCORE",
+	"min-points":     "PLUMBER_ANALYZE_MIN_POINTS",
 	"print":          "PLUMBER_ANALYZE_PRINT",
 	"output":         "PLUMBER_ANALYZE_OUTPUT",
 	"pbom":           "PLUMBER_ANALYZE_PBOM",
 	"pbom-cyclonedx": "PLUMBER_ANALYZE_PBOM_CYCLONEDX",
 	"sarif":          "PLUMBER_ANALYZE_SARIF",
 	"glsast":         "PLUMBER_ANALYZE_GLSAST",
+	"csv":            "PLUMBER_ANALYZE_CSV",
+	"ocsf":           "PLUMBER_ANALYZE_OCSF",
 	"mr-comment":     "PLUMBER_ANALYZE_MR_COMMENT",
 	"badge":          "PLUMBER_ANALYZE_BADGE",
 	"score":          "PLUMBER_ANALYZE_SCORE",
 	"score-point":    "PLUMBER_ANALYZE_SCORE_POINT",
+	"score-push":     "PLUMBER_ANALYZE_SCORE_PUSH",
+	"score-endpoint": "PLUMBER_ANALYZE_SCORE_ENDPOINT",
+	"platform":       "PLUMBER_ANALYZE_PLATFORM",
 	"controls":       "PLUMBER_ANALYZE_CONTROLS",
 	"skip-controls":  "PLUMBER_ANALYZE_SKIP_CONTROLS",
+	"no-controls":    "PLUMBER_ANALYZE_NO_CONTROLS",
 	"fail-warnings":  "PLUMBER_ANALYZE_FAIL_WARNINGS",
 	"ci-config-path": "PLUMBER_ANALYZE_CI_CONFIG_PATH",
 	"verbose":        "PLUMBER_ANALYZE_VERBOSE",
 }
 
-func envStringFallback(cmd *cobra.Command, flag, envKey string, dest *string) {
+func envStringFallback(cmd *cobra.Command, flag, envKey string, dest *string) error {
 	if !cmd.Flags().Changed(flag) {
 		if v := os.Getenv(envKey); v != "" {
 			*dest = v
+			// Mark the flag as set so a value provided via a PLUMBER_ANALYZE_*
+			// env var drives provider/host/project selection exactly like the
+			// equivalent flag. The GitLab CI component passes coordinates as env
+			// vars, not flags; without this the provider stays undetermined and
+			// the host gets overwritten with the gitlab.com default.
+			if err := cmd.Flags().Set(flag, v); err != nil {
+				return fmt.Errorf("apply %s: %w", envKey, err)
+			}
 		}
 	}
+	return nil
 }
 
 func envBoolFallback(cmd *cobra.Command, flag, envKey string, dest *bool) error {
@@ -527,6 +610,41 @@ func envBoolFallback(cmd *cobra.Command, flag, envKey string, dest *bool) error 
 				return fmt.Errorf("invalid value for %s: %q: %w", envKey, v, err)
 			}
 			*dest = b
+		}
+	}
+	return nil
+}
+
+// resolveGateFlags validates the pass/fail gate flags after the env fallbacks
+// ran and records which gate is active. The default gate is the Plumber Score
+// (--min-points 100: any finding fails, exactly the behavior the old default
+// --threshold 100 had). Supplying the deprecated --threshold switches back to
+// the legacy passing-controls percentage and warns; combining it with the
+// score gate flags is an error.
+func resolveGateFlags(cmd *cobra.Command) error {
+	thresholdSet = cmd.Flags().Changed("threshold") || os.Getenv(envKeys["threshold"]) != ""
+	minPointsSet = cmd.Flags().Changed("min-points") || os.Getenv(envKeys["min-points"]) != ""
+
+	if thresholdSet && (minPointsSet || minScore != "") {
+		return fmt.Errorf("the deprecated --threshold cannot be combined with --min-points / --min-score; drop --threshold")
+	}
+	if thresholdSet {
+		fmt.Fprintf(os.Stderr, "Warning: --threshold is deprecated and will be removed in a future release; gate on the Plumber Score with --min-points (0-100) or --min-score (A-E) instead. See https://getplumber.io/docs/plumber-score\n")
+		// Inverted comparison so NaN fails closed: ParseFloat accepts "nan",
+		// which every ordered comparison answers false — `< 0 || > 100` would
+		// let it through and the gate could then never fail.
+		if !(threshold >= 0 && threshold <= 100) {
+			return fmt.Errorf("threshold must be between 0 and 100")
+		}
+		return nil
+	}
+	if !(minPoints >= 0 && minPoints <= 100) {
+		return fmt.Errorf("min-points must be between 0 and 100")
+	}
+	if minScore != "" {
+		minScore = strings.ToUpper(strings.TrimSpace(minScore))
+		if control.ScoreLetterRank(minScore) == 0 {
+			return fmt.Errorf("min-score must be one of A, B, C, D, E")
 		}
 	}
 	return nil
@@ -555,37 +673,62 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 	}
 
 	// Apply environment variable fallbacks; CLI flags always take precedence.
-	envStringFallback(cmd, "gitlab-url", envKeys["gitlab-url"], &gitlabURL)
-	envStringFallback(cmd, "github-url", envKeys["github-url"], &githubURL)
-	envStringFallback(cmd, "project", envKeys["project"], &projectPath)
-	envStringFallback(cmd, "provider", envKeys["provider"], &providerFlag)
-	envStringFallback(cmd, "branch", envKeys["branch"], &defaultBranch)
-	envStringFallback(cmd, "config", envKeys["config"], &configFile)
-	envStringFallback(cmd, "output", envKeys["output"], &outputFile)
-	envStringFallback(cmd, "pbom", envKeys["pbom"], &pbomFile)
-	envStringFallback(cmd, "pbom-cyclonedx", envKeys["pbom-cyclonedx"], &pbomCycloneDXFile)
-	envStringFallback(cmd, "sarif", envKeys["sarif"], &sarifFile)
-	envStringFallback(cmd, "glsast", envKeys["glsast"], &glsastFile)
-	envStringFallback(cmd, "controls", envKeys["controls"], &controlsFilter)
-	envStringFallback(cmd, "skip-controls", envKeys["skip-controls"], &skipControls)
-	envStringFallback(cmd, "ci-config-path", envKeys["ci-config-path"], &ciConfigPath)
+	// The string fallbacks mark the flag as set, so env-provided coordinates
+	// select the provider/host/project exactly like flags (the GitLab CI
+	// component passes them as PLUMBER_ANALYZE_* env vars, not flags).
 	for _, apply := range []func() error{
+		func() error { return envStringFallback(cmd, "gitlab-url", envKeys["gitlab-url"], &gitlabURL) },
+		func() error { return envStringFallback(cmd, "github-url", envKeys["github-url"], &githubURL) },
+		func() error { return envStringFallback(cmd, "project", envKeys["project"], &projectPath) },
+		func() error { return envStringFallback(cmd, "provider", envKeys["provider"], &providerFlag) },
+		func() error { return envStringFallback(cmd, "branch", envKeys["branch"], &defaultBranch) },
+		func() error { return envStringFallback(cmd, "config", envKeys["config"], &configFile) },
+		func() error { return envStringFallback(cmd, "output", envKeys["output"], &outputFile) },
+		func() error { return envStringFallback(cmd, "pbom", envKeys["pbom"], &pbomFile) },
+		func() error {
+			return envStringFallback(cmd, "pbom-cyclonedx", envKeys["pbom-cyclonedx"], &pbomCycloneDXFile)
+		},
+		func() error { return envStringFallback(cmd, "sarif", envKeys["sarif"], &sarifFile) },
+		func() error { return envStringFallback(cmd, "glsast", envKeys["glsast"], &glsastFile) },
+		func() error { return envStringFallback(cmd, "csv", envKeys["csv"], &csvFile) },
+		func() error { return envStringFallback(cmd, "ocsf", envKeys["ocsf"], &ocsfFile) },
+		func() error {
+			return envStringFallback(cmd, "score-endpoint", envKeys["score-endpoint"], &scoreEndpoint)
+		},
+		func() error { return envStringFallback(cmd, "platform", envKeys["platform"], &platformURL) },
+		func() error { return envStringFallback(cmd, "controls", envKeys["controls"], &controlsFilter) },
+		func() error { return envStringFallback(cmd, "skip-controls", envKeys["skip-controls"], &skipControls) },
+		func() error {
+			return envStringFallback(cmd, "ci-config-path", envKeys["ci-config-path"], &ciConfigPath)
+		},
 		func() error { return envFloat64Fallback(cmd, "threshold", envKeys["threshold"], &threshold) },
+		func() error { return envStringFallback(cmd, "min-score", envKeys["min-score"], &minScore) },
+		func() error { return envFloat64Fallback(cmd, "min-points", envKeys["min-points"], &minPoints) },
 		func() error { return envBoolFallback(cmd, "print", envKeys["print"], &printOutput) },
 		func() error { return envBoolFallback(cmd, "mr-comment", envKeys["mr-comment"], &mrComment) },
 		func() error { return envBoolFallback(cmd, "badge", envKeys["badge"], &badge) },
 		func() error { return envBoolFallback(cmd, "score", envKeys["score"], &showScore) },
 		func() error { return envBoolFallback(cmd, "score-point", envKeys["score-point"], &showScorePoint) },
+		func() error { return envBoolFallback(cmd, "score-push", envKeys["score-push"], &pushScore) },
 		func() error { return envBoolFallback(cmd, "fail-warnings", envKeys["fail-warnings"], &failWarnings) },
+		func() error { return envBoolFallback(cmd, "no-controls", envKeys["no-controls"], &noControls) },
 	} {
 		if err := apply(); err != nil {
 			return err
 		}
 	}
 
+	// envStringFallback marks --config as changed when PLUMBER_ANALYZE_CONFIG
+	// is set, so this one check covers both an explicit flag and the env var.
+	configExplicitlySet = cmd.Flags().Changed("config")
+
 	flags := readAnalyzeFlags(cmd)
 
 	if err := validateProviderFlags(flags); err != nil {
+		return err
+	}
+
+	if err := resolveGateFlags(cmd); err != nil {
 		return err
 	}
 
@@ -596,12 +739,11 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 
 	remoteInfo := utils.DetectGitRemote()
 
-	providerName, reason := resolveProvider(providerFlag, flags.gitlabURLFromFlag, flags.githubURLFromFlag, remoteInfo)
+	providerName, _ := resolveProvider(providerFlag, flags.gitlabURLFromFlag, flags.githubURLFromFlag, remoteInfo)
 	if providerName == "" {
 		return fmt.Errorf("could not determine the provider: not in a git repository and no provider flag set. " +
 			"Pass --provider github|gitlab, or --github-url <host> / --gitlab-url <url> to target a specific instance")
 	}
-	printProviderDetection(providerName, reason)
 
 	if providerName == "github" {
 		return dispatchGitHub(cmd, flags, remoteInfo, controlsFilterList, skipControlsList)
@@ -612,10 +754,6 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if threshold < 0 || threshold > 100 {
-		return fmt.Errorf("threshold must be between 0 and 100")
-	}
-
 	gitlabToken, err := resolveGitLabToken(flags)
 	if err != nil {
 		return err
@@ -623,7 +761,7 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 
 	cleanGitlabURL := strings.TrimSuffix(gitlabURL, "/")
 
-	plumberConfig, configPath, configWarnings, err := loadConfigOrOffer(configFile)
+	plumberConfig, configPath, configWarnings, err := loadConfigOrOffer(configFile, configExplicitlySet)
 	if err != nil {
 		return err
 	}
@@ -634,15 +772,22 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 	if printOutput {
 		printBanner()
 	}
-	fmt.Fprintf(os.Stderr, "Using configuration: %s\n", configPath)
-	fmt.Fprintf(os.Stderr, "Analyzing project: %s on %s\n", projectPath, cleanGitlabURL)
 
 	conf := buildGitLabConf(cleanGitlabURL, gitlabToken, flags, remote, plumberConfig, controlsFilterList, skipControlsList)
+	conf.ConfigFilePath = configPath
 
 	p, ok := plumberprovider.Get("gitlab")
 	if !ok {
 		return fmt.Errorf("gitlab provider not registered")
 	}
+
+	// Platform mode resolves its policy set, snapshot and CI configuration
+	// BEFORE collection, because what it resolves decides which lanes
+	// collection needs to run at all. Returns nil (and changes nothing)
+	// unless --platform is set.
+	conf.PlatformRun = setupPlatformMode(p, conf)
+	reportPlatformMode(conf.PlatformRun)
+
 	return runWithProvider(p, cmd, conf, controlsFilterList, skipControlsList)
 }
 
@@ -709,26 +854,47 @@ func parseControlsFilter(raw string) ([]string, error) {
 	return controls, nil
 }
 
-func writeJSONToFile(result *control.AnalysisResult, pc *configuration.PlumberConfig, s complianceSummary, p jsonOutputParams) error {
-	threshold, compliance, score, scoreMode, filePath, provider, includeOnly, skip :=
-		s.threshold, s.compliance, s.score, s.scoreMode, p.filePath, p.provider, p.includeOnly, p.skip
+// buildAnalysisJSONReport assembles the ordered analysis JSON payload. The
+// same bytes are written to --output and pushed to the score service, so the
+// stored badge record and the file on disk can never diverge.
+func buildAnalysisJSONReport(result *control.AnalysisResult, pc *configuration.PlumberConfig, s complianceSummary, p jsonOutputParams) ([]byte, error) {
+	score, scoreMode, provider, includeOnly, skip :=
+		s.score, s.scoreMode, p.provider, p.includeOnly, p.skip
 	// Marshal AnalysisResult into a generic map so the per-control
 	// `*Result` legacy blocks can sit alongside its existing fields
 	// without forcing every consumer to follow the dev's flat-findings
 	// shape. The legacy keys (imageForbiddenTagsResult, …) carry the
-	// same issues + metrics + compliance triplet v0.2.x emitted, so
-	// downstream tooling parses the dev output unchanged.
+	// same issues + metrics pair v0.2.x emitted, so downstream tooling
+	// parses the dev output unchanged.
 	raw, err := json.Marshal(result)
 	if err != nil {
-		return fmt.Errorf("marshal result: %w", err)
+		return nil, fmt.Errorf("marshal result: %w", err)
 	}
 	output := map[string]any{}
 	if err := json.Unmarshal(raw, &output); err != nil {
-		return fmt.Errorf("unmarshal result: %w", err)
+		return nil, fmt.Errorf("unmarshal result: %w", err)
 	}
-	output["threshold"] = threshold
-	output["compliance"] = compliance
-	output["passed"] = compliance >= threshold
+	// The gate that produced `passed` is spelled out next to it: the score
+	// gate emits minPoints / minScore; the deprecated --threshold gate emits
+	// threshold for the pipelines still supplying it. The compliance
+	// percentage itself is gone (#320) — plumberScore is the grade.
+	if s.thresholdSet {
+		output["threshold"] = s.threshold
+	} else {
+		if s.pointsGateActive() {
+			output["minPoints"] = s.minPoints
+		}
+		if s.minScore != "" {
+			output["minScore"] = s.minScore
+		}
+	}
+	output["passed"] = s.passed()
+	// `passed` means "the gate was met", and under --no-controls there was no
+	// gate to fail. Say so explicitly so a consumer can tell that apart from
+	// "everything was checked and is clean" without reading every block.
+	if p.noControls {
+		output["noControls"] = true
+	}
 	if scoreMode && score != nil {
 		output["plumberScore"] = score
 	}
@@ -741,7 +907,13 @@ func writeJSONToFile(result *control.AnalysisResult, pc *configuration.PlumberCo
 	if partial := partialControlEntries(result); len(partial) > 0 {
 		output["partialControls"] = partial
 	}
-	for k, v := range legacyResultsByName(result, pc, provider, includeOnly, skip) {
+	// plumberConfig makes the report self-describing: the policy that produced
+	// this grade, parsed into a structured object (not the verbatim file, so
+	// comments and formatting never leave the repo) plus a content hash. The
+	// CLI does NOT classify standard-vs-custom (it's the untrusted client); the
+	// score service classifies server-side from this object and its hash.
+	output["plumberConfig"] = buildPlumberConfigBlock(pc)
+	for k, v := range legacyResultsByName(result, pc, provider, includeOnly, skip, p.noControls) {
 		output[k] = v
 	}
 
@@ -784,11 +956,82 @@ func writeJSONToFile(result *control.AnalysisResult, pc *configuration.PlumberCo
 
 	// Encode with intentional key order so readers see project/context first,
 	// scoring next, then per-control *Result blocks (not Go map lexical order).
-	payload, err := marshalLegacyAnalysisJSONObject(output)
-	if err != nil {
-		return fmt.Errorf("marshal ordered analysis JSON: %w", err)
+	return marshalLegacyAnalysisJSONObject(output)
+}
+
+// buildPlumberConfigBlock returns the self-describing `plumberConfig` block:
+// the policy that produced the run parsed into a structured object (NOT the
+// verbatim file — comments and formatting are dropped), its source, and a
+// sha256 content hash of that object. Falls back to the embedded default
+// (source "default") when no config file was loaded.
+func buildPlumberConfigBlock(pc *configuration.PlumberConfig) map[string]any {
+	source, rawCfg := "default", ""
+	if pc != nil && pc.Raw != "" {
+		source, rawCfg = pc.Source, pc.Raw
 	}
-	if err := os.WriteFile(filePath, payload, 0o644); err != nil {
+	if rawCfg == "" {
+		rawCfg = string(defaultconfig.Get())
+		source = "default"
+	}
+	policy := parsePolicyObject(rawCfg)
+	// Hash the canonical JSON of the parsed policy: encoding/json sorts map
+	// keys, so the digest depends only on the policy's content, never on the
+	// file's comments, whitespace, or key order.
+	canonical, _ := json.Marshal(policy)
+	sum := sha256.Sum256(canonical)
+	return map[string]any{
+		"source":          source,
+		"effectivePolicy": policy,
+		"hash":            "sha256:" + hex.EncodeToString(sum[:]),
+	}
+}
+
+// parsePolicyObject parses YAML config text into a JSON-friendly object,
+// dropping comments and formatting. yaml.v2 decodes maps as map[any]any, which
+// json.Marshal cannot encode, so nested maps are rewritten to string keys.
+// Returns an empty object when the text is blank or cannot be parsed.
+func parsePolicyObject(rawCfg string) map[string]any {
+	if strings.TrimSpace(rawCfg) == "" {
+		return map[string]any{}
+	}
+	var parsed any
+	if err := yaml.Unmarshal([]byte(rawCfg), &parsed); err != nil {
+		return map[string]any{}
+	}
+	obj, ok := normalizeYAMLValue(parsed).(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	return obj
+}
+
+// normalizeYAMLValue rewrites yaml.v2's map[any]any into JSON-encodable
+// map[string]any, recursively, leaving scalars and slices intact.
+func normalizeYAMLValue(v any) any {
+	switch t := v.(type) {
+	case map[any]any:
+		m := make(map[string]any, len(t))
+		for k, val := range t {
+			m[fmt.Sprint(k)] = normalizeYAMLValue(val)
+		}
+		return m
+	case []any:
+		for i := range t {
+			t[i] = normalizeYAMLValue(t[i])
+		}
+		return t
+	default:
+		return v
+	}
+}
+
+// writeJSONToFile builds the analysis JSON report and writes it to p.filePath.
+func writeJSONToFile(result *control.AnalysisResult, pc *configuration.PlumberConfig, s complianceSummary, p jsonOutputParams) error {
+	payload, err := buildAnalysisJSONReport(result, pc, s, p)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(p.filePath, payload, 0o644); err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
 	return nil
@@ -797,7 +1040,7 @@ func writeJSONToFile(result *control.AnalysisResult, pc *configuration.PlumberCo
 // partialControlEntries lists controls whose evaluation was partial —
 // some inputs reachable, others not. CI gates parse this to decide
 // whether to fail loud ("we never actually checked your protection
-// rules") even when compliance is 100%.
+// rules") even when the run passed its gate.
 func partialControlEntries(result *control.AnalysisResult) []map[string]any {
 	if result == nil || result.GitHubStats == nil {
 		return nil
@@ -816,13 +1059,19 @@ func partialControlEntries(result *control.AnalysisResult) []map[string]any {
 
 // analysisJSONLegacyKeyHead is the canonical top-level key order before any
 // *Result control blocks so analysis.json reads: project → CI context →
-// outcome/score → findings (per-control).
+// outcome/score → findings (per-control). plumberConfig is pinned to the very
+// end instead (see analysisJSONLegacyKeyTail).
 var analysisJSONLegacyKeyHead = []string{
 	"projectPath", "projectId", "defaultBranch",
 	"ciConfigSource", "ciValid", "ciMissing", "ciErrors",
 	"pipelineOriginMetrics", "pipelineImageMetrics",
-	"compliance", "threshold", "passed", "plumberScore",
+	"minPoints", "minScore", "threshold", "passed", "plumberScore",
 }
+
+// analysisJSONLegacyKeyTail lists keys pinned to the END of the object, after
+// the per-control *Result blocks and everything else. plumberConfig is bulky
+// (the full parsed policy) and self-describing, so it reads best last.
+var analysisJSONLegacyKeyTail = []string{"plumberConfig"}
 
 func legacyAnalysisJSONKeyOrder(m map[string]any) []string {
 	seen := make(map[string]bool, len(m))
@@ -833,9 +1082,15 @@ func legacyAnalysisJSONKeyOrder(m map[string]any) []string {
 			seen[k] = true
 		}
 	}
+	// Reserve the tail keys so they skip the middle groups below and land at
+	// the very end, in their declared order.
+	tail := make(map[string]bool, len(analysisJSONLegacyKeyTail))
+	for _, k := range analysisJSONLegacyKeyTail {
+		tail[k] = true
+	}
 	var suffixResult []string
 	for k := range m {
-		if seen[k] {
+		if seen[k] || tail[k] {
 			continue
 		}
 		if strings.HasSuffix(k, "Result") {
@@ -849,12 +1104,19 @@ func legacyAnalysisJSONKeyOrder(m map[string]any) []string {
 	}
 	var rest []string
 	for k := range m {
-		if !seen[k] {
-			rest = append(rest, k)
+		if seen[k] || tail[k] {
+			continue
 		}
+		rest = append(rest, k)
 	}
 	sort.Strings(rest)
 	order = append(order, rest...)
+	for _, k := range analysisJSONLegacyKeyTail {
+		if _, ok := m[k]; ok && !seen[k] {
+			order = append(order, k)
+			seen[k] = true
+		}
+	}
 	return order
 }
 
@@ -1044,22 +1306,124 @@ type jsonOutputParams struct {
 	provider    string
 	includeOnly []string
 	skip        []string
+	// noControls mirrors conf.NoControls so the report can say plainly that
+	// nothing was evaluated instead of leaving a consumer to infer it.
+	noControls bool
 }
 
-// complianceSummary bundles the computed compliance values passed to outputText.
+// noControlsSkipReason is the SkipReason stamped on every control of a
+// --no-controls run, in the JSON blocks and anywhere else a skip is explained.
+const noControlsSkipReason = "no controls requested (--no-controls)"
+
+// complianceSummary bundles the computed gate values passed to outputText.
 type complianceSummary struct {
+	// compliance is the legacy passing-controls percentage, computed only to
+	// serve the deprecated --threshold gate. It is never emitted anymore.
 	compliance   float64
 	controlCount int
 	threshold    float64
+	thresholdSet bool
+	minPoints    float64
+	minPointsSet bool
+	minScore     string
 	score        *control.PlumberScoreResult
 	scoreMode    bool
 	scorePoint   bool
+	// noControls records that the run asked for no controls (--no-controls),
+	// which is what tells the gate and the renderer apart a deliberate
+	// zero-control run from a misconfiguration that evaluated nothing.
+	noControls bool
+}
+
+// pointsGateActive reports whether the points gate applies: either it was set
+// explicitly, or nothing was set at all (the default gate is min-points 100).
+// When only --min-score is given, the letter alone gates.
+func (s complianceSummary) pointsGateActive() bool {
+	return s.minPointsSet || s.minScore == ""
+}
+
+// gateErr returns nil when the active gate passes, or the exit-code-1 error
+// describing the failure. The deprecated --threshold gate wins when supplied;
+// otherwise the Plumber Score gates the run.
+func (s complianceSummary) gateErr() error {
+	// --no-controls asked for exactly this: nothing evaluated. Every gate
+	// below reads something the run deliberately did not produce (the
+	// passing-controls percentage, the score), so all of them are inert,
+	// the deprecated --threshold included. This check must stay first: a CI
+	// template that sets --threshold or --min-points globally must not turn
+	// a deliberate artifact-only run into a failure. The zero-control
+	// fail-closed further down exists to catch a run that MEANT to check
+	// something and checked nothing, which is not this.
+	if s.noControls {
+		return nil
+	}
+	if s.thresholdSet {
+		if s.compliance < s.threshold {
+			return &ComplianceError{Compliance: s.compliance, Threshold: s.threshold}
+		}
+		return nil
+	}
+	// Zero controls evaluated: zero findings score 100 pts, but nothing was
+	// checked, so fail closed. This is the ONLY nothing-scoreable case that
+	// fails: a provider-mismatched or empty .plumber.yaml, a skip-all
+	// filter, and — on GitLab, whose ComputeCompliance zeroes the control
+	// count on a missing/invalid CI — a CI-less project. On GitHub a repo
+	// with no (or unparseable) workflows keeps its control count and PASSES
+	// on a clean score: the pre-0.4.0 behavior, restored on purpose so
+	// fleet scanners (plumber radar) don't fail on CI-less repositories.
+	if s.controlCount == 0 {
+		return &ScoreGateError{NoControls: true}
+	}
+	if s.score == nil {
+		return nil
+	}
+	if s.minScore != "" && control.ScoreLetterRank(s.score.Score) < control.ScoreLetterRank(s.minScore) {
+		return &ScoreGateError{Letter: s.score.Score, MinLetter: s.minScore, Points: s.score.FinalPoints}
+	}
+	if s.pointsGateActive() && s.score.FinalPoints < s.minPoints {
+		return &ScoreGateError{Points: s.score.FinalPoints, MinPoints: s.minPoints, PointsGate: true, Letter: s.score.Score}
+	}
+	return nil
+}
+
+// passed reports whether the active gate is met. It is the value written to
+// the JSON `passed` field and shown by the MR comment and job summaries.
+func (s complianceSummary) passed() bool {
+	return s.gateErr() == nil
+}
+
+// gateLine renders the active gate and its outcome as one human-readable
+// sentence fragment, e.g. "score A — 100.0/100 pts, required ≥ 100 pts".
+func (s complianceSummary) gateLine() string {
+	// Same precedence as gateErr: --no-controls makes every gate inert, the
+	// deprecated --threshold included, so the line must not describe a
+	// threshold that did not run. Reversed, `--no-controls --threshold 100`
+	// renders "PASSED (0.0% of controls passing, deprecated threshold 100%)".
+	if s.noControls {
+		return "no controls requested, nothing to score"
+	}
+	if s.thresholdSet {
+		return fmt.Sprintf("%.1f%% of controls passing, deprecated threshold %.0f%%", s.compliance, s.threshold)
+	}
+	if s.controlCount == 0 {
+		return "no controls evaluated, nothing to score"
+	}
+	if s.score == nil {
+		return ""
+	}
+	requirements := []string{}
+	if s.pointsGateActive() {
+		requirements = append(requirements, fmt.Sprintf("≥ %.0f pts", s.minPoints))
+	}
+	if s.minScore != "" {
+		requirements = append(requirements, fmt.Sprintf("≥ %s", s.minScore))
+	}
+	return fmt.Sprintf("score %s — %.1f/100 pts, required %s", s.score.Score, s.score.FinalPoints, strings.Join(requirements, " and "))
 }
 
 // controlSummary holds summary data for a control
 type controlSummary struct {
 	name       string
-	compliance float64
 	issues     int
 	skipped    bool
 	codes      []string
@@ -1111,28 +1475,6 @@ func compareSeverityWorstFirst(a, b control.SeverityCounts) int {
 	return 0
 }
 
-func sortControlSummariesForComplianceTable(s []controlSummary) {
-	sort.SliceStable(s, func(i, j int) bool {
-		a, b := s[i], s[j]
-		if a.skipped != b.skipped {
-			return !a.skipped && b.skipped
-		}
-		if a.skipped {
-			return a.name < b.name
-		}
-		if a.compliance != b.compliance {
-			return a.compliance < b.compliance
-		}
-		if cmp := compareSeverityWorstFirst(a.bySeverity, b.bySeverity); cmp != 0 {
-			return cmp < 0
-		}
-		if a.issues != b.issues {
-			return a.issues > b.issues
-		}
-		return a.name < b.name
-	})
-}
-
 func sortControlSummariesForIssuesTable(s []controlSummary) {
 	sort.SliceStable(s, func(i, j int) bool {
 		a, b := s[i], s[j]
@@ -1170,6 +1512,19 @@ func printBanner() {
 	)
 }
 
+// printCIErrors prints just the CI-configuration errors, without the
+// "no controls could be evaluated" headline. Used on a --no-controls run,
+// where zero controls is the request but an unparseable CI config still
+// has to be explained: it is why the inventory came out empty.
+func printCIErrors(result *control.AnalysisResult) {
+	fmt.Printf(fmtIndentLine, styleError.Render("CI configuration errors:"))
+	bullet := styleError.Render("•")
+	for _, e := range result.CiErrors {
+		fmt.Printf("    %s %s\n", bullet, sanitizeTerminal(e))
+	}
+	fmt.Println()
+}
+
 // printNoControlsWarning prints the warning block shown when zero controls
 // could be evaluated (CI missing, invalid, or data collection failure).
 func printNoControlsWarning(result *control.AnalysisResult) {
@@ -1178,7 +1533,7 @@ func printNoControlsWarning(result *control.AnalysisResult) {
 		fmt.Printf(fmtIndentLine, styleError.Render("CI configuration errors:"))
 		bullet := styleError.Render("•")
 		for _, e := range result.CiErrors {
-			fmt.Printf("    %s %s\n", bullet, e)
+			fmt.Printf("    %s %s\n", bullet, sanitizeTerminal(e))
 		}
 		fmt.Println()
 		return
@@ -1187,8 +1542,8 @@ func printNoControlsWarning(result *control.AnalysisResult) {
 		fmt.Printf(fmtIndentPara, styleDim.Render("CI configuration file is missing from the project."))
 		return
 	}
-	fmt.Printf(fmtIndentLine, styleDim.Render("Data collection failed - compliance defaults to 0%."))
-	fmt.Printf(fmtIndentPara, styleDim.Render("Use --verbose for more info."))
+	fmt.Printf(fmtIndentLine, styleDim.Render("Data collection failed — no checks could run."))
+	fmt.Printf(fmtIndentPara, styleDim.Render("Re-run with --verbose for details."))
 }
 
 // findingsToItems converts a slice of OPA findings into the parallel
@@ -1365,28 +1720,25 @@ func printScoreBreakdown(score *control.PlumberScoreResult) {
 	fmt.Println()
 }
 
-func printControlHeader(name string, compliance float64, skipped bool) {
-	line := strings.Repeat("─", 50)
-	fmt.Printf(fmtColored, colorDim, line, colorReset)
-	if skipped {
-		fmt.Printf("%s%s%s %s(skipped)%s\n", colorBold, name, colorReset, colorDim, colorReset)
-	} else {
-		compColor := colorGreen
-		if compliance < 100 {
-			compColor = colorYellow
-		}
-		if compliance == 0 {
-			compColor = colorRed
-		}
-		fmt.Printf("%s%s%s %s(%.1f%% compliant)%s\n", colorBold, name, colorReset, compColor, compliance, colorReset)
-	}
-	fmt.Printf(fmtColored, colorDim, line, colorReset)
+func printSectionHeader(name string) {
+	printStatusSectionHeader(name, "", "")
 }
 
-func printSectionHeader(name string) {
+// printStatusSectionHeader prints the section band with an optional
+// status glyph and color, so the three control buckets read their state
+// at a glance (✓ green / • dim / ✗ red) instead of three identical bold
+// lines. The glyph echoes the per-item markers used inside the section;
+// the rules stay neutral dim so the one red title in the output is what
+// pulls the eye. Empty glyph/color renders the neutral band (Summary,
+// Points breakdown).
+func printStatusSectionHeader(name, glyph, color string) {
 	line := strings.Repeat("─", 20)
 	fmt.Printf(fmtColored, colorDim, line, colorReset)
-	fmt.Printf(fmtColored, colorBold, name, colorReset)
+	if glyph == "" {
+		fmt.Printf(fmtColored, colorBold, name, colorReset)
+	} else {
+		fmt.Printf("%s%s%s %s%s%s\n", color, glyph, colorReset, colorBold+color, name, colorReset)
+	}
 	fmt.Printf(fmtColored, colorDim, line, colorReset)
 }
 
@@ -1405,6 +1757,27 @@ func printSectionHeader(name string) {
 // modernised two-column layout: a large grade badge on the left, and
 // a side panel on the right with points, progress bar, meaning text,
 // severity chips, and any Critical malus warning.
+// printNoControlsSummary replaces the score banner on a --no-controls run.
+//
+// Simply omitting the banner is not enough: an output with no score in it
+// reads as a rendering glitch, and leaves the reader to guess whether
+// nothing was found or nothing was checked. Those are opposite conclusions,
+// so the run says which one it is, in the place the grade would have been.
+func printNoControlsSummary() {
+	sep := styleRule.Render(strings.Repeat("─", hrWidth))
+	fmt.Println()
+	fmt.Println(" " + sep)
+	fmt.Println(" " + styleMuted.Render("Plumber Score"))
+	fmt.Println()
+	fmt.Printf(" %s\n", styleFail.Render("No control was run (--no-controls)"))
+	fmt.Printf(" %s\n", styleFail.Render("No Plumber Score: nothing was evaluated, so this run makes no claim"))
+	fmt.Printf(" %s\n", styleFail.Render("about the pipeline."))
+	fmt.Printf(" %s\n", styleMuted.Render("The artifacts it wrote contain the collected inventory only."))
+	fmt.Println()
+	fmt.Println(" " + sep)
+	fmt.Println()
+}
+
 func printSummaryScoreBanner(score *control.PlumberScoreResult, scoreMode, degraded bool) {
 	if score == nil || !scoreMode {
 		return
@@ -1554,91 +1927,17 @@ func indentBlock(s, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 
-// complianceTableRow is a single row in the compliance summary table.
-type complianceTableRow struct {
-	isTotal bool
-	name    string
-	compStr string
-	status  string
-	compOK  bool
-}
-
-func complianceStatusEmoji(ok bool) string {
-	if ok {
-		return "🟢"
+// equalIgnoringScheme reports whether two base URLs name the same GitLab
+// instance, treating the scheme (http vs https) and a trailing slash as
+// transport detail rather than identity. Empty strings never match: an
+// absent remote must not equal an absent URL.
+func equalIgnoringScheme(a, b string) bool {
+	norm := func(s string) string {
+		s = strings.TrimSuffix(strings.TrimSpace(s), "/")
+		s = strings.TrimPrefix(s, "https://")
+		s = strings.TrimPrefix(s, "http://")
+		return s
 	}
-	return "🔴"
-}
-
-func buildComplianceRows(controls []controlSummary, overallCompliance, threshold float64) []complianceTableRow {
-	sorted := append([]controlSummary(nil), controls...)
-	sortControlSummariesForComplianceTable(sorted)
-
-	rows := make([]complianceTableRow, 0, len(sorted)+1)
-	for _, ctrl := range sorted {
-		r := complianceTableRow{name: ctrl.name, compStr: "-", status: "-"}
-		if !ctrl.skipped {
-			r.compOK = ctrl.compliance >= 100
-			r.compStr = fmt.Sprintf("%.1f%%", ctrl.compliance)
-			r.status = complianceStatusEmoji(r.compOK)
-		}
-		rows = append(rows, r)
-	}
-	totalOK := overallCompliance >= threshold
-	rows = append(rows, complianceTableRow{
-		isTotal: true,
-		name:    fmt.Sprintf("Total (required: %.0f%%)", threshold),
-		compStr: fmt.Sprintf("%.1f%%", overallCompliance),
-		compOK:  totalOK,
-		status:  complianceStatusEmoji(totalOK),
-	})
-	return rows
-}
-
-func complianceValueStyle(base lipgloss.Style, r complianceTableRow) lipgloss.Style {
-	if r.compStr == "-" {
-		return base.Faint(true)
-	}
-	if r.compOK {
-		return base.Inherit(styleSuccess)
-	}
-	return base.Inherit(styleError)
-}
-
-func complianceTableStyleFunc(rows []complianceTableRow) func(int, int) lipgloss.Style {
-	return func(row, col int) lipgloss.Style {
-		if row == table.HeaderRow {
-			return styleHeader
-		}
-		if row < 0 || row >= len(rows) {
-			return styleCell
-		}
-		r := rows[row]
-		style := styleCell
-		if r.isTotal {
-			style = style.Bold(true)
-		}
-		if col == 1 || col == 2 {
-			return complianceValueStyle(style, r)
-		}
-		return style
-	}
-}
-
-func printComplianceTable(controls []controlSummary, overallCompliance, threshold float64) {
-	fmt.Printf(fmtIndentLine, styleTitle.Render("Compliance"))
-
-	rows := buildComplianceRows(controls, overallCompliance, threshold)
-
-	tbl := table.New().
-		Border(lipgloss.RoundedBorder()).
-		BorderStyle(styleAccent).
-		Headers("Control", "Compliance", "Status").
-		StyleFunc(complianceTableStyleFunc(rows))
-
-	for _, r := range rows {
-		tbl.Row(r.name, r.compStr, r.status)
-	}
-
-	fmt.Println(indentBlock(tbl.String(), "  "))
+	na, nb := norm(a), norm(b)
+	return na != "" && na == nb
 }

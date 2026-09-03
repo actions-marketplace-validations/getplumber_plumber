@@ -16,12 +16,84 @@ import (
 
 const githubWorkflowsSubdir = ".github/workflows"
 
+// maxWorkflowFileBytes bounds a single workflow / dependabot file read.
+const maxWorkflowFileBytes = 1 << 20 // 1 MiB
+
+// resolveWithinRoot joins relParts onto rootDir and returns the path only when
+// it resolves inside rootDir, with symlinks resolved on both sides. ok is false
+// when the path escapes the repository (e.g. a committed symlink), so the
+// caller ignores it rather than reading outside the checkout.
+func resolveWithinRoot(rootDir string, relParts ...string) (string, bool) {
+	rootReal := rootDir
+	if r, err := filepath.EvalSymlinks(rootDir); err == nil {
+		rootReal = r
+	}
+	joined := filepath.Join(append([]string{rootReal}, relParts...)...)
+	targetReal := joined
+	if r, err := filepath.EvalSymlinks(joined); err == nil {
+		targetReal = r
+	}
+	rel, err := filepath.Rel(rootReal, targetReal)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return joined, false
+	}
+	return joined, true
+}
+
 const (
 	fmtReadErr = "read %s: %w"
 	fmtFileErr = "%s: %w"
 )
 
-// ScanGitHubWorkflows reads every .yml/.yaml file under
+// collectWorkflowJobs reads every .yml/.yaml file under
+// <rootDir>/.github/workflows/ and returns the parsed jobs, sorted by
+// name. A missing workflows directory — or one that resolves outside
+// the repository (e.g. a committed symlink) — is not an error: the
+// scan simply carries no jobs, and the caller still collects the
+// repository-level artifacts (dependabot, Renovate, security policy,
+// Dockerfiles) that do not depend on that directory. Individual
+// unreadable or unparseable files land in partialErrors so the caller
+// can surface them without aborting the whole scan.
+func collectWorkflowJobs(rootDir string) (jobs []ir.Job, partialErrors []error, err error) {
+	dir, ok := resolveWithinRoot(rootDir, githubWorkflowsSubdir)
+	if !ok {
+		return nil, nil, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf(fmtReadErr, dir, err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".yml") && !strings.HasSuffix(name, ".yaml") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		data, readErr := utils.ReadFileLimit(path, maxWorkflowFileBytes)
+		if readErr != nil {
+			partialErrors = append(partialErrors, fmt.Errorf(fmtFileErr, name, readErr))
+			continue
+		}
+		fileJobs, parseErr := parseGitHubWorkflowJobs(data, workflowBaseName(name), path)
+		if parseErr != nil {
+			partialErrors = append(partialErrors, fmt.Errorf(fmtFileErr, name, parseErr))
+			continue
+		}
+		jobs = append(jobs, fileJobs...)
+	}
+	sort.Slice(jobs, func(i, j int) bool {
+		return jobs[i].Name < jobs[j].Name
+	})
+	return jobs, partialErrors, nil
+}
+
+// ScanGitHubWorkflowsWithProgress reads every .yml/.yaml file under
 // <rootDir>/.github/workflows/ and aggregates them into a single
 // NormalizedPipeline. Job names are namespaced by the workflow file base
 // name ("ci/lint", "release/build", ...) so two workflows can expose
@@ -31,67 +103,9 @@ const (
 // simply carries no jobs. Individual unreadable or unparseable files are
 // returned in partialErrors so the caller can surface them without
 // aborting the whole scan.
-func ScanGitHubWorkflows(projectPath, defaultBranch, rootDir, apiHost string, enrichActionMetadata bool) (pipeline *ir.NormalizedPipeline, partialErrors []error, err error) {
-	pipeline = &ir.NormalizedPipeline{
-		Provider:      ir.ProviderGitHub,
-		ProjectPath:   projectPath,
-		DefaultBranch: defaultBranch,
-	}
-
-	dir := filepath.Join(rootDir, githubWorkflowsSubdir)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return pipeline, nil, nil
-		}
-		return nil, nil, fmt.Errorf(fmtReadErr, dir, err)
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if !strings.HasSuffix(name, ".yml") && !strings.HasSuffix(name, ".yaml") {
-			continue
-		}
-		path := filepath.Join(dir, name)
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			partialErrors = append(partialErrors, fmt.Errorf(fmtFileErr, name, readErr))
-			continue
-		}
-		jobs, parseErr := parseGitHubWorkflowJobs(data, workflowBaseName(name), path)
-		if parseErr != nil {
-			partialErrors = append(partialErrors, fmt.Errorf(fmtFileErr, name, parseErr))
-			continue
-		}
-		pipeline.Jobs = append(pipeline.Jobs, jobs...)
-	}
-
-	sort.Slice(pipeline.Jobs, func(i, j int) bool {
-		return pipeline.Jobs[i].Name < pipeline.Jobs[j].Name
-	})
-	if dcfg, derr := scanDependabotConfig(rootDir); derr != nil {
-		partialErrors = append(partialErrors, derr)
-	} else if dcfg != nil {
-		pipeline.Dependabot = dcfg
-	}
-	pipeline.RenovateConfigPath = scanRenovateConfig(rootDir)
-	pipeline.SecurityPolicyPath = scanSecurityPolicy(rootDir)
-	pipeline.Dockerfiles = scanDockerfiles(rootDir)
-	// Enrich actions with GitHub API metadata (archived repo, ref
-	// kind, tag SHA). Best-effort: if gh is not authenticated, the
-	// client operates in degraded mode and leaves metadata empty.
-	if enrichActionMetadata {
-		enrichActionsWithAPIMetadata(pipeline, apiHost, nil)
-	}
-	return pipeline, partialErrors, nil
-}
-
-// ScanGitHubWorkflowsWithProgress mirrors ScanGitHubWorkflows but
-// notifies the caller through progressFn as it works. The progress
-// total is sized so the bar advances monotonically end-to-end:
+//
+// The caller is notified through progressFn as the scan works. The
+// progress total is sized so the bar advances monotonically end-to-end:
 //
 //	step 1                 Scanning workflow files
 //	step 2..(1+N)          Resolving action <n>      (N unique refs)
@@ -100,45 +114,25 @@ func ScanGitHubWorkflows(projectPath, defaultBranch, rootDir, apiHost string, en
 // The last step (policy evaluation) is reported by the caller
 // (RunGitHubAnalysis) using the same total so the bar keeps
 // climbing. progressFn may be nil; callers that don't care about
-// progress should call the plain ScanGitHubWorkflows variant.
-func ScanGitHubWorkflowsWithProgress(projectPath, defaultBranch, rootDir, apiHost string, enrichActionMetadata bool, progressFn ProgressFunc) (pipeline *ir.NormalizedPipeline, partialErrors []error, err error) {
+// progress simply pass nil.
+func ScanGitHubWorkflowsWithProgress(projectPath, defaultBranch, rootDir, apiHost string, enrichActionMetadata, scanMutableExec bool, progressFn ProgressFunc) (pipeline *ir.NormalizedPipeline, partialErrors []error, err error) {
 	pipeline = &ir.NormalizedPipeline{
 		Provider:      ir.ProviderGitHub,
 		ProjectPath:   projectPath,
 		DefaultBranch: defaultBranch,
 	}
-	dir := filepath.Join(rootDir, githubWorkflowsSubdir)
-	entries, err := os.ReadDir(dir)
+	// Producer-side check: if the scanned repo is itself an action whose
+	// own source fetches mutable remote code, flag it. Read from the
+	// local checkout; computed even when the repo has no workflows. Gated
+	// on the control being active so a disabled control does no scanning.
+	if scanMutableExec {
+		pipeline.SelfActionMutableExec = ScanLocalSelfAction(rootDir)
+	}
+	jobs, partialErrors, err := collectWorkflowJobs(rootDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return pipeline, nil, nil
-		}
-		return nil, nil, fmt.Errorf(fmtReadErr, dir, err)
+		return nil, nil, err
 	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if !strings.HasSuffix(name, ".yml") && !strings.HasSuffix(name, ".yaml") {
-			continue
-		}
-		path := filepath.Join(dir, name)
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			partialErrors = append(partialErrors, fmt.Errorf(fmtFileErr, name, readErr))
-			continue
-		}
-		jobs, parseErr := parseGitHubWorkflowJobs(data, workflowBaseName(name), path)
-		if parseErr != nil {
-			partialErrors = append(partialErrors, fmt.Errorf(fmtFileErr, name, parseErr))
-			continue
-		}
-		pipeline.Jobs = append(pipeline.Jobs, jobs...)
-	}
-	sort.Slice(pipeline.Jobs, func(i, j int) bool {
-		return pipeline.Jobs[i].Name < pipeline.Jobs[j].Name
-	})
+	pipeline.Jobs = jobs
 	if dcfg, derr := scanDependabotConfig(rootDir); derr != nil {
 		partialErrors = append(partialErrors, derr)
 	} else if dcfg != nil {
@@ -155,7 +149,7 @@ func ScanGitHubWorkflowsWithProgress(projectPath, defaultBranch, rootDir, apiHos
 	total := n + 3
 	report(progressFn, 1, total, "Scanning workflow files")
 	if enrichActionMetadata {
-		enrichActionsWithAPIMetadata(pipeline, apiHost, wrapProgress(progressFn, total))
+		enrichActionsWithAPIMetadata(pipeline, apiHost, scanMutableExec, wrapProgress(progressFn, total))
 	}
 	return pipeline, partialErrors, nil
 }
@@ -254,9 +248,35 @@ func report(fn ProgressFunc, step, total int, message string) {
 // every unique reference so the caller's spinner can track the
 // long phase. Duplicate refs only emit once because the client
 // caches and the enrichment loop iterates actions left to right.
-func enrichActionsWithAPIMetadata(pipeline *ir.NormalizedPipeline, apiHost string, progressFn ProgressFunc) {
-	client := NewGitHubMetadataClientForHost(apiHost)
+// scanMutableExec gates the per-action source fetch that powers
+// actionsMustNotExecuteMutableRemoteCode (ISSUE-714). When false, the
+// collector skips resolveMutableExec entirely — up to ~7 sequential HTTP
+// requests per unique action — so disabling the control removes its
+// scan-time and rate-limit cost instead of merely hiding the findings.
+func enrichActionsWithAPIMetadata(pipeline *ir.NormalizedPipeline, apiHost string, scanMutableExec bool, progressFn ProgressFunc) {
+	enrichActionsWithClient(pipeline, NewGitHubMetadataClientForHost(apiHost), scanMutableExec, progressFn)
+}
+
+// enrichActionsWithClient is enrichActionsWithAPIMetadata with the
+// metadata client supplied rather than constructed, so tests can drive
+// the collector-to-IR handoff through a stubbed transport. Every field
+// the policies read crosses from GitHubMetadata into ir.ActionMetadata
+// here, and a field dropped in that copy silently disables the rule
+// that consumes it while every other test stays green.
+func enrichActionsWithClient(pipeline *ir.NormalizedPipeline, client *GitHubMetadataClient, scanMutableExec bool, progressFn ProgressFunc) {
 	if !client.Available() {
+		// Returning silently here was the widest silent pass on this
+		// provider: no action gets .Metadata, so every rule that reads it
+		// simply never fires, and nine controls report passed over an
+		// enrichment that did not run. The cause was already recorded on
+		// the client and never read.
+		//
+		// The warning goes on the same channel the per-action ones use, so
+		// the renderer and the JSON/SARIF writers surface it exactly as
+		// they already surface a blocked tag list (ISSUE-228).
+		if reason := client.UnavailableReason(); reason != "" {
+			pipeline.AdvisoryWarnings = append(pipeline.AdvisoryWarnings, reason)
+		}
 		return
 	}
 	// Pre-count unique refs for accurate N/total ratios.
@@ -268,6 +288,7 @@ func enrichActionsWithAPIMetadata(pipeline *ir.NormalizedPipeline, apiHost strin
 	}
 	total := len(uniqueRefs)
 	seen := map[string]struct{}{}
+	mreCache := map[string]*ir.MutableRemoteExec{}
 	done := 0
 	for i := range pipeline.Jobs {
 		job := &pipeline.Jobs[i]
@@ -279,19 +300,26 @@ func enrichActionsWithAPIMetadata(pipeline *ir.NormalizedPipeline, apiHost strin
 				report(progressFn, done, total, fmt.Sprintf("Resolving action %s", action.Uses))
 			}
 			meta := client.Resolve(action.Uses)
-			if isZeroMetadata(meta) && action.Comment == "" {
+			var mre *ir.MutableRemoteExec
+			if scanMutableExec {
+				mre = resolveMutableExec(action.Uses, mreCache)
+			}
+			if isZeroMetadata(meta) && action.Comment == "" && mre == nil {
 				continue
 			}
 			amd := &ir.ActionMetadata{
-				RepoArchived:     meta.RepoArchived,
-				RefExists:        meta.RefExists,
-				RefKind:          meta.RefKind,
-				TagSha:           meta.TagSha,
-				LatestTag:        meta.LatestTag,
-				LatestReleaseSha: meta.LatestReleaseSha,
-				RefIsAmbiguous:   meta.RefIsAmbiguous,
-				Advisories:       meta.Advisories,
-				StargazersCount:  meta.StargazersCount,
+				RepoArchived:      meta.RepoArchived,
+				RefExists:         meta.RefExists,
+				RefKnownAbsent:    meta.RefKnownAbsent,
+				RefKind:           meta.RefKind,
+				RefCommitSha:      meta.RefCommitSha,
+				TagSha:            meta.TagSha,
+				LatestTag:         meta.LatestTag,
+				LatestReleaseSha:  meta.LatestReleaseSha,
+				RefIsAmbiguous:    meta.RefIsAmbiguous,
+				Advisories:        meta.Advisories,
+				StargazersCount:   meta.StargazersCount,
+				MutableRemoteExec: mre,
 			}
 			if action.Comment != "" {
 				amd.CommentVersion = extractVersionFromComment(action.Comment)
@@ -356,8 +384,11 @@ type ghDependabotConfig struct {
 // is (nil, nil) and the pipeline simply carries no dependabot data.
 func scanDependabotConfig(rootDir string) (*ir.DependabotConfig, error) {
 	for _, name := range []string{"dependabot.yml", "dependabot.yaml"} {
-		path := filepath.Join(rootDir, ".github", name)
-		data, err := os.ReadFile(path)
+		path, ok := resolveWithinRoot(rootDir, ".github", name)
+		if !ok {
+			continue
+		}
+		data, err := utils.ReadFileLimit(path, maxWorkflowFileBytes)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
@@ -717,6 +748,9 @@ func extractGitHubUses(v any) []ir.Action {
 			continue
 		}
 		action := ir.Action{Uses: uses}
+		if name, ok := stepMap["name"].(string); ok {
+			action.Name = name
+		}
 		if withMap, ok := ghCastStringMap(stepMap["with"]); ok {
 			action.With = withMap
 		}
@@ -878,12 +912,8 @@ func parseGitHubContainer(v any) (ir.Image, bool) {
 	return ir.Image{}, false
 }
 
-// SplitImageRef parses a GitHub Actions image reference into an ir.Image,
+// splitImageRef parses a GitHub Actions image reference into an ir.Image,
 // folding Docker Hub registry-host aliases to docker.io.
-func SplitImageRef(ref string) ir.Image {
-	return splitImageRef(ref)
-}
-
 func splitImageRef(ref string) ir.Image {
 	// Fold Docker Hub registry-host aliases (registry.hub.docker.com,
 	// index.docker.io, registry-1.docker.io) to docker.io so trustedUrls

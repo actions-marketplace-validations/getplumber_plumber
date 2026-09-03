@@ -5,6 +5,15 @@
 # Can be generated with: plumber config generate
 
 version: "2.0"
+
+# Plumber Score publishing is controlled by your CI pipeline, not this file:
+# set the `score-push` input on the Plumber GitHub Action / GitLab component
+# (or pass --score-push / PLUMBER_ANALYZE_SCORE_PUSH). Publishing happens ONLY
+# in CI (it needs a CI-native OIDC id-token, so a local run never publishes and
+# can't spoof another repo's badge). Docs: https://getplumber.io/docs/plumber-score
+# To target a self-hosted score service, set --score-endpoint /
+# PLUMBER_ANALYZE_SCORE_ENDPOINT (the `score-endpoint` CI integration input).
+
 gitlab:
   controls:
     # ===========================================
@@ -138,6 +147,20 @@ gitlab:
         - gcr.io/go-containerregistry/* # google/go-containerregistry (crane, gcrane)
         - gcr.io/google.com/cloudsdktool/* # Google Cloud SDK (gcloud) official
     # ===========================================
+    # CI/CD variables must be protected
+    # ===========================================
+    # Flags project CI/CD settings variables that are not marked
+    # protected, so they are exposed to pipelines on unprotected
+    # branches. GitLab-only.
+    cicdVariablesMustBeProtected:
+      enabled: true
+    # ===========================================
+    # CI/CD variables must be masked
+    # ===========================================
+    # Flags project CI/CD settings variables that are not masked, so
+    # their values print in job logs. GitLab-only.
+    cicdVariablesMustBeMasked:
+      enabled: true
     # Branch must be protected
     # ===========================================
     # Checks that repository branches have proper protection settings.
@@ -168,6 +191,73 @@ gitlab:
       minMergeAccessLevel: 30
       # Minimum access level required to push (0=No one, 30=Developer, 40=Maintainer)
       minPushAccessLevel: 40
+    # ===========================================
+    # MR approval rules must require a minimum number of approvals
+    # ===========================================
+    # Flags approval rules covering all protected branches that require fewer
+    # approvals than the minimum below. GitLab Premium/Ultimate feature; on
+    # Free the approvals API returns no rules, so it passes vacuously. A
+    # genuine 401/403 reports not-evaluable.
+    mergeRequestApprovalRulesMustRequireMinimumApprovals:
+      enabled: true
+      minimumRequiredApprovals: 1
+    # ===========================================
+    # MR approval rules must cover all protected branches
+    # ===========================================
+    # Flags a project where no approval rule applies to all protected branches
+    # (explicit "all protected branches" target only). GitLab Premium/Ultimate
+    # feature; on Free the approvals API returns empty, so this fires. A genuine
+    # 401/403 reports not-evaluable.
+    mergeRequestApprovalRulesMustCoverAllProtectedBranches:
+      enabled: true
+    # ===========================================
+    # MR approval settings must be compliant
+    # ===========================================
+    # Checks the project's MR approval settings against the expectations
+    # below (unset/false = not checked; behaviorWhenCommitIsAdded is a
+    # minimum on keep_approvals < remove_approvals_by_code_owners <
+    # remove_all_approvals). REQUIRES GITLAB PREMIUM OR ULTIMATE: on Free
+    # the settings do not exist and the API answers with defaults, so this
+    # fires. A genuine 401/403 reports not-evaluable.
+    mergeRequestApprovalSettingsMustBeCompliant:
+      enabled: true
+      preventApprovalByAuthor: true
+      preventApprovalsByCommitters: true
+      preventEditingApprovalRulesInMR: true
+      requireReAuthToApprove: false
+      behaviorWhenCommitIsAdded: remove_all_approvals
+    # ===========================================
+    # MR settings must be compliant
+    # ===========================================
+    # Requires the project's merge-request/merge settings (Settings > Merge
+    # requests) to match the values below exactly. Every field is optional:
+    # remove any you don't want enforced. mergeMethod is one of merge, ff,
+    # rebase_merge; squashOption is one of never, always, default_on,
+    # default_off. mergePipelinesEnabled and mergeTrainsEnabled are GitLab
+    # Premium/Ultimate (always false on Free, so drop them there).
+    mergeRequestSettingsMustBeCompliant:
+      enabled: false
+      mergeMethod: ff                      # linear history, no merge commits
+      squashOption: default_on             # squash to one commit by default
+      mergePipelinesEnabled: true          # run the pipeline on the merged result
+      mergeTrainsEnabled: false
+      allowMergeOnSkippedPipeline: false   # never merge when CI was skipped
+      resolveOutdatedDiffDiscussions: true # auto-resolve stale review threads
+      printingMergeRequestLinkEnabled: true
+      removeSourceBranchAfterMerge: true   # clean up the branch after merge
+    # ===========================================
+    # Project must have a security policy source
+    # ===========================================
+    # Requires the project to link a GitLab security policy project (Settings >
+    # Security & Compliance > Policies). Set expectedProjectId (numeric) OR
+    # expectedProjectPath (full path, case-insensitive) to require a specific
+    # policy project — the ID wins if both are set; leave both unset to require
+    # only that SOME policy project is linked. REQUIRES GITLAB ULTIMATE.
+    projectMustHaveSecurityPolicySource:
+      # Set to true to enable this control
+      enabled: false
+      # expectedProjectId: 123
+      # expectedProjectPath: my-group/security-policy-project
     # ===========================================
     # Pipeline must not include hardcoded jobs
     # ===========================================
@@ -500,19 +590,6 @@ gitlab:
       # Supports wildcards (e.g., https://internal-artifacts.example.com/*).
       trustedUrls: []
       # - https://internal-artifacts.example.com/*
-    # ── Pipeline must not leak secrets in configuration ─────────────
-    #
-    # Runs gitleaks against the resolved pipeline YAML to detect hardcoded
-    # secrets (API tokens, private keys, passwords) committed directly in
-    # the CI configuration. Requires gitleaks to be installed and available
-    # on PATH (or configured via gitleaksPath).
-    pipelineMustNotLeakSecretsInConfig:
-      # Set to true to enable this control (requires gitleaks)
-      enabled: false
-      # Path to the gitleaks binary. Defaults to "gitleaks" (PATH lookup).
-      # gitleaksPath: /usr/local/bin/gitleaks
-      # Optional path to a custom gitleaks configuration file.
-      # gitleaksConfigPath: /path/to/gitleaks.toml
     # ── Pipeline must not use Docker-in-Docker ──────────────────────
     #
     # Detects CI/CD jobs that use Docker-in-Docker (dind) services.
@@ -538,22 +615,6 @@ gitlab:
 # ============================================================================
 github:
   controls:
-    # ── Pipeline must not leak secrets in configuration ─────────────
-    #
-    # Runs gitleaks against every workflow file under
-    # .github/workflows/ to detect hardcoded secrets (API tokens,
-    # private keys, passwords) committed directly into the YAML.
-    # Requires gitleaks to be installed and available on PATH (or
-    # configured via gitleaksPath). Disabled by default because
-    # gitleaks is an external dependency.
-    pipelineMustNotLeakSecretsInConfig:
-      # Set to true to enable this control (requires gitleaks)
-      enabled: false
-      # Path to the gitleaks binary. Defaults to "gitleaks" (PATH lookup).
-      # gitleaksPath: /usr/local/bin/gitleaks
-      # Optional path to a custom gitleaks configuration file.
-      # gitleaksConfigPath: /path/to/gitleaks.toml
-
     # ===========================================
     # Actions must be pinned by commit SHA
     # ===========================================
@@ -598,6 +659,8 @@ github:
       # Allowlist of trusted action sources. Each entry is either an
       # exact `owner/repo` or an `owner/*` wildcard for a whole org.
       trustedGithubActions:
+        - getplumber/plumber # Plumber's own GitHub Action
+        - anthropics/claude-code-action # Claude PR review workflow (claude-pr-checks.yml)
         - docker/setup-qemu-action
         - docker/setup-buildx-action
         - docker/login-action
@@ -657,6 +720,19 @@ github:
     # environment — to the reusable workflow regardless of what it
     # actually needs. Use an explicit secrets map instead.
     reusableWorkflowsMustNotInheritSecrets:
+      enabled: true
+
+    # ===========================================
+    # Workflow must not export the entire secrets context
+    # ===========================================
+    # Flags a job that serialises the whole `secrets` context with
+    # toJson(secrets) / toJSON(secrets) into a run script, an env
+    # binding, or an action `with:` input. The JSON blob carries every
+    # repository, organisation and environment secret the job can see;
+    # GitHub log redaction masks known secret values, not a JSON string
+    # derived from them, so a single echo leaks the lot. Reference each
+    # secret by name instead.
+    workflowMustNotExportEntireSecretsContext:
       enabled: true
 
     # ===========================================
@@ -745,6 +821,19 @@ github:
       enabled: true
 
     # ===========================================
+    # Workflow must not write untrusted content to $GITHUB_ENV / $GITHUB_PATH
+    # ===========================================
+    # Flags a `run:` step that writes an attacker-controlled expression
+    # (${{ github.event.* }} / ${{ github.head_ref }}) into $GITHUB_ENV or
+    # $GITHUB_PATH. Both files are sticky: every later step inherits the
+    # variable or PATH entry, so an injected NODE_OPTIONS (or a front-loaded
+    # PATH directory) hijacks later steps. Critical under pull_request_target /
+    # workflow_run. Bind the value through `env:` and reference the shell
+    # variable on the redirect line.
+    workflowMustNotWriteUntrustedContentToGitHubEnv:
+      enabled: true
+
+    # ===========================================
     # Workflow must not use dangerous triggers
     # ===========================================
     # Flags `pull_request_target` and `workflow_run` triggers, which
@@ -765,6 +854,18 @@ github:
     # run together, which is the tj-actions / CVE-2025-30066 vector.
     # Keep fork code under a plain `pull_request` trigger instead.
     pullRequestTargetMustNotCheckoutHead:
+      enabled: true
+
+    # ===========================================
+    # Checkout must not persist credentials
+    # ===========================================
+    # By default `actions/checkout` writes the GITHUB_TOKEN into the
+    # cloned repository's `.git/config`, where it survives for the rest
+    # of the job. Any later step that uploads `.git` as an artifact or
+    # runs fork-controlled code can then exfiltrate the token. The fix
+    # is a one-liner: `with: persist-credentials: false`. Flags any
+    # `actions/checkout` step that omits it or sets it to `true`.
+    checkoutMustNotPersistCredentials:
       enabled: true
 
     # ===========================================
@@ -799,7 +900,7 @@ github:
         - production
         - dev
       allowForcePush: false
-      codeOwnerApprovalRequired: true
+      codeOwnerApprovalRequired: false
 
     # ============================================================================
     # Workflows must include required actions
@@ -931,6 +1032,36 @@ github:
       enabled: true
 
     # ===========================================
+    # Actions must pin commits that exist upstream
+    # ===========================================
+    # Flags `uses: owner/repo@<sha>` references pinned to a 40-character
+    # commit SHA that the upstream repository confirms does not exist:
+    # either a typo (the runner silently falls back to the default
+    # branch) or a commit that was removed or never pushed upstream.
+    #
+    # Scope note: this does NOT detect a fork-network "impostor commit"
+    # (one pushed to a fork of the upstream repo). GitHub serves those
+    # with HTTP 200 from the parent, so they read as present; the control
+    # flags only SHAs the API reports as absent.
+    #
+    # Fires ONLY when the GitHub API confirms the commit is absent from a
+    # repository Plumber can read. A SHA it could not verify
+    # (private/missing repo, rate limit, network error) stays silent, so
+    # a valid pin is never flagged. Non-SHA refs (tags, branches) are out
+    # of scope here; mutable-ref concerns are
+    # actionsMustBePinnedByCommitSha's job.
+    #
+    # Scope: committed `.github/workflows/*.{yml,yaml}` only; step-level
+    # `uses: owner/repo@<sha>`. Job-level reusable-workflow refs are not
+    # yet covered: the collector does not enrich them with API metadata
+    # for ANY metadata control (also affects archived / known-CVE /
+    # ref-confusion); extending all four together is tracked upstream.
+    # Requires GitHub API auth (`gh` / GH_TOKEN); without it the rule
+    # abstains (no finding).
+    actionRefsMustExistUpstream:
+      enabled: true
+
+    # ===========================================
     # Actions must not carry known CVEs
     # ===========================================
     # Cross-references every `uses: owner/repo@ref` against the GitHub
@@ -959,6 +1090,97 @@ github:
     # actions nested inside composite actions you do not call directly.
     actionsMustNotCarryKnownCVEs:
       enabled: true
+
+    # ===========================================
+    # Actions must not execute mutable remote code
+    # ===========================================
+    # Flags a third-party action that, even pinned by commit SHA, fetches
+    # and executes a script from a MOVING ref (main/master/HEAD) of
+    # another repository at runtime. Pinning the action's own ref does
+    # not make its execution immutable: the fetched code can change with
+    # nothing committed where the pin can see it. The canonical case is
+    # anchore/scan-action, which runs `raw.githubusercontent.com/anchore/
+    # grype/main/install.sh`. Driven by the collector's per-action source
+    # analysis (needs API metadata enrichment). Config-free; toggle via
+    # `enabled`.
+    actionsMustNotExecuteMutableRemoteCode:
+      enabled: true
+
+    # ===========================================
+    # Release workflows must not restore an untrusted cache
+    # ===========================================
+    # Flags a release/publish job that restores a build cache whose key
+    # is not scoped to the release ref. GitHub Actions caches are shared
+    # across branches with a permissive fallback, so a PR run on any
+    # feature branch can populate the same key a release job later
+    # restores, injecting compromised artefacts into the published
+    # output (the May 2026 TanStack vector). Weave github.ref_name /
+    # github.sha into the cache key, or disable caching on publish paths.
+    #
+    # The action / script inventories below are configurable: the built-in
+    # cache semantics (which setup-* actions cache by default vs on opt-in)
+    # stay in code, but WHICH actions publish, WHICH extra actions restore a
+    # cache, and WHICH shell commands mean "publish" are org-specific. Extend
+    # them for your own tooling instead of waiting for a plumber release.
+    releaseWorkflowsMustNotRestoreUntrustedCache:
+      enabled: true
+      # Actions that publish/release artifacts (a job running one restores
+      # into a published build). Add your org's own publish actions.
+      publishActions:
+        - pypa/gh-action-pypi-publish
+        - JS-DevTools/npm-publish
+        - gradle/publish-plugin
+        - softprops/action-gh-release
+        - ncipollo/release-action
+        - goreleaser/goreleaser-action
+        - crazy-max/ghaction-docker-buildx
+        - changesets/action
+      # Full inventory of cache-restoring actions AND their per-action
+      # semantics (the rego hardcodes none of this). mode:
+      #   always  — restores whenever present (actions/cache, rust-cache)
+      #   default — restores unless disableInput holds disableValue
+      #   opt-in  — restores only when enableInput names a package manager
+      #             (enableContains further requires that substring in the
+      #             value, e.g. build-push-action only caches via GHA when
+      #             cache-from mentions type=gha)
+      # Add your org's own cache actions with the matching mode.
+      cacheActions:
+        - {action: actions/cache, mode: always}
+        - {action: actions/cache/restore, mode: always}
+        - {action: Swatinem/rust-cache, mode: always}
+        - {action: actions/setup-go, mode: default, disableInput: cache, disableValue: false}
+        - {action: gradle/actions/setup-gradle, mode: default, disableInput: cache-disabled, disableValue: true}
+        - {action: actions/setup-node, mode: opt-in, enableInput: cache}
+        - {action: actions/setup-python, mode: opt-in, enableInput: cache}
+        - {action: actions/setup-java, mode: opt-in, enableInput: cache}
+        - {action: pnpm/action-setup, mode: opt-in, enableInput: cache}
+        - {action: docker/build-push-action, mode: opt-in, enableInput: cache-from, enableContains: type=gha}
+      # Shell commands (regex) that mark a job as release intent even under a
+      # plain push/tag trigger with no publish action.
+      publishScriptPatterns:
+        - '(?i)(npm|pnpm|yarn|bun)\s+publish'
+        - '(?i)cargo\s+publish'
+        - '(?i)twine\s+upload'
+        - '(?i)poetry\s+publish'
+        - '(?i)gh\s+release\s+create'
+        - '(?i)goreleaser\s+release'
+        - '(?i)semantic-release'
+        - '(?i)gradlew?\b[^\n]*\bpublish'
+        - '(?i)\bmvnw?\b[^\n]*\bdeploy\b'
+        - '(?i)dotnet\s+nuget\s+push'
+        - '(?i)gem\s+push'
+        - '(?i)docker\s+push'
+      # Verification-only forms that veto a publish-script match on the same
+      # run block — they never publish anything.
+      publishScriptExcludePatterns:
+        - '(?i)--dry-run'
+        - '(?i)publishToMavenLocal'
+      # Jobs to exempt from this control (glob on `<workflow-file>/<job-id>`).
+      # The escape hatch for release jobs you have reviewed and accepted —
+      # e.g. a lint job that caches but ships nothing.
+      allowedJobs: []
+        # - '*/lint'
+        # - 'release-docs/*'
 
     # ===========================================
     # Pipeline must not enable debug trace

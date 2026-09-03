@@ -11,11 +11,8 @@ import (
 	"github.com/getplumber/plumber/configuration"
 	"github.com/getplumber/plumber/control"
 	githubpkg "github.com/getplumber/plumber/github"
-	"github.com/getplumber/plumber/internal/ir"
-	"github.com/getplumber/plumber/pbom"
 	plumberprovider "github.com/getplumber/plumber/provider"
 	"github.com/getplumber/plumber/utils"
-	"github.com/sirupsen/logrus"
 )
 
 const githubDotCom = "github.com"
@@ -31,7 +28,7 @@ const githubDotCom = "github.com"
 // the config and its path. It is the shared setup step for both GitHub analyze
 // paths.
 func loadGitHubConfig() (*configuration.PlumberConfig, string, error) {
-	plumberConfig, configPath, configWarnings, err := loadConfigOrOffer(configFile)
+	plumberConfig, configPath, configWarnings, err := loadConfigOrOffer(configFile, configExplicitlySet)
 	if err != nil {
 		return nil, "", err
 	}
@@ -47,20 +44,19 @@ func loadGitHubConfig() (*configuration.PlumberConfig, string, error) {
 	return plumberConfig, configPath, nil
 }
 
-func runGitHubAnalyze(info *utils.GitRemoteInfo, controlsFilterList, skipControlsList []string) error {
-	fmt.Fprintf(os.Stderr, "GitHub project: %s (local clone)\n", info.ProjectPath)
-
-	plumberConfig, configPath, err := loadGitHubConfig()
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "Using configuration: %s\n", configPath)
-
-	if printOutput {
-		printBanner()
-	}
-
+// buildGitHubLocalConf constructs the analysis Configuration for the
+// local-clone GitHub flow. Extracted from runGitHubAnalyze so the wiring
+// (in particular the control scope, which carries --no-controls) is
+// reachable from a test without running an analysis, mirroring
+// buildGitLabConf.
+func buildGitHubLocalConf(
+	info *utils.GitRemoteInfo,
+	plumberConfig *configuration.PlumberConfig,
+	configPath string,
+	controlsFilterList, skipControlsList []string,
+) *configuration.Configuration {
 	conf := configuration.NewDefaultConfiguration()
+	conf.ConfigFilePath = configPath
 	conf.ProjectPath = info.ProjectPath
 	conf.GitRepoRoot = info.RepoRoot
 	// This command is the local-clone GitHub flow: the working tree
@@ -70,11 +66,10 @@ func runGitHubAnalyze(info *utils.GitRemoteInfo, controlsFilterList, skipControl
 	conf.IsLocalProject = true
 	conf.Branch = defaultBranch
 	conf.PlumberConfig = plumberConfig
-	conf.ControlsFilter = controlsFilterList
-	conf.SkipControlsFilter = skipControlsList
+	applyControlScope(conf, controlsFilterList, skipControlsList)
 	// API host for the settings/metadata controls. Precedence:
 	//   1. --github-url, if the user passed it explicitly;
-	//   2. otherwise the git remote host, when it is not github.com — this
+	//   2. otherwise the git remote host, when it is not github.com - this
 	//      is a GitHub Enterprise Server clone, so target its API directly
 	//      (mirrors how the GitLab path auto-uses the remote URL). go-gh
 	//      resolves the matching token (GH_ENTERPRISE_TOKEN / gh auth login
@@ -85,12 +80,40 @@ func runGitHubAnalyze(info *utils.GitRemoteInfo, controlsFilterList, skipControl
 		apiHost = info.Host
 	}
 	conf.GithubAPIHost = apiHost
-	if verbose {
-		conf.LogLevel = logrus.DebugLevel
+	return conf
+}
+
+// buildGitHubRemoteConf is the upstream-fetch counterpart of
+// buildGitHubLocalConf, extracted for the same reason.
+func buildGitHubRemoteConf(
+	owner, repo, ref, apiHost string,
+	plumberConfig *configuration.PlumberConfig,
+	configPath string,
+	controlsFilterList, skipControlsList []string,
+) *configuration.Configuration {
+	conf := configuration.NewDefaultConfiguration()
+	conf.ConfigFilePath = configPath
+	conf.ProjectPath = owner + "/" + repo
+	conf.Branch = ref
+	conf.PlumberConfig = plumberConfig
+	conf.GithubAPIHost = apiHost
+	applyControlScope(conf, controlsFilterList, skipControlsList)
+	return conf
+}
+
+func runGitHubAnalyze(info *utils.GitRemoteInfo, controlsFilterList, skipControlsList []string) error {
+	plumberConfig, configPath, err := loadGitHubConfig()
+	if err != nil {
+		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Scanning workflows under: %s\n", info.RepoRoot)
-	printGitHubAuthBanner(apiHost, false)
+	if printOutput {
+		printBanner()
+	}
+
+	conf := buildGitHubLocalConf(info, plumberConfig, configPath, controlsFilterList, skipControlsList)
+
+	printGitHubAuthBanner(conf.GithubAPIHost, false)
 
 	p, ok := plumberprovider.Get("github")
 	if !ok {
@@ -121,30 +144,15 @@ func runGitHubAnalyzeRemote(host, project, ref string, controlsFilterList, skipC
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "Using configuration: %s\n", configPath)
 
 	if printOutput {
 		printBanner()
 	}
 
 	apiHost := strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://")
-	if apiHost == githubDotCom || apiHost == "" {
-		fmt.Fprintf(os.Stderr, "Analyzing GitHub project: %s/%s (remote fetch)\n", owner, repo)
-	} else {
-		fmt.Fprintf(os.Stderr, "Analyzing GitHub project: %s/%s on %s (remote fetch)\n", owner, repo, apiHost)
-	}
 	printGitHubAuthBanner(apiHost, true)
 
-	conf := configuration.NewDefaultConfiguration()
-	conf.ProjectPath = owner + "/" + repo
-	conf.Branch = ref
-	conf.PlumberConfig = plumberConfig
-	conf.GithubAPIHost = apiHost
-	conf.ControlsFilter = controlsFilterList
-	conf.SkipControlsFilter = skipControlsList
-	if verbose {
-		conf.LogLevel = logrus.DebugLevel
-	}
+	conf := buildGitHubRemoteConf(owner, repo, ref, apiHost, plumberConfig, configPath, controlsFilterList, skipControlsList)
 
 	p, ok := plumberprovider.Get("github")
 	if !ok {
@@ -220,109 +228,4 @@ func detectGitHubAuthSource(apiHost string) string {
 		return "gh"
 	}
 	return ""
-}
-
-// parseAdvisoryIDs extracts the advisory ID strings from the raw []any slice
-// stored in a finding's Data map.
-func parseAdvisoryIDs(advRaw []any) []string {
-	ids := make([]string, 0, len(advRaw))
-	for _, a := range advRaw {
-		if s, ok := a.(string); ok && s != "" {
-			ids = append(ids, s)
-		}
-	}
-	return ids
-}
-
-// applyVulnerableAction records a vulnerable action and its advisory IDs.
-func applyVulnerableAction(uses string, data map[string]any, out *pbom.GitHubComplianceData) {
-	out.VulnerableActions[uses] = true
-	if advRaw, ok := data["advisories"].([]any); ok {
-		if ids := parseAdvisoryIDs(advRaw); len(ids) > 0 {
-			out.ActionAdvisories[uses] = ids
-		}
-	}
-}
-
-// applyFindingToCompliance updates the appropriate compliance map field based
-// on a single finding's code and data.
-func applyFindingToCompliance(code string, data map[string]any, out *pbom.GitHubComplianceData) {
-	switch code {
-	case string(control.CodeImageForbiddenTag):
-		if v, ok := data["link"].(string); ok && v != "" {
-			out.ForbiddenTagImages[v] = true
-		}
-	case string(control.CodeActionUnpinned):
-		if v, ok := data["uses"].(string); ok && v != "" {
-			out.UnpinnedActions[v] = true
-		}
-	case string(control.CodeActionArchivedRepo):
-		if v, ok := data["uses"].(string); ok && v != "" {
-			out.ArchivedActions[v] = true
-		}
-	case string(control.CodeKnownVulnerableAction):
-		if v, ok := data["uses"].(string); ok && v != "" {
-			applyVulnerableAction(v, data, out)
-		}
-	}
-}
-
-// collectPinnedImages walks the normalized pipeline IR and records every
-// image that is pinned by digest.
-func collectPinnedImages(result *control.AnalysisResult, out *pbom.GitHubComplianceData) {
-	if result.GitHubPipeline == nil {
-		return
-	}
-	for _, j := range result.GitHubPipeline.Jobs {
-		if j.Image != nil && j.Image.Digest != "" {
-			out.ImagesPinnedByDigest[normalizeIRImageRef(*j.Image)] = true
-		}
-		for _, s := range j.Services {
-			if s.Digest != "" {
-				out.ImagesPinnedByDigest[normalizeIRImageRef(s)] = true
-			}
-		}
-	}
-}
-
-// buildGitHubPBOMCompliance walks Findings and the IR to assemble
-// the per-image / per-action compliance lookup the PBOM generator
-// uses to enrich entries. Returns nil when there is nothing to enrich.
-func buildGitHubPBOMCompliance(result *control.AnalysisResult) *pbom.GitHubComplianceData {
-	if result == nil {
-		return nil
-	}
-	out := &pbom.GitHubComplianceData{
-		ForbiddenTagImages:   map[string]bool{},
-		ImagesPinnedByDigest: map[string]bool{},
-		UnpinnedActions:      map[string]bool{},
-		ArchivedActions:      map[string]bool{},
-		VulnerableActions:    map[string]bool{},
-		ActionAdvisories:     map[string][]string{},
-	}
-	for _, f := range result.Findings {
-		applyFindingToCompliance(f.Code, f.Data, out)
-	}
-	collectPinnedImages(result, out)
-	return out
-}
-
-// normalizeIRImageRef mirrors pbom.normalizeImageRef so the keys we
-// stamp into the compliance lookup match the ones the PBOM emits.
-// Kept private to cmd/ to avoid leaking pbom internals.
-func normalizeIRImageRef(img ir.Image) string {
-	if img.Name == "" {
-		return ""
-	}
-	ref := img.Name
-	if img.Registry != "" && !strings.HasPrefix(ref, img.Registry+"/") {
-		ref = img.Registry + "/" + ref
-	}
-	if img.Digest != "" {
-		return ref + "@" + img.Digest
-	}
-	if img.Tag != "" {
-		return ref + ":" + img.Tag
-	}
-	return ref
 }

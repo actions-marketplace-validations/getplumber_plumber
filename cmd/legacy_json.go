@@ -28,9 +28,8 @@ func _minAccessLevelGitlab(levels []gitlab.BranchProtectionAccessLevel) int {
 // legacyResultsByName builds the per-control `*Result` JSON blocks
 // that the v0.2.x analyzer emitted alongside the bare findings list.
 // External consumers (CI gates, dashboards, MR comment generators)
-// learned to parse those blocks: each control's issues list, its
-// `metrics` object, and the binary `compliance` flag travel together
-// under a stable JSON key. The Rego port had collapsed them into a
+// learned to parse those blocks: each control's issues list and its
+// `metrics` object travel together under a stable JSON key. The Rego port had collapsed them into a
 // single `findings` array, so we reconstruct them here from the IR
 // data still attached to AnalysisResult plus the bucketed Rego
 // findings.
@@ -43,9 +42,20 @@ func _minAccessLevelGitlab(levels []gitlab.BranchProtectionAccessLevel) int {
 // applied via control.MarkSkippedByFilter so the per-block `skipped:`
 // field tracks both the YAML enabled flag AND the CLI filter. Pass
 // nil/empty when no filter is active.
-func legacyResultsByName(result *control.AnalysisResult, pc *configuration.PlumberConfig, provider string, includeOnly, skip []string) map[string]any {
+func legacyResultsByName(result *control.AnalysisResult, pc *configuration.PlumberConfig, provider string, includeOnly, skip []string, noControls bool) map[string]any {
 	if result == nil || pc == nil {
 		return nil
+	}
+	// --no-controls: the blocks still describe the catalog, but every one of
+	// them must read as "not evaluated". `status` exists so consumers stop
+	// inferring a pass from an empty issues list, so it is exactly the field
+	// that has to tell the truth for a run that evaluated nothing.
+	markSkipped := func(entries []control.ControlEntry) {
+		if noControls {
+			control.MarkAllSkipped(entries, noControlsSkipReason)
+			return
+		}
+		control.MarkSkippedByFilter(entries, includeOnly, skip)
 	}
 	out := map[string]any{}
 	findingsByControl := control.FindingsByControl(result.Findings)
@@ -53,42 +63,160 @@ func legacyResultsByName(result *control.AnalysisResult, pc *configuration.Plumb
 	switch provider {
 	case "github":
 		entries := control.GitHubControls(pc)
-		control.MarkSkippedByFilter(entries, includeOnly, skip)
+		markSkipped(entries)
 		for _, e := range entries {
 			fs := findingsByControl[e.ControlName]
 			key, block := buildLegacyResultGitHub(e, result, pc, fs)
 			if key == "" {
 				continue
 			}
-			out[key] = block
+			out[key] = _withControlMeta(block, e, result, len(fs))
 		}
 	default:
 		entries := control.GitLabControls(pc)
-		control.MarkSkippedByFilter(entries, includeOnly, skip)
+		markSkipped(entries)
 		for _, e := range entries {
 			fs := findingsByControl[e.ControlName]
 			key, block := buildLegacyResult(e, result, pc, fs)
 			if key == "" {
 				continue
 			}
-			out[key] = block
+			out[key] = _withControlMeta(block, e, result, len(fs))
 		}
 	}
 	return out
 }
 
+// _withControlMeta stamps the block's stable .plumber.yaml control name
+// and its evaluation status onto the block itself.
+//
+// controlName lives here once rather than on every individual issue --
+// every issue in a block's `issues` array is guaranteed to share the
+// same controlName (FindingsByControl buckets strictly by it), so
+// repeating it per-issue would be pure redundancy.
+//
+// status is the explicit passed/failed/skipped/error verdict
+// (control.StatusFor) so consumers stop inferring pass from "issues is
+// empty" -- an empty list can also mean the control never really
+// evaluated (missing CI config, degraded collection). The existing
+// `skipped` boolean stays untouched for backward compatibility;
+// status: "skipped" mirrors it.
+//
+// Every `buildX...` function returns map[string]any; the type assertion
+// only fails for a hand-built AnalysisResult in a test that skips the
+// real builders.
+func _withControlMeta(block any, e control.ControlEntry, result *control.AnalysisResult, findingCount int) any {
+	if m, ok := block.(map[string]any); ok {
+		m["controlName"] = e.ControlName
+		// Display metadata next to the stable technical id (#440): the
+		// docs-catalog wording and grouping, so no consumer has to maintain
+		// a technicalName -> human-name map that drifts on every release.
+		if meta, ok := configuration.ControlMetaFor(e.ControlName); ok {
+			m["name"] = meta.DisplayName
+			m["category"] = meta.Category
+		}
+		m["status"] = control.StatusFor(e, result, findingCount)
+		if result != nil && result.ApprovalRulesTierCaveat && isApprovalRuleControl(e.ControlName) {
+			// Structured so a consumer can key on it: the approvals API returned
+			// no rules, which on GitLab Free means the feature is unavailable
+			// (the API 200-empties) rather than a real misconfiguration.
+			m["tierCaveat"] = map[string]any{
+				"reason":       "no-approval-rules-returned",
+				"requiresTier": "premium_or_ultimate",
+				"message":      approvalRulesTierCaveatMessage,
+			}
+		}
+		if result != nil && result.MRApprovalSettingsTierCaveat && e.ControlName == "mergeRequestApprovalSettingsMustBeCompliant" {
+			// Same tier-ambiguity as the rules caveat, one step blinder: the
+			// settings API 200-defaults every protection off on GitLab Free, so a
+			// no-protection read can't be told apart from a genuinely unlocked paid
+			// project. Keyed so a consumer can suppress or annotate ISSUE-503.
+			m["tierCaveat"] = map[string]any{
+				"reason":       "no-approval-protections",
+				"requiresTier": "premium_or_ultimate",
+				"message":      mrApprovalSettingsTierCaveatMessage,
+			}
+		}
+		if result != nil && len(result.MRSettingsPremiumCaveatFields) > 0 && e.ControlName == "mergeRequestSettingsMustBeCompliant" {
+			// One or more configured MR-setting expectations require a Premium/
+			// Ultimate feature the project cannot turn on (merge trains, merged-
+			// results pipelines). Keyed with the offending fields so a consumer can
+			// annotate ISSUE-506 or advise disabling just those expectations.
+			m["tierCaveat"] = map[string]any{
+				"reason":       "premium-settings-expected-on",
+				"requiresTier": "premium_or_ultimate",
+				"fields":       result.MRSettingsPremiumCaveatFields,
+				"message":      mrSettingsTierCaveatMessage,
+			}
+		}
+		if result != nil && result.SecurityPolicyTierCaveat && e.ControlName == "projectMustHaveSecurityPolicySource" {
+			// No policy project is linked, and security policies are an Ultimate
+			// feature, so we cannot tell a non-Ultimate project (unable to link)
+			// from an Ultimate project that left it unset. Keyed so a consumer can
+			// annotate ISSUE-601.
+			m["tierCaveat"] = map[string]any{
+				"reason":       "no-security-policy-project-linked",
+				"requiresTier": "ultimate",
+				"message":      securityPolicyTierCaveatMessage,
+			}
+		}
+	}
+	return block
+}
+
+// approvalRulesTierCaveatMessage explains the Premium/Ultimate requirement for
+// the MR approval-rule controls when the approvals API returned no rules.
+// Shared by the terminal caveat (render_details.go) and the JSON tierCaveat.
+const approvalRulesTierCaveatMessage = "MR approval rules are a GitLab Premium/Ultimate feature. Disable these controls if you don't have GitLab Premium or Ultimate."
+
+// mrApprovalSettingsTierCaveatMessage explains the Premium/Ultimate requirement
+// for the MR approval-settings control (ISSUE-503) when the project has no
+// approval protection in effect. Shared by the terminal caveat
+// (render_details.go) and the JSON tierCaveat.
+const mrApprovalSettingsTierCaveatMessage = "MR approval settings are a GitLab Premium/Ultimate feature and this project has no approval protections in effect. If you're not on GitLab Premium or Ultimate you can't set them — disable this control."
+
+// mrSettingsTierCaveatMessage explains that one or more configured MR-setting
+// expectations (see the tierCaveat "fields") require a GitLab Premium/Ultimate
+// feature the project cannot turn on. Shared by the terminal caveat
+// (render_details.go) and the JSON tierCaveat.
+const mrSettingsTierCaveatMessage = "One or more expected MR settings are GitLab Premium/Ultimate features that read as off (see fields). The API gives no tier signal, so this may be a Free project that cannot enable them or a paid project that left them off. If this project is not on GitLab Premium/Ultimate, set those expectations to false or remove them from mergeRequestSettingsMustBeCompliant; if it is, enable the feature to satisfy the check."
+
+// isApprovalRuleControl reports whether a control name is one of the two
+// GitLab MR approval-rule controls the tier caveat applies to.
+func isApprovalRuleControl(name string) bool {
+	return name == "mergeRequestApprovalRulesMustRequireMinimumApprovals" ||
+		name == "mergeRequestApprovalRulesMustCoverAllProtectedBranches"
+}
+
+// securityPolicyTierCaveatMessage explains the Ultimate requirement for
+// ISSUE-601 when no security policy project is linked. Shared by the terminal
+// caveat (render_details.go) and the JSON tierCaveat.
+const securityPolicyTierCaveatMessage = "Security policies require GitLab Ultimate, and no policy project is linked. If this project is not on GitLab Ultimate it cannot link one — disable this control. If it is, link the expected security policy project to satisfy the check."
+
+// buildSecurityPolicyProjectBlock emits the legacy JSON block for the
+// security-policy-project linkage control (ISSUE-601). The finding is a
+// project-level singleton (no file/job); its linkedProjectId / linkedProjectPath
+// / expectedProjectId ride in the issue's data, preserved by projectFindings.
+func buildSecurityPolicyProjectBlock(c legacyCommon, findings []opaengine.Finding) map[string]any {
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"projectWithoutExpectedSecurityPolicy": len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
 // buildLegacyResult routes a control entry to its legacy JSON
 // builder and returns the (jsonKey, block) pair.
 func buildLegacyResult(e control.ControlEntry, result *control.AnalysisResult, pc *configuration.PlumberConfig, findings []opaengine.Finding) (string, any) {
-	compliance := 100.0
-	if !e.Skipped && len(findings) > 0 {
-		compliance = 0
-	}
 	common := legacyCommon{
-		Compliance: compliance,
-		CiValid:    result.CiValid,
-		CiMissing:  result.CiMissing,
-		Skipped:    e.Skipped,
+		CiValid:   result.CiValid,
+		CiMissing: result.CiMissing,
+		Skipped:   e.Skipped,
 	}
 
 	switch e.ControlName {
@@ -98,13 +226,15 @@ func buildLegacyResult(e control.ControlEntry, result *control.AnalysisResult, p
 		return "imageAuthorizedSourcesResult", buildImageAuthorizedSourcesBlock(common, result, findings)
 	case "branchMustBeProtected":
 		return "branchProtectionResult", buildBranchProtectionBlock(common, result, pc, findings)
+	case "projectMustHaveSecurityPolicySource":
+		return "securityPolicyProjectResult", buildSecurityPolicyProjectBlock(common, findings)
 	case "pipelineMustNotIncludeHardcodedJobs":
 		return "hardcodedJobsResult", buildHardcodedJobsBlock(common, result, findings)
 	case "externalRefsMustNotCollide":
 		return "includeRefConfusionResult", buildIncludeRefConfusionBlock(common, result, findings)
 	case "includesMustBeUpToDate":
 		return "outdatedIncludesResult", buildOutdatedIncludesBlock(common, result, findings)
-	// (jobNameKey is dropped for the outdated builder — the legacy
+	// (jobKey is dropped for the outdated builder — the legacy
 	// shape replaces `job` with `gitlabIncludeLocation`.)
 	case "includesMustNotUseForbiddenVersions":
 		return "forbiddenVersionsIncludesResult", buildForbiddenVersionsBlock(common, result, findings)
@@ -120,36 +250,170 @@ func buildLegacyResult(e control.ControlEntry, result *control.AnalysisResult, p
 		return "securityJobsWeakenedResult", buildSecurityJobsBlock(common, result, pc, findings)
 	case "pipelineMustNotExecuteUnverifiedScripts":
 		return "unverifiedScriptsResult", buildUnverifiedScriptsBlock(common, result, findings)
-	case "pipelineMustNotLeakSecretsInConfig":
-		return "leakedSecretsResult", buildLeakedSecretsBlock(common, result, findings)
 	case "pipelineMustNotOverrideJobVariables":
 		return "jobVariablesOverrideResult", buildJobVariablesOverrideBlock(common, result, findings)
 	case "pipelineMustNotUseDockerInDocker":
 		return "dockerInDockerResult", buildDockerInDockerBlock(common, result, findings)
+	case "mergeRequestApprovalRulesMustRequireMinimumApprovals":
+		return "mrApprovalRulesMinApprovalsResult", buildMRApprovalRulesMinApprovalsBlock(common, findings)
+	case "mergeRequestApprovalRulesMustCoverAllProtectedBranches":
+		return "mrApprovalRulesCoverAllBranchesResult", buildMRApprovalRulesCoverAllBranchesBlock(common, findings)
+	case "cicdVariablesMustBeProtected":
+		return "cicdVariablesProtectedResult", buildCicdVariablesProtectedBlock(common, result, findings)
+	case "cicdVariablesMustBeMasked":
+		return "cicdVariablesMaskedResult", buildCicdVariablesMaskedBlock(common, result, findings)
+	case "mergeRequestApprovalSettingsMustBeCompliant":
+		return "mrApprovalSettingsResult", buildMRApprovalSettingsBlock(common, findings)
+	case "mergeRequestSettingsMustBeCompliant":
+		return "mrSettingsResult", buildMRSettingsBlock(common, findings)
 	}
 	return "", nil
 }
 
+// buildMRApprovalRulesMinApprovalsBlock and
+// buildMRApprovalRulesCoverAllBranchesBlock emit the legacy JSON blocks for the
+// merge-request approval-rule controls. The findings are settings-level (no
+// file/job), so each issue carries the approval-rule identity (approvalRuleId)
+// plus the ruleName / approvalsRequired / minApprovalsRequired data that
+// projectFindings preserves from f.Data.
+func buildMRApprovalRulesMinApprovalsBlock(c legacyCommon, findings []opaengine.Finding) map[string]any {
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"rulesBelowMinimum": len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
+func buildMRApprovalRulesCoverAllBranchesBlock(c legacyCommon, findings []opaengine.Finding) map[string]any {
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"allProtectedBranchesRuleMissing": len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
+// buildCicdVariablesProtectedBlock and buildCicdVariablesMaskedBlock emit the
+// legacy JSON blocks for the settings-variable controls. The findings are
+// settings-level (no file/job), so each issue carries the variable identity
+// (variableName / variableType / environment) that projectFindings preserves;
+// the value is never present, per the #370 variable-sensitivity tiers.
+func buildCicdVariablesProtectedBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"totalVariablesChecked": variablesCheckedCount(result),
+			"unprotectedFound":      len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
+func buildCicdVariablesMaskedBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"totalVariablesChecked": variablesCheckedCount(result),
+			"unmaskedFound":         len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
+// variablesCheckedCount is the denominator for the settings-variable JSON
+// blocks: how many variables were read (0 when the listing was unreadable or
+// not collected — the block's status:error then carries the not-evaluable
+// signal). Mirrors the totalVariablesChecked metric on the comparable
+// pipelineMustNotOverrideJobVariables block.
+func variablesCheckedCount(result *control.AnalysisResult) int {
+	if result != nil && result.VariablesData != nil {
+		return len(result.VariablesData.Variables)
+	}
+	return 0
+}
+
+// buildMRApprovalSettingsBlock emits the legacy JSON block for the
+// merge-request approval-settings control (ISSUE-503). The finding is a
+// settings-level singleton (no file/job); its deviatingSettings list and the
+// project's behaviorWhenCommitIsAdded ride in the issue's data, preserved by
+// projectFindings.
+func buildMRApprovalSettingsBlock(c legacyCommon, findings []opaengine.Finding) map[string]any {
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"hasNonCompliantSettings": len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
+// buildMRSettingsBlock emits the legacy JSON block for the merge-request
+// settings control (ISSUE-506). The finding is a settings-level singleton (no
+// file/job); its deviatingSettings list rides in the issue's data, preserved by
+// projectFindings.
+func buildMRSettingsBlock(c legacyCommon, findings []opaengine.Finding) map[string]any {
+	return map[string]any{
+		"issues": projectFindings(findings, "job"),
+		"metrics": map[string]any{
+			"hasNonCompliantSettings": len(findings),
+		},
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
+	}
+}
+
 // legacyCommon carries the bookkeeping fields shared by every
-// `*Result` block: compliance, ciValid, ciMissing, skipped.
+// `*Result` block: ciValid, ciMissing, skipped.
 type legacyCommon struct {
-	Compliance float64
-	CiValid    bool
-	CiMissing  bool
-	Skipped    bool
+	CiValid   bool
+	CiMissing bool
+	Skipped   bool
 }
 
 // projectFinding strips the verbose Rego-side fields (severity,
 // message, file, line) so the returned issue keeps only what the
 // legacy format documented: code, docUrl, plus whatever structured
 // payload the rule emitted (link/tag/variableName/…).
-func projectFinding(f opaengine.Finding, jobNameKey string) map[string]any {
+//
+// controlName is NOT repeated here: it lives once on the parent
+// *Result block (see _withControlMeta in legacyResultsByName), since
+// every issue in a block is guaranteed to share that block's
+// controlName -- FindingsByControl buckets strictly by it. Only code
+// varies within a block (e.g. containerImageMustNotUseForbiddenTags
+// covers both ISSUE-102 and ISSUE-103), so code stays per-issue.
+func projectFinding(f opaengine.Finding, jobKey string) map[string]any {
 	out := map[string]any{
 		"code":   f.Code,
 		"docUrl": "https://getplumber.io/docs/cli/issues/" + f.Code,
 	}
-	if f.Job != "" && jobNameKey != "" {
-		out[jobNameKey] = f.Job
+	// The issue TYPE's display name (#440), the docs wording from the code
+	// registry, so grouping findings by code needs no hand-made code map.
+	// The technical code above stays the stable key.
+	if info := control.LookupCode(control.ErrorCode(f.Code)); info != nil && info.Title != "" {
+		out["title"] = info.Title
+	}
+	if f.Job != "" && jobKey != "" {
+		out[jobKey] = f.Job
 	}
 	// `url` is the per-finding clickable pointer populated by the
 	// location linker. Emitted on every per-control issue block so
@@ -159,8 +423,25 @@ func projectFinding(f opaengine.Finding, jobNameKey string) map[string]any {
 	if f.URL != "" {
 		out["url"] = f.URL
 	}
+	if f.Fingerprint != "" {
+		out["fingerprint"] = f.Fingerprint
+	}
+	// The fingerprint above is a hash, so it cannot tell a consumer WHICH
+	// fields it was built from, and this function strips message, file and
+	// line, so those inputs are not recoverable from the issue entry either.
+	// The identity block carries the selected field set itself, which is what
+	// lets a platform group findings into long-lived issues across runs
+	// without re-deriving (and eventually diverging from) the recipe. Its
+	// version travels with it: see finding/identity.RecipeVersion.
+	if fields, ok := f.Identity(); ok {
+		out["identity"] = map[string]any{
+			"version":            fields.Version,
+			"fields":             fields.Pairs(),
+			"subjectFromMessage": fields.SubjectFromMessage,
+		}
+	}
 	for k, v := range f.Data {
-		if k == "docUrl" || k == "url" {
+		if k == "docUrl" || k == "url" || k == "fingerprint" || k == "identity" {
 			continue
 		}
 		out[k] = v
@@ -168,10 +449,10 @@ func projectFinding(f opaengine.Finding, jobNameKey string) map[string]any {
 	return out
 }
 
-func projectFindings(findings []opaengine.Finding, jobNameKey string) []map[string]any {
+func projectFindings(findings []opaengine.Finding, jobKey string) []map[string]any {
 	out := make([]map[string]any, 0, len(findings))
 	for _, f := range findings {
-		out = append(out, projectFinding(f, jobNameKey))
+		out = append(out, projectFinding(f, jobKey))
 	}
 	return out
 }
@@ -248,11 +529,6 @@ func enrichBranchProtection505IssueMaps(issues []map[string]any, result *control
 		}
 		branchName, _ := issue["branchName"].(string)
 		if branchName == "" {
-			if j, ok := issue["job"].(string); ok {
-				branchName = j
-			}
-		}
-		if branchName == "" {
 			continue
 		}
 		if result == nil || result.ProtectionData == nil {
@@ -321,7 +597,11 @@ func enrichForbiddenVersion404IssueMaps(issues []map[string]any, result *control
 		if code != string(control.CodeIncludeForbiddenVersion) {
 			continue
 		}
-		src, _ := issue["job"].(string)
+		// The rule emits includePath, not job: an include is not a job, and
+		// includePath is what the identity recipe selects for this finding
+		// (finding/identity). It carries the same include-source value job
+		// used to carry, so reading it here restores the enrichment.
+		src, _ := issue["includePath"].(string)
 		if src == "" {
 			continue
 		}
@@ -380,12 +660,22 @@ func enrichForbiddenVersion404IssueMaps(issues []map[string]any, result *control
 }
 
 func buildImageForbiddenTagsBlock(c legacyCommon, result *control.AnalysisResult, pc *configuration.PlumberConfig, findings []opaengine.Finding) map[string]any {
+	// The metrics below are computed here rather than derived from the
+	// findings, so they must make the same abstention the rules make. An
+	// image whose reference never rendered to a literal is neither pinned
+	// nor unpinned: the digest was looked for in placeholder text. Counting
+	// it either way puts the metrics at odds with the issues list.
 	total := 0
 	notPinned := 0
+	unresolved := 0
 	usingForbidden := 0
 	if result.PipelineImageData != nil {
 		total = len(result.PipelineImageData.Images)
 		for _, img := range result.PipelineImageData.Images {
+			if img.Unresolved {
+				unresolved++
+				continue
+			}
 			if !utils.HasDigestPin(img.Link) {
 				notPinned++
 			}
@@ -410,11 +700,11 @@ func buildImageForbiddenTagsBlock(c legacyCommon, result *control.AnalysisResult
 			"total":              total,
 			"usingForbiddenTags": usingForbidden,
 			"notPinnedByDigest":  notPinned,
-			"pinnedByDigest":     total - notPinned,
+			"pinnedByDigest":     total - notPinned - unresolved,
+			"unresolvedRefs":     unresolved,
 			"ciInvalid":          0,
 			"ciMissing":          0,
 		},
-		"compliance":           c.Compliance,
 		"version":              "0.4.0",
 		"ciValid":              c.CiValid,
 		"ciMissing":            c.CiMissing,
@@ -424,30 +714,57 @@ func buildImageForbiddenTagsBlock(c legacyCommon, result *control.AnalysisResult
 }
 
 func buildImageAuthorizedSourcesBlock(c legacyCommon, result *control.AnalysisResult, findings []opaengine.Finding) map[string]any {
+	// authorized is derived by subtraction, so an image the rule abstained
+	// on would be reported as coming from an authorized source. Subtract the
+	// unresolved references out and report them in their own field.
 	total := 0
+	unresolved := 0
 	if result.PipelineImageMetrics != nil {
 		total = int(result.PipelineImageMetrics.Total)
 	}
+	if result.PipelineImageData != nil {
+		for _, img := range result.PipelineImageData.Images {
+			if img.Unresolved {
+				unresolved++
+			}
+		}
+	}
 	unauthorized := len(findings)
-	authorized := total - unauthorized
+	authorized := total - unauthorized - unresolved
 	if authorized < 0 {
 		authorized = 0
 	}
 	return map[string]any{
 		"issues": projectFindings(findings, "job"),
 		"metrics": map[string]any{
-			"total":        total,
-			"authorized":   authorized,
-			"unauthorized": unauthorized,
-			"ciInvalid":    0,
-			"ciMissing":    0,
+			"total":          total,
+			"authorized":     authorized,
+			"unauthorized":   unauthorized,
+			"unresolvedRefs": unresolved,
+			"ciInvalid":      0,
+			"ciMissing":      0,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
+}
+
+// nonCompliantBranchNames collects the branches that fired ISSUE-505, read from
+// the finding's branchName payload. Not from Finding.Job: that field is a CI
+// job name, and a branch is not a job, so branch rules leave it empty.
+func nonCompliantBranchNames(findings []opaengine.Finding) map[string]bool {
+	out := map[string]bool{}
+	for _, f := range findings {
+		if f.Code != string(control.CodeBranchNonCompliant) {
+			continue
+		}
+		if name, ok := f.Data["branchName"].(string); ok && name != "" {
+			out[name] = true
+		}
+	}
+	return out
 }
 
 func buildBranchProtectionBlock(c legacyCommon, result *control.AnalysisResult, pc *configuration.PlumberConfig, findings []opaengine.Finding) map[string]any {
@@ -496,12 +813,7 @@ func buildBranchProtectionBlock(c legacyCommon, result *control.AnalysisResult, 
 		// fired a non-compliance finding — compliant branches keep
 		// the slim {branchName, default, protected} shape so the JSON
 		// stays focused on what reviewers need to act on.
-		nonCompliantBranches := map[string]bool{}
-		for _, f := range findings {
-			if f.Code == string(control.CodeBranchNonCompliant) {
-				nonCompliantBranches[f.Job] = true
-			}
-		}
+		nonCompliantBranches := nonCompliantBranchNames(findings)
 		// Iterate the branches with the default branch first, then the
 		// rest sorted alphabetically — matches v0.2.x's display order
 		// where the project's flagship branch leads the data list.
@@ -557,10 +869,9 @@ func buildBranchProtectionBlock(c legacyCommon, result *control.AnalysisResult, 
 	// than emitting `"issues": []`; reproduce that quirk so byte-for-
 	// byte JSON consumers (snapshot tests, etc.) stay aligned.
 	block := map[string]any{
-		"enabled":    !c.Skipped,
-		"compliance": c.Compliance,
-		"version":    "0.2.0",
-		"data":       data,
+		"enabled": !c.Skipped,
+		"version": "0.2.0",
+		"data":    data,
 		"metrics": map[string]any{
 			"branches":                   total,
 			"branchesToProtect":          toProtect,
@@ -586,18 +897,17 @@ func buildHardcodedJobsBlock(c legacyCommon, result *control.AnalysisResult, fin
 		hardcoded = result.PipelineOriginMetrics.JobHardcoded
 	}
 	return map[string]any{
-		"issues": projectFindings(_sortedFindings(findings), "jobName"),
+		"issues": projectFindings(_sortedFindings(findings), "job"),
 		"metrics": map[string]any{
 			"total":         total,
 			"hardcodedJobs": hardcoded,
 			"ciInvalid":     0,
 			"ciMissing":     0,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -649,11 +959,10 @@ func buildOutdatedIncludesBlock(c legacyCommon, result *control.AnalysisResult, 
 			"ciInvalid":      0,
 			"ciMissing":      0,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -698,11 +1007,10 @@ func buildIncludeRefConfusionBlock(c legacyCommon, result *control.AnalysisResul
 			"ciInvalid":     0,
 			"ciMissing":     0,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -713,7 +1021,7 @@ func buildForbiddenVersionsBlock(c legacyCommon, result *control.AnalysisResult,
 	if usingAuthorized < 0 {
 		usingAuthorized = 0
 	}
-	issues := projectFindings(findings, "job")
+	issues := projectFindings(findings, "")
 	enrichForbiddenVersion404IssueMaps(issues, result)
 	return map[string]any{
 		"issues": issues,
@@ -722,11 +1030,10 @@ func buildForbiddenVersionsBlock(c legacyCommon, result *control.AnalysisResult,
 			"usingForbiddenVersion":  usingForbidden,
 			"usingAuthorizedVersion": usingAuthorized,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -738,7 +1045,7 @@ func buildRequirementGroupsBlock(c legacyCommon, cfg *configuration.RequiredComp
 	requirementGroups, satisfied := _resolveRequirementGroups(groups, result)
 	return map[string]any{
 		"requirementGroups": requirementGroups,
-		"issues":            projectFindings(findings, "job"),
+		"issues":            projectFindings(findings, ""),
 		"overriddenIssues":  []any{},
 		"metrics": map[string]any{
 			"totalGroups":       len(requirementGroups),
@@ -747,11 +1054,10 @@ func buildRequirementGroupsBlock(c legacyCommon, cfg *configuration.RequiredComp
 			"ciInvalid":         0,
 			"ciMissing":         0,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.2.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.2.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -763,7 +1069,7 @@ func buildRequirementGroupsTemplateBlock(c legacyCommon, cfg *configuration.Requ
 	requirementGroups, satisfied := _resolveRequirementGroups(groups, result)
 	return map[string]any{
 		"requirementGroups": requirementGroups,
-		"issues":            projectFindings(findings, "job"),
+		"issues":            projectFindings(findings, ""),
 		"overriddenIssues":  []any{},
 		"metrics": map[string]any{
 			"totalGroups":       len(requirementGroups),
@@ -772,11 +1078,10 @@ func buildRequirementGroupsTemplateBlock(c legacyCommon, cfg *configuration.Requ
 			"ciInvalid":         0,
 			"ciMissing":         0,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.2.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.2.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -852,11 +1157,10 @@ func buildDebugTraceBlock(c legacyCommon, result *control.AnalysisResult, findin
 			"totalVariablesChecked": _countAllVariableBindings(result),
 			"forbiddenFound":        len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -866,32 +1170,30 @@ func buildVariableInjectionBlock(c legacyCommon, result *control.AnalysisResult,
 		jobs = int(result.PipelineOriginMetrics.JobTotal)
 	}
 	return map[string]any{
-		"issues": projectFindings(findings, "jobName"),
+		"issues": projectFindings(findings, "job"),
 		"metrics": map[string]any{
 			"jobsChecked":             jobs,
 			"totalScriptLinesChecked": _countScriptLines(result),
 			"unsafeExpansionsFound":   len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
 func buildSecurityJobsBlock(c legacyCommon, result *control.AnalysisResult, pc *configuration.PlumberConfig, findings []opaengine.Finding) map[string]any {
 	return map[string]any{
-		"issues": projectFindings(findings, "jobName"),
+		"issues": projectFindings(findings, "job"),
 		"metrics": map[string]any{
 			"securityJobsFound": _countSecurityJobs(result, pc),
 			"weakenedJobs":      len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -901,17 +1203,16 @@ func buildUnverifiedScriptsBlock(c legacyCommon, result *control.AnalysisResult,
 		jobs = int(result.PipelineOriginMetrics.JobTotal)
 	}
 	return map[string]any{
-		"issues": projectFindings(findings, "jobName"),
+		"issues": projectFindings(findings, "job"),
 		"metrics": map[string]any{
 			"jobsChecked":             jobs,
 			"totalScriptLinesChecked": _countScriptLines(result),
 			"unverifiedScriptsFound":  len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -931,11 +1232,10 @@ func buildJobVariablesOverrideBlock(c legacyCommon, result *control.AnalysisResu
 			"totalVariablesChecked": totalChecked,
 			"overriddenFound":       len(findings),
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }
 
@@ -951,16 +1251,15 @@ func buildDockerInDockerBlock(c legacyCommon, result *control.AnalysisResult, fi
 		}
 	}
 	return map[string]any{
-		"issues": projectFindings(findings, "jobName"),
+		"issues": projectFindings(findings, "job"),
 		"metrics": map[string]any{
 			"totalJobsChecked":    jobs,
 			"dindServicesFound":   _countDinDServices(result),
 			"insecureDaemonFound": insecure,
 		},
-		"compliance": c.Compliance,
-		"version":    "0.1.0",
-		"ciValid":    c.CiValid,
-		"ciMissing":  c.CiMissing,
-		"skipped":    c.Skipped,
+		"version":   "0.1.0",
+		"ciValid":   c.CiValid,
+		"ciMissing": c.CiMissing,
+		"skipped":   c.Skipped,
 	}
 }

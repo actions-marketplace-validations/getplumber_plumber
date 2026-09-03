@@ -3,6 +3,7 @@ package control
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/getplumber/plumber/configuration"
 	"github.com/getplumber/plumber/gitlab"
@@ -11,20 +12,23 @@ import (
 
 const (
 	// MRCommentIdentifier is an invisible HTML comment used to find the Plumber
-	// comment in the merge request notes so it can be updated on subsequent runs.
+	// comment in the merge request notes so it can be updated on subsequent
+	// runs. The historical wording is kept on purpose: changing it would stop
+	// matching comments posted by older versions and create duplicates.
 	MRCommentIdentifier = "<!-- Plumber Compliance Comment -->"
 )
 
-// ManageMergeRequestComment creates or updates the Plumber compliance comment
-// on the given merge request. projectID and gitlabURL come from the already-
-// resolved configuration/result; only mrIID is CI-specific.
+// ManageMergeRequestComment creates or updates the Plumber comment on the
+// given merge request. projectID and gitlabURL come from the already-resolved
+// configuration/result; only mrIID is CI-specific. passed is the run's gate
+// verdict and gateLine its human-readable rendering.
 func ManageMergeRequestComment(
 	projectID int,
 	mrIID int,
 	result *AnalysisResult,
 	pc *configuration.PlumberConfig,
-	compliance float64,
-	threshold float64,
+	passed bool,
+	gateLine string,
 	conf *configuration.Configuration,
 	score *PlumberScoreResult,
 	scoreMode bool,
@@ -37,7 +41,7 @@ func ManageMergeRequestComment(
 	})
 
 	// Generate comment body
-	commentBody := generateMRComment(result, pc, compliance, threshold, score, scoreMode, scorePointMode, conf.ControlsFilter, conf.SkipControlsFilter)
+	commentBody := generateMRComment(result, pc, passed, gateLine, score, scoreMode, scorePointMode, conf.ControlsFilter, conf.SkipControlsFilter)
 
 	// List existing notes to find our comment
 	notes, err := gitlab.ListMergeRequestNotes(
@@ -97,19 +101,6 @@ func ManageMergeRequestComment(
 	return nil
 }
 
-// ComplianceBadgeURL builds a Shields.io badge URL for the given compliance %.
-// Color is green if compliance meets threshold, red otherwise.
-// Exported so it can be used by the project badge feature.
-func ComplianceBadgeURL(compliance, threshold float64) string {
-	pct := fmt.Sprintf("%.1f%%", compliance)
-	color := "red"
-	if compliance >= threshold {
-		color = "brightgreen"
-	}
-	message := strings.ReplaceAll(pct, "%", "%25")
-	return fmt.Sprintf("https://img.shields.io/badge/Plumber-%s-%s", message, color)
-}
-
 // ScoreBadgeURL builds a Shields.io badge URL showing the Plumber letter score (A–E).
 func ScoreBadgeURL(letter string) string {
 	color := "red"
@@ -130,23 +121,18 @@ func ScoreBadgeURL(letter string) string {
 
 // generateMRComment builds the Markdown body for the merge request comment
 // based on the analysis result.
-func generateMRComment(result *AnalysisResult, pc *configuration.PlumberConfig, compliance, threshold float64, score *PlumberScoreResult, scoreMode, scorePointMode bool, controlsFilterList, skipControlsList []string) string {
+func generateMRComment(result *AnalysisResult, pc *configuration.PlumberConfig, passed bool, gateLine string, score *PlumberScoreResult, scoreMode, scorePointMode bool, controlsFilterList, skipControlsList []string) string {
 	var b strings.Builder
 
 	// Hidden identifier so we can find this comment later
 	b.WriteString(MRCommentIdentifier + "\n")
 
-	// Compliance badge (green if passed, red if failed)
-	passed := compliance >= threshold
-	badgeURL := ComplianceBadgeURL(compliance, threshold)
+	// Letter-score badge linking to the score documentation
 	if scoreMode && score != nil {
-		badgeURL = ScoreBadgeURL(score.Score)
-		fmt.Fprintf(&b, "[![Plumber](%s)](%s)\n\n", badgeURL, PlumberScoreDocURL)
-	} else {
-		fmt.Fprintf(&b, "![Plumber](%s)\n\n", badgeURL)
+		fmt.Fprintf(&b, "[![Plumber](%s)](%s)\n\n", ScoreBadgeURL(score.Score), PlumberScoreDocURL)
 	}
 
-	b.WriteString("*If this merge request is merged, the expected pipeline compliance will be as shown above.*\n\n")
+	b.WriteString("*If this merge request is merged, the expected Plumber Score will be as shown above.*\n\n")
 
 	if scorePointMode && score != nil {
 		b.WriteString("### Plumber Score\n\n")
@@ -166,14 +152,15 @@ func generateMRComment(result *AnalysisResult, pc *configuration.PlumberConfig, 
 	}
 
 	// Gather controls from the config-driven catalog joined with the
-	// Rego Findings list. Compliance is binary per control (100% when
-	// no finding matches, 0% otherwise); skipped status comes from
-	// .plumber.yaml.
+	// Rego Findings list. An empty findings list is not automatically a
+	// pass: a control whose data lane supplied nothing has no findings
+	// either, and a green check beside it on a merge request is the most
+	// consequential place to get that wrong.
 	type controlEntry struct {
-		name       string
-		compliance float64
-		issues     int
-		skipped    bool
+		name         string
+		issues       int
+		skipped      bool
+		notEvaluable bool
 	}
 
 	findingsByControl := FindingsByControl(result.Findings)
@@ -184,11 +171,16 @@ func generateMRComment(result *AnalysisResult, pc *configuration.PlumberConfig, 
 	MarkSkippedByFilter(mrEntries, controlsFilterList, skipControlsList)
 	for _, e := range mrEntries {
 		count := len(findingsByControl[e.ControlName])
-		ctrlCompliance := 100.0
-		if !e.Skipped && count > 0 {
-			ctrlCompliance = 0.0
-		}
-		controls = append(controls, controlEntry{e.DisplayName, ctrlCompliance, count, e.Skipped})
+		// Keyed on result.NotEvaluable, not StatusFor: StatusFor also
+		// returns StatusError for the older run-wide degradation signals,
+		// and re-bucketing those would change what a STANDALONE run posts.
+		_, unevaluated := result.NotEvaluable[e.ControlName]
+		controls = append(controls, controlEntry{
+			name:         e.DisplayName,
+			issues:       count,
+			skipped:      e.Skipped,
+			notEvaluable: !e.Skipped && unevaluated,
+		})
 		if !e.Skipped {
 			totalIssues += count
 		}
@@ -196,26 +188,28 @@ func generateMRComment(result *AnalysisResult, pc *configuration.PlumberConfig, 
 
 	// Controls summary table
 	b.WriteString("### Controls\n\n")
-	b.WriteString("| Control | Compliance | Issues |\n")
-	b.WriteString("|---------|-----------|--------|\n")
+	b.WriteString("| Control | Status | Issues |\n")
+	b.WriteString("|---------|--------|--------|\n")
 	for _, c := range controls {
 		if c.skipped {
 			fmt.Fprintf(&b, "| %s | _skipped_ | — |\n", c.name)
+		} else if c.notEvaluable {
+			// Never a green check: this control was not checked at all, and
+			// a reviewer reading the MR must not take it for a pass.
+			fmt.Fprintf(&b, "| :grey_question: %s | _not evaluated_ | — |\n", c.name)
+		} else if c.issues > 0 {
+			fmt.Fprintf(&b, "| :x: %s | failed | %d |\n", c.name, c.issues)
 		} else {
-			icon := ":white_check_mark:"
-			if c.compliance < 100 {
-				icon = ":x:"
-			}
-			fmt.Fprintf(&b, "| %s %s | %.1f%% | %d |\n", icon, c.name, c.compliance, c.issues)
+			fmt.Fprintf(&b, "| :white_check_mark: %s | passed | 0 |\n", c.name)
 		}
 	}
 	b.WriteString("\n")
 
 	// Status line after the table
 	if passed {
-		fmt.Fprintf(&b, ":white_check_mark: **Compliance: %.1f%%** meets threshold (%.0f%%)\n\n", compliance, threshold)
+		fmt.Fprintf(&b, ":white_check_mark: **Plumber check passed** (%s)\n\n", gateLine)
 	} else {
-		fmt.Fprintf(&b, ":warning: **Compliance: %.1f%%** is below threshold (%.0f%%)\n\n", compliance, threshold)
+		fmt.Fprintf(&b, ":warning: **Plumber check failed** — %s\n\n", gateLine)
 	}
 
 	// Issue details as a normal section
@@ -231,6 +225,33 @@ func generateMRComment(result *AnalysisResult, pc *configuration.PlumberConfig, 
 	return b.String()
 }
 
+// sanitizeMarkdownInline neutralizes repo-controlled text placed inline in the
+// merge-request comment. Finding messages embed data from the scanned
+// repository (job names, image refs, script lines); left raw they could inject
+// Markdown links/images or — via a newline — whole new lines into a comment
+// posted with Plumber's identity. Control characters are removed (newlines and
+// tabs become spaces) and Markdown-active characters are backslash-escaped so
+// the text renders literally.
+func sanitizeMarkdownInline(s string) string {
+	const escaped = "\\`*_[]()<>|~@#!%$"
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			b.WriteByte(' ')
+		case unicode.IsControl(r):
+			// drop other control characters
+		default:
+			if strings.ContainsRune(escaped, r) {
+				b.WriteByte('\\')
+			}
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // writeIssueDetails appends per-control issue details into the builder.
 // Findings are grouped by the ControlName declared in the issue-code
 // registry so the section headings line up with the controls table.
@@ -238,35 +259,7 @@ func generateMRComment(result *AnalysisResult, pc *configuration.PlumberConfig, 
 // runs produce stable output.
 func writeIssueDetails(b *strings.Builder, result *AnalysisResult) {
 	findingsByControl := FindingsByControl(result.Findings)
-	// Emit groups in the registry order (the same order used by the
-	// controls table above) so the two sections align visually.
-	order := []struct {
-		controlName string
-		heading     string
-	}{
-		{"containerImageMustNotUseForbiddenTags", "Container images must not use forbidden tags"},
-		{"containerImageMustComeFromAuthorizedSources", "Container images must come from authorized sources"},
-		{"branchMustBeProtected", "Branch must be protected"},
-		{"pipelineMustNotIncludeHardcodedJobs", "Pipeline must not include hardcoded jobs"},
-		{"includesMustBeUpToDate", "Includes must be up to date"},
-		{"includesMustNotUseForbiddenVersions", "Includes must not use forbidden versions"},
-		{"pipelineMustIncludeComponent", "Pipeline must include required components"},
-		{"pipelineMustIncludeTemplate", "Pipeline must include required templates"},
-		{"pipelineMustNotEnableDebugTrace", "Pipeline must not enable debug trace"},
-		{"pipelineMustNotUseUnsafeVariableExpansion", "Pipeline must not use unsafe variable expansion"},
-		{"pipelineMustNotOverrideJobVariables", "Pipeline must not override job variables"},
-		{"securityJobsMustNotBeWeakened", "Security jobs must not be weakened"},
-		{"pipelineMustNotExecuteUnverifiedScripts", "Pipeline must not execute unverified scripts"},
-		{"pipelineMustNotUseDockerInDocker", "Pipeline must not use Docker-in-Docker"},
-		{"workflowMustNotInjectUserInputInScripts", "Workflow must not inject user input in scripts"},
-		{"workflowMustNotReEnableInsecureCommands", "Workflow must not re-enable insecure commands"},
-		{"checkoutMustNotPersistCredentials", "actions/checkout must not persist credentials"},
-		{"workflowMustNotUseDangerousTriggers", "Workflow must not use dangerous triggers"},
-		{"pullRequestTargetMustNotCheckoutHead", "pull_request_target must not check out the PR head"},
-		{"workflowMustNotGrantPermissionsWriteAll", "Workflow must not grant write-all permissions"},
-		{"githubActionMustComeFromAuthorizedSources", "Actions must come from authorized sources"},
-	}
-	for _, g := range order {
+	for _, g := range mrCommentControlOrder {
 		findings := findingsByControl[g.controlName]
 		if len(findings) == 0 {
 			continue
@@ -274,12 +267,52 @@ func writeIssueDetails(b *strings.Builder, result *AnalysisResult) {
 		fmt.Fprintf(b, "**%s:**\n", g.heading)
 		for _, f := range findings {
 			docURL := ErrorCode(f.Code).DocURL()
-			if f.Job != "" {
-				fmt.Fprintf(b, "- `%s` %s ([docs](%s))\n", f.Code, f.Message, docURL)
-			} else {
-				fmt.Fprintf(b, "- `%s` %s ([docs](%s))\n", f.Code, f.Message, docURL)
-			}
+			fmt.Fprintf(b, "- `%s` %s ([docs](%s))\n", f.Code, sanitizeMarkdownInline(f.Message), docURL)
 		}
 		b.WriteString("\n")
 	}
+}
+
+// mrCommentControlOrder drives the per-control detail sections of the MR
+// comment, in the same order as the controls table above so the two sections
+// align visually.
+//
+// This list is hand-maintained and a control missing from it has its findings
+// SILENTLY dropped from the comment body — the control still shows as failed in
+// the table, but with no detail lines under it. That has now happened three
+// times (#422, #423, #426), so TestMRCommentOrderCoversEveryGitLabControl
+// fails the build when a GitLab control is added without an entry here.
+var mrCommentControlOrder = []struct {
+	controlName string
+	heading     string
+}{
+	{"containerImageMustNotUseForbiddenTags", "Container images must not use forbidden tags"},
+	{"containerImageMustComeFromAuthorizedSources", "Container images must come from authorized sources"},
+	{"branchMustBeProtected", "Branch must be protected"},
+	{"projectMustHaveSecurityPolicySource", "Project must have a security policy source"},
+	{"mergeRequestApprovalRulesMustRequireMinimumApprovals", "MR approval rules must require a minimum number of approvals"},
+	{"mergeRequestApprovalRulesMustCoverAllProtectedBranches", "MR approval rules must cover all protected branches"},
+	{"mergeRequestApprovalSettingsMustBeCompliant", "MR approval settings must be compliant"},
+	{"mergeRequestSettingsMustBeCompliant", "MR settings must be compliant"},
+	{"cicdVariablesMustBeProtected", "CI/CD variables must be protected"},
+	{"cicdVariablesMustBeMasked", "CI/CD variables must be masked"},
+	{"pipelineMustNotIncludeHardcodedJobs", "Pipeline must not include hardcoded jobs"},
+	{"externalRefsMustNotCollide", "Includes must not use ambiguous tag/branch refs"},
+	{"includesMustBeUpToDate", "Includes must be up to date"},
+	{"includesMustNotUseForbiddenVersions", "Includes must not use forbidden versions"},
+	{"pipelineMustIncludeComponent", "Pipeline must include required components"},
+	{"pipelineMustIncludeTemplate", "Pipeline must include required templates"},
+	{"pipelineMustNotEnableDebugTrace", "Pipeline must not enable debug trace"},
+	{"pipelineMustNotUseUnsafeVariableExpansion", "Pipeline must not use unsafe variable expansion"},
+	{"pipelineMustNotOverrideJobVariables", "Pipeline must not override job variables"},
+	{"securityJobsMustNotBeWeakened", "Security jobs must not be weakened"},
+	{"pipelineMustNotExecuteUnverifiedScripts", "Pipeline must not execute unverified scripts"},
+	{"pipelineMustNotUseDockerInDocker", "Pipeline must not use Docker-in-Docker"},
+	{"workflowMustNotInjectUserInputInScripts", "Workflow must not inject user input in scripts"},
+	{"workflowMustNotReEnableInsecureCommands", "Workflow must not re-enable insecure commands"},
+	{"checkoutMustNotPersistCredentials", "actions/checkout must not persist credentials"},
+	{"workflowMustNotUseDangerousTriggers", "Workflow must not use dangerous triggers"},
+	{"pullRequestTargetMustNotCheckoutHead", "pull_request_target must not check out the PR head"},
+	{"workflowMustNotGrantPermissionsWriteAll", "Workflow must not grant write-all permissions"},
+	{"githubActionMustComeFromAuthorizedSources", "Actions must come from authorized sources"},
 }

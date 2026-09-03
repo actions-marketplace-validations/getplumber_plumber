@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v2"
 
+	"github.com/getplumber/plumber/finding/identity"
 	githubpkg "github.com/getplumber/plumber/github"
 	opaengine "github.com/getplumber/plumber/internal/engine/opa"
 	"github.com/getplumber/plumber/internal/ir"
@@ -294,7 +297,7 @@ func TestIssue102_ImageMutableTag(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -333,7 +336,7 @@ func TestIssue102_ImageMutableTag(t *testing.T) {
 
 // TestIssue509_ExcessivePermissions drives the excessive_permissions
 // policy against real GitHub workflow fixtures. It uses the real
-// production collector (ScanGitHubWorkflows) rather than the test-time
+// production collector (ScanGitHubWorkflowsWithProgress) rather than the test-time
 // parser to exercise the permissions propagation end-to-end.
 func TestIssue509_ExcessivePermissions(t *testing.T) {
 	cases := []struct {
@@ -355,14 +358,14 @@ func TestIssue509_ExcessivePermissions(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.fixture, func(t *testing.T) {
 			// Stage the fixture under a fake .github/workflows/ dir so
-			// ScanGitHubWorkflows can discover it unmodified.
+			// ScanGitHubWorkflowsWithProgress can discover it unmodified.
 			tmp := t.TempDir()
 			wfDir := filepath.Join(tmp, ".github", "workflows")
 			if err := os.MkdirAll(wfDir, 0o755); err != nil {
@@ -377,7 +380,7 @@ func TestIssue509_ExcessivePermissions(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -409,7 +412,7 @@ func TestIssue509_ExcessivePermissions(t *testing.T) {
 // trigger AND a checkout of fork-controlled code — so the violation
 // fixtures pin the checkout ref to the PR / workflow_run head, and the
 // clean fixtures cover a metadata-only job and a fork-guarded job. The
-// test exercises the real production collector (ScanGitHubWorkflows).
+// test exercises the real production collector (ScanGitHubWorkflowsWithProgress).
 func TestIssue414_DangerousTriggers(t *testing.T) {
 	cases := []struct {
 		fixture      string
@@ -480,7 +483,7 @@ func TestIssue414_DangerousTriggers(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -500,7 +503,7 @@ func TestIssue414_DangerousTriggers(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -600,7 +603,7 @@ func TestIssue206_TemplateInjection(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -620,7 +623,7 @@ func TestIssue206_TemplateInjection(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -666,7 +669,7 @@ func TestIssue208_InsecureCommands(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -686,7 +689,7 @@ func TestIssue208_InsecureCommands(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -713,26 +716,47 @@ func TestIssue208_InsecureCommands(t *testing.T) {
 	}
 }
 
-// TestIssue307_Artipacked drives the artipacked policy against a
-// default actions/checkout (violation) and one explicitly passing
-// `persist-credentials: false` (clean).
+// TestIssue307_Artipacked drives the artipacked policy under the graded
+// model. A persisted-credential checkout (A) always fires, but the
+// severity depends on whether `.git` is packed into an artifact (B):
+//   - A ∧ B  → ISSUE-310 (high): the demonstrable ArtiPACKED leak.
+//   - A ∧ ¬B → ISSUE-307 (low): latent hygiene.
+//   - ¬A     → nothing (credentials disabled).
+//
+// expectedCodes lists the ISSUE codes each fixture must produce.
 func TestIssue307_Artipacked(t *testing.T) {
 	cases := []struct {
-		fixture      string
-		expectedHits []string
+		fixture       string
+		expectedCodes []string
 	}{
 		{
-			fixture:      "violation_default_checkout.yml",
-			expectedHits: []string{"violation_default_checkout/clone"},
+			fixture:       "violation_default_checkout.yml",
+			expectedCodes: []string{"ISSUE-310"},
 		},
 		{
-			fixture:      "clean_credentials_disabled.yml",
-			expectedHits: nil,
+			fixture:       "violation_persist_true.yml",
+			expectedCodes: []string{"ISSUE-310"},
+		},
+		{
+			fixture:       "low_persisted_no_upload.yml",
+			expectedCodes: []string{"ISSUE-307"},
+		},
+		{
+			fixture:       "low_upload_scoped_path.yml",
+			expectedCodes: []string{"ISSUE-307"},
+		},
+		{
+			fixture:       "clean_credentials_disabled.yml",
+			expectedCodes: nil,
+		},
+		{
+			fixture:       "clean_credentials_disabled_quoted.yml",
+			expectedCodes: nil,
 		},
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -752,7 +776,7 @@ func TestIssue307_Artipacked(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -762,18 +786,17 @@ func TestIssue307_Artipacked(t *testing.T) {
 				t.Fatalf("evaluate: %v", err)
 			}
 
-			hits := make([]string, 0, len(findings))
+			codes := make([]string, 0, len(findings))
 			for _, f := range findings {
-				if f.Code != "ISSUE-307" {
-					continue
+				if f.Code == "ISSUE-307" || f.Code == "ISSUE-310" {
+					codes = append(codes, f.Code)
 				}
-				hits = append(hits, f.Job)
 			}
-			sort.Strings(hits)
-			expected := append([]string(nil), tc.expectedHits...)
+			sort.Strings(codes)
+			expected := append([]string(nil), tc.expectedCodes...)
 			sort.Strings(expected)
-			if !stringSlicesEqual(hits, expected) {
-				t.Fatalf("%s: expected %v, got %v", tc.fixture, expected, hits)
+			if !stringSlicesEqual(codes, expected) {
+				t.Fatalf("%s: expected %v, got %v", tc.fixture, expected, codes)
 			}
 		})
 	}
@@ -824,7 +847,7 @@ func TestIssue103_ImagePinnedByDigest(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -1028,7 +1051,7 @@ func TestIssue411_UnverifiedScripts_GitHub(t *testing.T) {
 // the resolved latest version.
 func TestIssue403_IncludesOutdated(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	pipeline := &ir.NormalizedPipeline{
@@ -1060,7 +1083,7 @@ func TestIssue403_IncludesOutdated(t *testing.T) {
 // "@1" tracks the latest 1.x.x, so it is never out of date within that major.
 func TestIssue403_IncludesOutdated_PartialSemver(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -1111,7 +1134,7 @@ func TestIssue403_IncludesOutdated_PartialSemver(t *testing.T) {
 // name pattern that the provider reports as unprotected.
 func TestIssue501_BranchUnprotected(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1145,11 +1168,503 @@ func TestIssue501_BranchUnprotected(t *testing.T) {
 	}
 }
 
+// countCode counts findings carrying the given code.
+func countCode(findings []opaengine.Finding, code string) int {
+	n := 0
+	for _, f := range findings {
+		if f.Code == code {
+			n++
+		}
+	}
+	return n
+}
+
+// TestIssue502_MRApprovalRulesMinApprovals flags merge-request approval rules
+// that cover all protected branches yet require fewer approvals than the
+// configured minimum. Rules scoped to specific branches are out of scope, and
+// the rule abstains when the approvals listing was unreadable
+// (MRApprovalRulesKnown=false), so a token that cannot read approvals reports
+// not-evaluable rather than a false pass. Identity keys on the stable rule ID.
+func TestIssue502_MRApprovalRulesMinApprovals(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	cfg := map[string]any{
+		"mergeRequestApprovalRulesMustRequireMinimumApprovals": map[string]any{
+			"minimumRequiredApprovals": 2,
+		},
+	}
+
+	// Positive: two named all-branches rules below the minimum (the explicit
+	// flag, and the zero-scope form), an UNNAMED all-branches rule below the
+	// minimum (GitLab API/auto-created rules can carry an empty name — it must
+	// still be flagged, not silently skipped), one compliant all-branches rule,
+	// and one scoped rule below the minimum that is out of scope.
+	pipeline := &ir.NormalizedPipeline{
+		Provider:             ir.ProviderGitLab,
+		MRApprovalRulesKnown: true,
+		MRApprovalRules: []ir.MRApprovalRule{
+			{ID: "10", Name: "All-1", ApprovalsRequired: 1, AppliesToAllProtectedBranches: true},
+			{ID: "20", Name: "All-zero-scope", ApprovalsRequired: 0, ProtectedBranchCount: 0},
+			{ID: "30", Name: "Compliant", ApprovalsRequired: 3, AppliesToAllProtectedBranches: true},
+			{ID: "40", Name: "Scoped", ApprovalsRequired: 0, ProtectedBranchCount: 2},
+			{ID: "50", Name: "", ApprovalsRequired: 0, AppliesToAllProtectedBranches: true},
+		},
+	}
+	findings, err := engine.Evaluate(context.Background(), pipeline, cfg)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if got := countCode(findings, "ISSUE-502"); got != 3 {
+		t.Fatalf("expected 3 ISSUE-502 findings (incl. the unnamed rule), got %d", got)
+	}
+	assertSubjectKey(t, findings, "ISSUE-502", "approvalRuleId", []string{"10", "20", "50"})
+
+	// Negative: every all-branches rule meets the minimum -> no findings.
+	clean := &ir.NormalizedPipeline{
+		Provider:             ir.ProviderGitLab,
+		MRApprovalRulesKnown: true,
+		MRApprovalRules: []ir.MRApprovalRule{
+			{ID: "10", Name: "All", ApprovalsRequired: 2, AppliesToAllProtectedBranches: true},
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), clean, cfg); countCode(f, "ISSUE-502") != 0 {
+		t.Fatalf("expected 0 ISSUE-502 findings when every covering rule meets the minimum")
+	}
+
+	// Abstain: listing unreadable (Known=false) -> not-evaluable, so no
+	// findings even though a covering rule is below the minimum.
+	unknown := &ir.NormalizedPipeline{
+		Provider:             ir.ProviderGitLab,
+		MRApprovalRulesKnown: false,
+		MRApprovalRules: []ir.MRApprovalRule{
+			{ID: "10", Name: "All", ApprovalsRequired: 0, AppliesToAllProtectedBranches: true},
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), unknown, cfg); countCode(f, "ISSUE-502") != 0 {
+		t.Fatalf("expected 0 ISSUE-502 findings when the approvals listing is unreadable")
+	}
+}
+
+// TestIssue503_MRApprovalSettingsCompliant flags a project whose
+// merge-request approval settings fall short of the configured expectations
+// (a singleton finding listing the deviations). Every expectation is
+// optional: unset — and, platform-faithfully, explicit false — checks
+// nothing. behaviorWhenCommitIsAdded is a minimum on the strictness ladder.
+// The rule abstains when the settings could not be read (nil projection), so
+// a token without scope reports not-evaluable rather than a false pass.
+func TestIssue503_MRApprovalSettingsCompliant(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	allExpectations := map[string]any{
+		"mergeRequestApprovalSettingsMustBeCompliant": map[string]any{
+			"preventApprovalByAuthor":         true,
+			"preventApprovalsByCommitters":    true,
+			"preventEditingApprovalRulesInMR": true,
+			"requireReAuthToApprove":          true,
+			"behaviorWhenCommitIsAdded":       ir.MRApprovalBehaviorRemoveCodeOwnerApprovals,
+		},
+	}
+
+	// Positive: everything unlocked -> ONE finding (singleton) naming every
+	// deviating setting, the behavior ladder included.
+	weak := &ir.NormalizedPipeline{
+		Provider: ir.ProviderGitLab,
+		MRApprovalSettings: &ir.MRApprovalSettings{
+			BehaviorWhenCommitIsAdded: ir.MRApprovalBehaviorKeepApprovals,
+		},
+	}
+	findings, err := engine.Evaluate(context.Background(), weak, allExpectations)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if got := countCode(findings, "ISSUE-503"); got != 1 {
+		t.Fatalf("expected 1 ISSUE-503 finding (singleton), got %d", got)
+	}
+	for _, f := range findings {
+		if f.Code != "ISSUE-503" {
+			continue
+		}
+		devs, _ := f.Data["deviatingSettings"].([]any)
+		if len(devs) != 5 {
+			t.Fatalf("expected all 5 expectations deviating, got %v", f.Data["deviatingSettings"])
+		}
+		// The raw config-key names are the stable machine contract on
+		// deviatingSettings; the message renders them as human prose.
+		devKeys := map[string]bool{}
+		for _, d := range devs {
+			if s, ok := d.(string); ok {
+				devKeys[s] = true
+			}
+		}
+		for _, name := range []string{"behaviorWhenCommitIsAdded", "preventApprovalByAuthor", "requireReAuthToApprove", "preventApprovalsByCommitters", "preventEditingApprovalRulesInMR"} {
+			if !devKeys[name] {
+				t.Fatalf("deviatingSettings must include %q, got %v", name, devs)
+			}
+		}
+		// The message reads as current-vs-expected prose, not raw config keys.
+		for _, want := range []string{"authors can approve", "re-authentication", "keep_approvals", "should be at least"} {
+			if !strings.Contains(f.Message, want) {
+				t.Fatalf("message should read as current-vs-expected prose containing %q, got %q", want, f.Message)
+			}
+		}
+	}
+
+	// Negative: a locked-down project meets every expectation, and an actual
+	// behavior ABOVE the configured minimum (remove_all vs remove-code-owner
+	// expected) is compliant, not a deviation.
+	strict := &ir.NormalizedPipeline{
+		Provider: ir.ProviderGitLab,
+		MRApprovalSettings: &ir.MRApprovalSettings{
+			PreventApprovalByAuthor:         true,
+			PreventApprovalsByCommitters:    true,
+			PreventEditingApprovalRulesInMR: true,
+			RequireReAuthToApprove:          true,
+			BehaviorWhenCommitIsAdded:       ir.MRApprovalBehaviorRemoveAllApprovals,
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), strict, allExpectations); countCode(f, "ISSUE-503") != 0 {
+		t.Fatal("expected 0 ISSUE-503 findings when every expectation is met")
+	}
+
+	// Negative: no expectations configured -> nothing is checked, even on a
+	// fully unlocked project. An explicit false is the same as unset
+	// (platform-faithful: there is no "expect the unsafe setting" mode).
+	noExpectations := map[string]any{
+		"mergeRequestApprovalSettingsMustBeCompliant": map[string]any{
+			"preventApprovalByAuthor": false,
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), weak, noExpectations); countCode(f, "ISSUE-503") != 0 {
+		t.Fatal("expected 0 ISSUE-503 findings with no (or explicit-false) expectations")
+	}
+
+	// Positive: only the behavior expectation set, project keeps approvals ->
+	// exactly that one deviation.
+	behaviorOnly := map[string]any{
+		"mergeRequestApprovalSettingsMustBeCompliant": map[string]any{
+			"behaviorWhenCommitIsAdded": ir.MRApprovalBehaviorRemoveAllApprovals,
+		},
+	}
+	f, err := engine.Evaluate(context.Background(), weak, behaviorOnly)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if countCode(f, "ISSUE-503") != 1 {
+		t.Fatal("expected 1 ISSUE-503 finding for the behavior ladder alone")
+	}
+	for _, fd := range f {
+		if fd.Code != "ISSUE-503" {
+			continue
+		}
+		if devs, _ := fd.Data["deviatingSettings"].([]any); len(devs) != 1 || devs[0] != "behaviorWhenCommitIsAdded" {
+			t.Fatalf("expected the single behaviorWhenCommitIsAdded deviation, got %v", fd.Data["deviatingSettings"])
+		}
+	}
+
+	// Abstain: settings unreadable (nil projection, the 401/403 case) -> no
+	// findings even though every expectation is set: not-evaluable, not a pass.
+	unknown := &ir.NormalizedPipeline{Provider: ir.ProviderGitLab}
+	if f, _ := engine.Evaluate(context.Background(), unknown, allExpectations); countCode(f, "ISSUE-503") != 0 {
+		t.Fatal("expected 0 ISSUE-503 findings when the settings could not be read")
+	}
+}
+
+// TestIssue506_MRSettingsCompliant flags a project whose merge-request/merge
+// settings do not exactly match the configured expectations. Every expectation
+// is optional (unset = not checked); a set expectation must equal the project's
+// actual value.
+func TestIssue506_MRSettingsCompliant(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+
+	// Positive: three configured expectations diverge (merge method, merge
+	// trains, remove-source-branch); squashOption is not configured, so the
+	// project's differing squash value is NOT a deviation.
+	cfg := map[string]any{
+		"mergeRequestSettingsMustBeCompliant": map[string]any{
+			"mergeMethod":                  "ff",
+			"mergeTrainsEnabled":           true,
+			"removeSourceBranchAfterMerge": true,
+		},
+	}
+	deviating := &ir.NormalizedPipeline{
+		Provider: ir.ProviderGitLab,
+		MRSettings: &ir.MRSettings{
+			MergeMethod:                  "merge", // != ff
+			SquashOption:                 "never", // not checked
+			MergeTrainsEnabled:           false,   // != true
+			RemoveSourceBranchAfterMerge: false,   // != true
+		},
+	}
+	findings, err := engine.Evaluate(context.Background(), deviating, cfg)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if got := countCode(findings, "ISSUE-506"); got != 1 {
+		t.Fatalf("expected 1 ISSUE-506 finding (singleton), got %d", got)
+	}
+	for _, f := range findings {
+		if f.Code != "ISSUE-506" {
+			continue
+		}
+		devKeys := map[string]bool{}
+		for _, d := range f.Data["deviatingSettings"].([]any) {
+			if s, ok := d.(string); ok {
+				devKeys[s] = true
+			}
+		}
+		for _, want := range []string{"mergeMethod", "mergeTrainsEnabled", "removeSourceBranchAfterMerge"} {
+			if !devKeys[want] {
+				t.Errorf("deviatingSettings must include %q, got %v", want, f.Data["deviatingSettings"])
+			}
+		}
+		if devKeys["squashOption"] {
+			t.Errorf("squashOption is not configured, must not deviate: %v", f.Data["deviatingSettings"])
+		}
+		// The message reads as current-vs-expected prose.
+		for _, want := range []string{"merge method", "expected"} {
+			if !strings.Contains(f.Message, want) {
+				t.Errorf("message should read as current-vs-expected prose containing %q, got %q", want, f.Message)
+			}
+		}
+	}
+
+	// Negative: every configured expectation matches -> no finding.
+	compliant := &ir.NormalizedPipeline{
+		Provider: ir.ProviderGitLab,
+		MRSettings: &ir.MRSettings{
+			MergeMethod:                  "ff",
+			SquashOption:                 "never",
+			MergeTrainsEnabled:           true,
+			RemoveSourceBranchAfterMerge: true,
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), compliant, cfg); countCode(f, "ISSUE-506") != 0 {
+		t.Fatal("expected 0 ISSUE-506 findings when every configured expectation matches")
+	}
+
+	// Negative: no expectations configured -> nothing to check, no finding even
+	// though the project settings are all set.
+	noCfg := map[string]any{"mergeRequestSettingsMustBeCompliant": map[string]any{}}
+	if f, _ := engine.Evaluate(context.Background(), deviating, noCfg); countCode(f, "ISSUE-506") != 0 {
+		t.Fatal("expected 0 ISSUE-506 findings when no expectation is configured")
+	}
+
+	// Abstain: settings unreadable (nil projection) -> no finding: not-evaluable.
+	unknown := &ir.NormalizedPipeline{Provider: ir.ProviderGitLab}
+	if f, _ := engine.Evaluate(context.Background(), unknown, cfg); countCode(f, "ISSUE-506") != 0 {
+		t.Fatal("expected 0 ISSUE-506 findings when the settings could not be read")
+	}
+}
+
+// TestIssue504_MRApprovalRulesCoverAllBranches flags a project where no
+// approval rule applies to all protected branches (a singleton finding). It
+// fires on zero rules too (no coverage at all), matching the legacy control,
+// and abstains when the listing was unreadable.
+func TestIssue504_MRApprovalRulesCoverAllBranches(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+
+	// Positive: rules exist but none covers all protected branches.
+	pipeline := &ir.NormalizedPipeline{
+		Provider:             ir.ProviderGitLab,
+		MRApprovalRulesKnown: true,
+		MRApprovalRules: []ir.MRApprovalRule{
+			{ID: "10", Name: "Scoped-a", ApprovalsRequired: 2, ProtectedBranchCount: 1},
+			{ID: "20", Name: "Scoped-b", ApprovalsRequired: 2, ProtectedBranchCount: 3},
+		},
+	}
+	findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if got := countCode(findings, "ISSUE-504"); got != 1 {
+		t.Fatalf("expected 1 ISSUE-504 finding, got %d", got)
+	}
+
+	// Positive: zero rules is also a finding — no rule covers all protected
+	// branches, so the gate is absent.
+	empty := &ir.NormalizedPipeline{Provider: ir.ProviderGitLab, MRApprovalRulesKnown: true}
+	if f, _ := engine.Evaluate(context.Background(), empty, nil); countCode(f, "ISSUE-504") != 1 {
+		t.Fatalf("expected 1 ISSUE-504 finding when no approval rule is defined")
+	}
+
+	// Negative: at least one rule covers all protected branches -> no finding.
+	covered := &ir.NormalizedPipeline{
+		Provider:             ir.ProviderGitLab,
+		MRApprovalRulesKnown: true,
+		MRApprovalRules: []ir.MRApprovalRule{
+			{ID: "10", Name: "All", ApprovalsRequired: 2, AppliesToAllProtectedBranches: true},
+			{ID: "20", Name: "Scoped", ApprovalsRequired: 2, ProtectedBranchCount: 1},
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), covered, nil); countCode(f, "ISSUE-504") != 0 {
+		t.Fatalf("expected 0 ISSUE-504 findings when a rule covers all protected branches")
+	}
+
+	// Positive: an "All branches" rule (no branch scope — flag off, zero
+	// protected-branch count) is deliberately NOT counted as covering all
+	// protected branches. 504 targets the explicit "all protected branches"
+	// flag only, matching the legacy platform; blanket all-branches coverage is
+	// a separate concern. A project whose only rule is "All branches" still
+	// fires 504. (Contrast ISSUE-502, which does accept a zero-scope rule.)
+	allBranchesOnly := &ir.NormalizedPipeline{
+		Provider:             ir.ProviderGitLab,
+		MRApprovalRulesKnown: true,
+		MRApprovalRules: []ir.MRApprovalRule{
+			{ID: "30", Name: "All branches", ApprovalsRequired: 2, AppliesToAllProtectedBranches: false, ProtectedBranchCount: 0},
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), allBranchesOnly, nil); countCode(f, "ISSUE-504") != 1 {
+		t.Fatalf("expected 1 ISSUE-504 finding: an \"All branches\" rule is not the explicit all-protected-branches flag (legacy-faithful)")
+	}
+
+	// Abstain: listing unreadable -> not-evaluable.
+	unknown := &ir.NormalizedPipeline{Provider: ir.ProviderGitLab, MRApprovalRulesKnown: false}
+	if f, _ := engine.Evaluate(context.Background(), unknown, nil); countCode(f, "ISSUE-504") != 0 {
+		t.Fatalf("expected 0 ISSUE-504 findings when the approvals listing is unreadable")
+	}
+}
+
+// TestIssue201_CicdVariableUnprotected flags settings CI/CD variables that are
+// not protected. These are settings-level findings (no file/job); identity is
+// the variable's name/type/environment. The rule abstains when the settings
+// listing was unreadable (SettingsVariablesKnown=false), so a token without
+// variable-read scope reports not-evaluable rather than a false pass.
+func TestIssue201_CicdVariableUnprotected(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+
+	// Positive: two unprotected variables, one protected (noise).
+	pipeline := &ir.NormalizedPipeline{
+		Provider:               ir.ProviderGitLab,
+		SettingsVariablesKnown: true,
+		SettingsVariables: []ir.SettingsVariable{
+			{Name: "AWS_KEY", Type: "env_var", Environment: "*", Protected: false, Masked: true},
+			{Name: "DEPLOY_TOKEN", Type: "env_var", Environment: "production", Protected: false, Masked: true},
+			{Name: "SAFE", Type: "env_var", Environment: "*", Protected: true, Masked: true},
+		},
+	}
+	findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if got := countCode(findings, "ISSUE-201"); got != 2 {
+		t.Fatalf("expected 2 ISSUE-201 findings, got %d", got)
+	}
+	assertSubjectKey(t, findings, "ISSUE-201", "variableName", []string{"AWS_KEY", "DEPLOY_TOKEN"})
+	assertSubjectKey(t, findings, "ISSUE-201", "environment", []string{"*", "production"})
+
+	// Negative: everything protected -> no findings.
+	clean := &ir.NormalizedPipeline{
+		Provider:               ir.ProviderGitLab,
+		SettingsVariablesKnown: true,
+		SettingsVariables: []ir.SettingsVariable{
+			{Name: "SAFE", Type: "env_var", Environment: "*", Protected: true, Masked: true},
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), clean, nil); countCode(f, "ISSUE-201") != 0 {
+		t.Fatalf("expected 0 ISSUE-201 findings when all variables are protected")
+	}
+
+	// Abstain: listing unreadable (Known=false) -> not-evaluable, so no
+	// findings even though a variable is unprotected.
+	unknown := &ir.NormalizedPipeline{
+		Provider:               ir.ProviderGitLab,
+		SettingsVariablesKnown: false,
+		SettingsVariables: []ir.SettingsVariable{
+			{Name: "AWS_KEY", Type: "env_var", Environment: "*", Protected: false},
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), unknown, nil); countCode(f, "ISSUE-201") != 0 {
+		t.Fatalf("expected 0 ISSUE-201 findings when the settings listing is unreadable")
+	}
+}
+
+// TestIssue202_CicdVariableUnmasked flags settings CI/CD variables that are
+// not masked (their values print in job logs). Same collector, identity, and
+// abstain semantics as ISSUE-201.
+func TestIssue202_CicdVariableUnmasked(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+
+	// Positive: one unmasked variable, one masked (noise).
+	pipeline := &ir.NormalizedPipeline{
+		Provider:               ir.ProviderGitLab,
+		SettingsVariablesKnown: true,
+		SettingsVariables: []ir.SettingsVariable{
+			{Name: "PLAINTEXT_TOKEN", Type: "env_var", Environment: "*", Protected: true, Masked: false},
+			{Name: "MASKED", Type: "env_var", Environment: "*", Protected: true, Masked: true},
+		},
+	}
+	findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if got := countCode(findings, "ISSUE-202"); got != 1 {
+		t.Fatalf("expected 1 ISSUE-202 finding, got %d", got)
+	}
+	assertSubjectKey(t, findings, "ISSUE-202", "variableName", []string{"PLAINTEXT_TOKEN"})
+
+	// Negative: everything masked -> no findings.
+	clean := &ir.NormalizedPipeline{
+		Provider:               ir.ProviderGitLab,
+		SettingsVariablesKnown: true,
+		SettingsVariables: []ir.SettingsVariable{
+			{Name: "MASKED", Type: "env_var", Environment: "*", Protected: true, Masked: true},
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), clean, nil); countCode(f, "ISSUE-202") != 0 {
+		t.Fatalf("expected 0 ISSUE-202 findings when all variables are masked")
+	}
+
+	// Negative: file-type variables cannot be masked in GitLab, so an unmasked
+	// file variable is an unfixable false positive and must NOT fire. Only the
+	// env_var here is flagged. Case-insensitive: the GraphQL enum form "FILE" is
+	// excluded the same as "file".
+	fileVars := &ir.NormalizedPipeline{
+		Provider:               ir.ProviderGitLab,
+		SettingsVariablesKnown: true,
+		SettingsVariables: []ir.SettingsVariable{
+			{Name: "KUBECONFIG", Type: "file", Environment: "*", Protected: true, Masked: false},
+			{Name: "TLS_KEY", Type: "FILE", Environment: "*", Protected: true, Masked: false},
+			{Name: "PLAINTEXT_TOKEN", Type: "env_var", Environment: "*", Protected: true, Masked: false},
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), fileVars, nil); countCode(f, "ISSUE-202") != 1 {
+		t.Fatalf("expected exactly 1 ISSUE-202 finding: file-type variables cannot be masked and must be skipped, only the env_var counts")
+	}
+
+	// Abstain: listing unreadable -> not-evaluable.
+	unknown := &ir.NormalizedPipeline{
+		Provider:               ir.ProviderGitLab,
+		SettingsVariablesKnown: false,
+		SettingsVariables: []ir.SettingsVariable{
+			{Name: "PLAINTEXT_TOKEN", Type: "env_var", Environment: "*", Masked: false},
+		},
+	}
+	if f, _ := engine.Evaluate(context.Background(), unknown, nil); countCode(f, "ISSUE-202") != 0 {
+		t.Fatalf("expected 0 ISSUE-202 findings when the settings listing is unreadable")
+	}
+}
+
 // TestIssue505_BranchNonCompliant flags protected branches whose
 // settings fail to meet the declared minimum bar.
 func TestIssue505_BranchNonCompliant(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1177,20 +1692,21 @@ func TestIssue505_BranchNonCompliant(t *testing.T) {
 		t.Fatalf("evaluate: %v", err)
 	}
 	hits := map[string]bool{}
-	issue505ByJob := map[string]opaengine.Finding{}
+	issue505ByBranch := map[string]opaengine.Finding{}
 	for _, f := range findings {
 		if f.Code == "ISSUE-505" {
-			if issue505ByJob[f.Job].Code != "" {
-				t.Fatalf("expected at most one ISSUE-505 per branch, got duplicate for %q", f.Job)
+			branch, _ := f.Data["branchName"].(string)
+			if issue505ByBranch[branch].Code != "" {
+				t.Fatalf("expected at most one ISSUE-505 per branch, got duplicate for %q", branch)
 			}
-			issue505ByJob[f.Job] = f
-			hits[f.Job] = true
+			issue505ByBranch[branch] = f
+			hits[branch] = true
 		}
 	}
 	if !hits["main"] || !hits["low-push"] {
 		t.Fatalf("expected main and low-push flagged, got %v", hits)
 	}
-	mainF := issue505ByJob["main"]
+	mainF := issue505ByBranch["main"]
 	if !strings.Contains(mainF.Message, "main") || !strings.Contains(mainF.Message, "non-compliant") {
 		t.Fatalf("unexpected ISSUE-505 message for main: %q", mainF.Message)
 	}
@@ -1201,6 +1717,8 @@ func TestIssue505_BranchNonCompliant(t *testing.T) {
 	if hits["compliant"] || hits["unprotected"] {
 		t.Fatalf("unexpected flag on compliant/unprotected: %v", hits)
 	}
+	assertSubjectKey(t, findings, "ISSUE-505", "branchName", []string{"main", "low-push"})
+	assertNoJob(t, findings, "ISSUE-505")
 }
 
 // TestIssue505_AccessLevelStrictestPolicy: GitLab access level 0 = "No one".
@@ -1208,7 +1726,7 @@ func TestIssue505_BranchNonCompliant(t *testing.T) {
 // permissive and should fire (legacy parity).
 func TestIssue505_AccessLevelStrictestPolicy(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1253,7 +1771,7 @@ func TestIssue505_AccessLevelStrictestPolicy(t *testing.T) {
 // policy requires a positive minimum.
 func TestIssue505_AccessLevelSkipsWhenIRZero(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1314,7 +1832,7 @@ func toStringSlice(raw any) []string {
 // the authoritative `Protected` field from the listing.
 func TestIssue505_DetailUnknownAbstainsButIssue501StillFires(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1345,8 +1863,8 @@ func TestIssue505_DetailUnknownAbstainsButIssue501StillFires(t *testing.T) {
 	for _, f := range findings {
 		switch f.Code {
 		case "ISSUE-501":
-			if f.Job != "feature" {
-				t.Fatalf("ISSUE-501 should target the unprotected branch, got %q", f.Job)
+			if name, _ := f.Data["branchName"].(string); name != "feature" {
+				t.Fatalf("ISSUE-501 should target the unprotected branch, got %q", name)
 			}
 			saw501++
 		case "ISSUE-505":
@@ -1359,6 +1877,8 @@ func TestIssue505_DetailUnknownAbstainsButIssue501StillFires(t *testing.T) {
 	if saw505 != 0 {
 		t.Errorf("expected 0 ISSUE-505 when ProtectionDetailsKnown=false, got %d", saw505)
 	}
+	assertSubjectKey(t, findings, "ISSUE-501", "branchName", []string{"feature"})
+	assertNoJob(t, findings, "ISSUE-501")
 }
 
 // TestIssue505_NotInPolicyScope ensures ISSUE-501 scope matches ISSUE-505:
@@ -1366,7 +1886,7 @@ func TestIssue505_DetailUnknownAbstainsButIssue501StillFires(t *testing.T) {
 // is not the default branch when defaultMustBeProtected is false produces no ISSUE-505.
 func TestIssue505_NotInPolicyScope(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1398,7 +1918,7 @@ func TestIssue505_NotInPolicyScope(t *testing.T) {
 // forbidden version.
 func TestIssue404_IncludesForbiddenVersion(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1430,6 +1950,11 @@ func TestIssue404_IncludesForbiddenVersion(t *testing.T) {
 	if hits != 2 {
 		t.Fatalf("expected 2 ISSUE-404 findings, got %d", hits)
 	}
+	// The include path is what the finding is about. Without it the finding's
+	// identity falls back to the prose message, and a copy-edit to that message
+	// re-keys every ISSUE-404 in the wild.
+	assertSubjectKey(t, findings, "ISSUE-404", "includePath", []string{"plumber/a", "plumber/b"})
+	assertNoJob(t, findings, "ISSUE-404")
 }
 
 // TestIssue204_UnsafeVariableExpansion flags scripts re-parsing
@@ -1452,7 +1977,7 @@ func TestIssue204_UnsafeVariableExpansion(t *testing.T) {
 // full pipelineOriginData), so this test builds the IR directly.
 func TestIssue401_HardcodedJobs(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	pipeline := &ir.NormalizedPipeline{
@@ -1476,6 +2001,143 @@ func TestIssue401_HardcodedJobs(t *testing.T) {
 	if len(hits) != 1 || hits[0] != "build" {
 		t.Fatalf("expected only [build], got %v", hits)
 	}
+	assertSubjectKey(t, findings, "ISSUE-401", "hardcodedJob", []string{"build"})
+}
+
+// assertSubjectKey pins the structured key a control emits to say what its
+// finding is about. That key must be part of the code's v4 declaration
+// (finding/identity.Declared); a control whose Rego payload stops carrying a
+// declared key silently degrades that pair to empty, so dropping or renaming
+// the payload re-keys every finding it ever emitted. Pinning the key here is
+// what keeps that from happening silently.
+//
+// This is also the tripwire the recipe's own tests cannot be: they run on fixed
+// identity.Finding values, so they guard the algorithm and stay green when a
+// control changes what it emits, even though that moves real fingerprints just
+// as much. If one of these assertions fails because a rule's payload changed on
+// purpose, bump identity.RecipeVersion in the same change.
+func assertSubjectKey(t *testing.T, findings []opaengine.Finding, code, key string, wantValues []string) {
+	t.Helper()
+	decl, ok := identity.Declared(code)
+	if !ok || !slices.Contains(decl, key) {
+		t.Fatalf("%s: key %q is not part of the code's identity declaration: %v", code, key, decl)
+	}
+	got := []string{}
+	for _, f := range findings {
+		if f.Code != code {
+			continue
+		}
+		fields, ok := f.Identity()
+		if !ok {
+			t.Fatalf("%s: finding has no identity: %+v", code, f)
+		}
+		value, declared := "", false
+		for _, p := range fields.Selected {
+			if p.Key == key {
+				value, declared = p.Value, true
+				break
+			}
+		}
+		if !declared {
+			t.Errorf("%s: declared fields %v do not include the structured key %q", code, fields.Selected, key)
+			continue
+		}
+		got = append(got, value)
+	}
+	slices.Sort(got)
+	want := slices.Clone(wantValues)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("%s: %s values = %v, want %v", code, key, got, want)
+	}
+}
+
+// TestNewV4SubjectValues pins the VALUE of every structured identity subject
+// this control-library PR newly emits, not just its presence. The identity
+// harness proves the declared key appears in some emission; it never checks
+// the value, and each of these values feeds the recipe-v4 fingerprint
+// (identity.Of renders key=value for every declared field). So a rule that
+// regressed to the wrong field (job.name instead of the ref) or an empty value
+// would silently re-key every finding of that code while the suite stayed
+// green. One case per newly-emitted subject; the value is asserted through the
+// finding's own Identity(), the same path the fingerprint hashes.
+func TestNewV4SubjectValues(t *testing.T) {
+	cases := []struct {
+		code, fixture, key string
+		want               []string
+		dependabot         bool
+	}{
+		{"ISSUE-209", "violation_env_bound_body.yml", "variableName", []string{"BODY"}, false},
+		{"ISSUE-210", "violation_actor_dependabot.yml", "condition", []string{"github.actor == 'dependabot[bot]'"}, false},
+		{"ISSUE-211", "violation_tautology.yml", "condition", []string{"always() || github.ref == 'refs/heads/main'"}, false},
+		{"ISSUE-212", "violation_inverted.yml", "condition", []string{"contains('main', github.ref)"}, false},
+		{"ISSUE-302", "violation_inherit.yml", "uses", []string{"acme/shared/.github/workflows/publish.yml@v1"}, false},
+		{"ISSUE-306", "violation_skip_revoke.yml", "uses", []string{"actions/create-github-app-token@v1"}, false},
+		{"ISSUE-901", "violation_allow.yml", "ecosystem", []string{"npm"}, true},
+		{"ISSUE-902", "violation_no_cooldown.yml", "ecosystem", []string{"npm", "pip"}, true},
+	}
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			tmp := t.TempDir()
+			wfDir := filepath.Join(tmp, ".github", "workflows")
+			if err := os.MkdirAll(wfDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join("testdata", tc.code, "github", tc.fixture))
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			if tc.dependabot {
+				if err := os.WriteFile(filepath.Join(tmp, ".github", "dependabot.yml"), data, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				minimal := []byte("name: x\non: [push]\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo x\n")
+				if err := os.WriteFile(filepath.Join(wfDir, "w.yml"), minimal, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(filepath.Join(wfDir, tc.fixture), data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
+			if err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+			if err != nil {
+				t.Fatalf("evaluate: %v", err)
+			}
+			assertSubjectKey(t, findings, tc.code, tc.key, tc.want)
+		})
+	}
+}
+
+// assertNoJob pins that a control leaves Finding.Job empty. The field is a CI
+// job name and a hashed identity input; a control that puts a branch, an
+// include source or a required path there both mislabels its output and makes
+// identity depend on the mislabelling.
+//
+// It also requires that the code produced at least one finding: a pin that
+// silently passes because the control emitted zero findings is not a
+// regression guard, it is a no-op.
+func assertNoJob(t *testing.T, findings []opaengine.Finding, code string) {
+	t.Helper()
+	count := 0
+	for _, f := range findings {
+		if f.Code != code {
+			continue
+		}
+		count++
+		if f.Job != "" {
+			t.Errorf("%s: job = %q, want empty: this finding is not about a job", code, f.Job)
+		}
+	}
+	if count == 0 {
+		t.Fatalf("%s: no findings with this code, assertNoJob passes vacuously", code)
+	}
 }
 
 // TestIssue101_ImageAuthorizedSources flags jobs using images from
@@ -1484,7 +2146,7 @@ func TestIssue401_HardcodedJobs(t *testing.T) {
 // because parseGitLabCI does not extract Image.Registry.
 func TestIssue101_ImageAuthorizedSources(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1526,6 +2188,57 @@ func TestIssue101_ImageAuthorizedSources(t *testing.T) {
 	}
 }
 
+// TestImageRepoIdentityValue pins the value of the imageRepo identity subject
+// for ISSUE-101 and ISSUE-103. imageRepo must be the tagless
+// <registry>/<name>, so a tag bump on the same untrusted / unpinned image does
+// not re-key the finding (the fix for the review point that the tag was
+// polluting image identity). It also pins the registryless cases the GitLab
+// collector actually produces: an empty registry AND the "unknown" literal
+// both collapse to the bare name, and — critically — the two controls'
+// _image_repo helpers must agree on that (they diverged on "unknown" before).
+// A wrong _image_repo (kept the tag, dropped the registry, or left "unknown"
+// in) fails here, which the presence/harness checks alone would not catch.
+func TestImageRepoIdentityValue(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	cfg := map[string]any{
+		// ISSUE-101 fires: the image is not in the trusted list.
+		"imageAuthorizedSources": map[string]any{
+			"trustedUrls": []string{"registry.company.com/*"},
+		},
+		// ISSUE-103 fires: pin-by-digest required and the image is tag-only.
+		"containerImageMustNotUseForbiddenTags": map[string]any{
+			"mustBePinnedByDigest": true,
+		},
+	}
+	cases := []struct {
+		name     string
+		image    ir.Image
+		wantRepo string
+	}{
+		{"known_registry", ir.Image{Name: "attacker/app", Tag: "3.2", Registry: "ghcr.io"}, "ghcr.io/attacker/app"},
+		{"unknown_registry", ir.Image{Name: "attacker/app", Tag: "3.2", Registry: "unknown"}, "attacker/app"},
+		{"no_registry", ir.Image{Name: "attacker/app", Tag: "3.2"}, "attacker/app"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pipeline := &ir.NormalizedPipeline{
+				Provider: ir.ProviderGitLab,
+				Jobs:     []ir.Job{{Name: "build", Image: &tc.image}},
+			}
+			findings, err := engine.Evaluate(context.Background(), pipeline, cfg)
+			if err != nil {
+				t.Fatalf("evaluate: %v", err)
+			}
+			// Both controls key on the tagless repo, and must agree on it.
+			assertSubjectKey(t, findings, "ISSUE-101", "imageRepo", []string{tc.wantRepo})
+			assertSubjectKey(t, findings, "ISSUE-103", "imageRepo", []string{tc.wantRepo})
+		})
+	}
+}
+
 // TestIssue410_SecurityJobsWeakened flags SAST-like jobs with
 // allow_failure: true or when: manual.
 func TestIssue410_SecurityJobsWeakened(t *testing.T) {
@@ -1554,7 +2267,7 @@ func TestIssue410_SecurityJobsWeakened(t *testing.T) {
 // "project", which the YAML-only test parser does not populate.
 func TestIssue410_MultipleWeakeningsOnOneJob(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1591,13 +2304,16 @@ func TestIssue410_MultipleWeakeningsOnOneJob(t *testing.T) {
 			hits = append(hits, detail)
 		}
 	}
-	// Expect 4 findings on this one job:
-	//   - allow_failure: true masks scan failures
-	//   - when: manual prevents the scan from running automatically
-	//   - rules overridden with 'when: manual', job will not run
-	//   - rules overridden with 'when: never', job will not run
-	if len(hits) != 4 {
-		t.Fatalf("expected 4 distinct ISSUE-410 reasons on the multi-weakened job, got %d: %v", len(hits), hits)
+	// Three distinct weakening TOKENS on this one job. detail is a stable
+	// token (not the prose reason), so identity survives a message rewording:
+	//   - allow_failure  (allow_failure: true)
+	//   - when_manual    (job-level when: manual)
+	//   - rules_override (the rules block pins when: manual/never — one
+	//     finding per job regardless of how many blocking rules, so the two
+	//     rule entries in this fixture collapse into a single finding).
+	slices.Sort(hits)
+	if !slices.Equal(hits, []string{"allow_failure", "rules_override", "when_manual"}) {
+		t.Fatalf("expected the three weakening tokens on the multi-weakened job, got %v", hits)
 	}
 }
 
@@ -1641,7 +2357,7 @@ func TestIssue410_GitHubContinueOnError(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -1661,7 +2377,7 @@ func TestIssue410_GitHubContinueOnError(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -1704,11 +2420,11 @@ func TestIssue205_JobVariableOverride(t *testing.T) {
 
 // TestIssue404_WildcardForbiddenVersion locks in legacy go-wildcard
 // parity: a `v*` pattern in forbiddenVersions must match `v1.0.0`
-// just like the legacy gitlab.CheckItemMatchToPatterns helper.
+// just like the go-wildcard matching the pre-OPA GitLab engine used.
 // Hardcoded includes are skipped regardless of ref.
 func TestIssue404_WildcardForbiddenVersion(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1731,12 +2447,14 @@ func TestIssue404_WildcardForbiddenVersion(t *testing.T) {
 	hits := []string{}
 	for _, f := range findings {
 		if f.Code == "ISSUE-404" {
-			hits = append(hits, f.Job)
+			path, _ := f.Data["includePath"].(string)
+			hits = append(hits, path)
 		}
 	}
 	if len(hits) != 1 || hits[0] != "plumber/a" {
 		t.Fatalf("expected only [plumber/a] flagged via wildcard, got %v", hits)
 	}
+	assertNoJob(t, findings, "ISSUE-404")
 }
 
 // TestIssue204_SourceAndDotSourcing covers the two patterns that were
@@ -1745,7 +2463,7 @@ func TestIssue404_WildcardForbiddenVersion(t *testing.T) {
 // is just as dangerous as `eval`.
 func TestIssue204_SourceAndDotSourcing(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1786,7 +2504,7 @@ func TestIssue204_SourceAndDotSourcing(t *testing.T) {
 // previous Rego implementation) over-matched.
 func TestIssue204_VariableWordBoundary(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1817,13 +2535,93 @@ func TestIssue204_VariableWordBoundary(t *testing.T) {
 	}
 }
 
+// TestIssue204_MultipleDangerousVariablesOnOneLine pins the crash
+// reported against v0.4.41: `_dangerous_variable_in_line` was a complete
+// function, so a script line naming TWO configured dangerous variables
+// made it yield two values and OPA aborted the module with
+// eval_conflict_error. Because Engine.Evaluate returns on the first
+// module error, that one line discarded the findings of EVERY policy and
+// the run silently scored 100/100. The default config ships ten
+// dangerous variables, several of which routinely co-occur on one line
+// (CI_COMMIT_REF_NAME with CI_COMMIT_REF_SLUG or CI_COMMIT_BRANCH), so
+// this was reachable on ordinary pipelines.
+//
+// Each dangerous variable on the line is its own injection vector and
+// gets its own finding. Reporting only one would have to guess which is
+// the real sink: on `echo "$CI_COMMIT_MESSAGE" && source
+// "./ci/$CI_COMMIT_REF_NAME.sh"` the safe echo comes first in config
+// order, and naming it invites a reviewer to dismiss a true positive.
+func TestIssue204_MultipleDangerousVariablesOnOneLine(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	cfg := map[string]any{
+		"unsafeVariableExpansion": map[string]any{
+			// Config order matters: the safe one is listed first, so a
+			// first-match-wins rule would report CI_COMMIT_MESSAGE and
+			// stay silent about the variable actually in the sink.
+			"dangerousVariables": []string{"CI_COMMIT_MESSAGE", "CI_COMMIT_REF_NAME"},
+			"allowedPatterns":    []string{},
+		},
+	}
+	pipeline := &ir.NormalizedPipeline{
+		Provider: ir.ProviderGitLab,
+		Jobs: []ir.Job{
+			{Name: "deploy", Scripts: []string{`echo "$CI_COMMIT_MESSAGE" && source "./ci/$CI_COMMIT_REF_NAME.sh"`}},
+		},
+	}
+	findings, err := engine.Evaluate(context.Background(), pipeline, cfg)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	got := []string{}
+	for _, f := range findings {
+		if f.Code == "ISSUE-204" {
+			name, _ := f.Data["variableName"].(string)
+			got = append(got, name)
+		}
+	}
+	sort.Strings(got)
+	want := []string{"CI_COMMIT_MESSAGE", "CI_COMMIT_REF_NAME"}
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("expected one finding per dangerous variable %v, got %v", want, got)
+	}
+}
+
+// TestIssue204_NoConfigNoFindings pins that the control stays silent when
+// no dangerousVariables are configured, so the set-based rule above does
+// not start flagging every shell re-parse on a config that never enabled
+// the control.
+func TestIssue204_NoConfigNoFindings(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	pipeline := &ir.NormalizedPipeline{
+		Provider: ir.ProviderGitLab,
+		Jobs: []ir.Job{
+			{Name: "deploy", Scripts: []string{`eval "$CI_COMMIT_MESSAGE"`}},
+		},
+	}
+	findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	for _, f := range findings {
+		if f.Code == "ISSUE-204" {
+			t.Fatalf("no dangerousVariables configured, expected no ISSUE-204, got %+v", f)
+		}
+	}
+}
+
 // TestIssue412_DindLatestAndRegistryPrefix locks in two legacy
 // behaviours of isDindImage: `docker:latest` is dind, and a
 // registry-prefixed `<host>/docker:dind` is dind. A non-`docker`
 // image with `dind` in the tag (e.g. `nginx:dind`) must NOT match.
 func TestIssue412_DindLatestAndRegistryPrefix(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	pipeline := &ir.NormalizedPipeline{
@@ -1857,7 +2655,7 @@ func TestIssue412_DindLatestAndRegistryPrefix(t *testing.T) {
 // job, the policy must emit a single finding.
 func TestIssue412_OneFindingPerJob(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	pipeline := &ir.NormalizedPipeline{
@@ -1894,7 +2692,7 @@ func TestIssue412_OneFindingPerJob(t *testing.T) {
 //     (the legacy GetConf path skips the control).
 func TestIssue203_TruthyAndCaseInsensitive(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -1949,7 +2747,7 @@ func TestIssue203_TruthyAndCaseInsensitive(t *testing.T) {
 // when-no-cfg behaviour for the GitHub provider.
 func TestIssue203_GitHubDebugVariables(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -2005,7 +2803,7 @@ func TestIssue203_GitHubDebugVariables(t *testing.T) {
 }
 
 // TestIssue203_GitHubDebugTrace_CollectorIntegration exercises expression
-// and $GITHUB_ENV bypass paths end-to-end through ScanGitHubWorkflows.
+// and $GITHUB_ENV bypass paths end-to-end through ScanGitHubWorkflowsWithProgress.
 func TestIssue203_GitHubDebugTrace_CollectorIntegration(t *testing.T) {
 	tmp := t.TempDir()
 	wfDir := filepath.Join(tmp, ".github", "workflows")
@@ -2033,12 +2831,12 @@ jobs:
 	if err := os.WriteFile(filepath.Join(wfDir, "debug.yml"), []byte(workflow), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	pipeline, partial, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+	pipeline, partial, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 	if err != nil || len(partial) != 0 {
 		t.Fatalf("scan: err=%v partial=%v", err, partial)
 	}
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -2074,7 +2872,7 @@ jobs:
 //     compares against just `name:tag`.
 func TestIssue101_VarNotationAndUnknownRegistry(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -2139,7 +2937,7 @@ type policyCase struct {
 func runGitLabPolicyCases(t *testing.T, code string, cases []policyCase, cfg map[string]any) {
 	t.Helper()
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	dir := filepath.Join("testdata", code, "gitlab")
@@ -2189,7 +2987,7 @@ func stringSlicesEqual(a, b []string) bool {
 // group — the Rego port does the same.
 func TestIssue408_ComponentMissing(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -2213,7 +3011,8 @@ func TestIssue408_ComponentMissing(t *testing.T) {
 	hits := map[string]bool{}
 	for _, f := range findings {
 		if f.Code == "ISSUE-408" {
-			hits[f.Job] = true
+			name, _ := f.Data["componentPath"].(string)
+			hits[name] = true
 		}
 	}
 	if !hits["components/secret-detection/secret-detection"] {
@@ -2225,13 +3024,16 @@ func TestIssue408_ComponentMissing(t *testing.T) {
 	if hits["components/sast/sast"] {
 		t.Fatalf("unexpected flag on present component: %v", hits)
 	}
+	assertSubjectKey(t, findings, "ISSUE-408", "componentPath",
+		[]string{"components/secret-detection/secret-detection", "your-org/full-security/full-security"})
+	assertNoJob(t, findings, "ISSUE-408")
 }
 
 // TestIssue409_ComponentOverridden flags required components whose
 // jobs were overridden with forbidden CI/CD keys.
 func TestIssue409_ComponentOverridden(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -2267,6 +3069,8 @@ func TestIssue409_ComponentOverridden(t *testing.T) {
 	if hits != 1 {
 		t.Fatalf("expected 1 ISSUE-409 finding, got %d", hits)
 	}
+	assertSubjectKey(t, findings, "ISSUE-409", "componentPath", []string{"components/sast/sast"})
+	assertNoJob(t, findings, "ISSUE-409")
 }
 
 // TestIssue405_TemplateMissing flags DNF groups whose required
@@ -2275,7 +3079,7 @@ func TestIssue409_ComponentOverridden(t *testing.T) {
 // ignored.
 func TestIssue405_TemplateMissing(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -2300,7 +3104,8 @@ func TestIssue405_TemplateMissing(t *testing.T) {
 	hits := map[string]bool{}
 	for _, f := range findings {
 		if f.Code == "ISSUE-405" {
-			hits[f.Job] = true
+			path, _ := f.Data["templatePath"].(string)
+			hits[path] = true
 		}
 	}
 	if !hits["templates/trivy/trivy"] {
@@ -2309,13 +3114,15 @@ func TestIssue405_TemplateMissing(t *testing.T) {
 	if hits["templates/go/go"] {
 		t.Fatalf("unexpected flag on present template: %v", hits)
 	}
+	assertSubjectKey(t, findings, "ISSUE-405", "templatePath", []string{"templates/trivy/trivy"})
+	assertNoJob(t, findings, "ISSUE-405")
 }
 
 // TestIssue406_TemplateOverridden flags required templates whose
 // jobs were overridden locally.
 func TestIssue406_TemplateOverridden(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	cfg := map[string]any{
@@ -2352,6 +3159,8 @@ func TestIssue406_TemplateOverridden(t *testing.T) {
 	if hits != 1 {
 		t.Fatalf("expected 1 ISSUE-406 finding, got %d", hits)
 	}
+	assertSubjectKey(t, findings, "ISSUE-406", "templatePath", []string{"templates/go/go"})
+	assertNoJob(t, findings, "ISSUE-406")
 }
 
 // parseGitHubStepsUses extracts `steps[].uses` entries from a workflow
@@ -2391,7 +3200,7 @@ func TestIssue302_SecretsInherit(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, tc := range cases {
@@ -2409,7 +3218,7 @@ func TestIssue302_SecretsInherit(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(wfDir, tc.fixture), data, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -2434,11 +3243,11 @@ func TestIssue302_SecretsInherit(t *testing.T) {
 	}
 }
 
-// TestIssue301_OverprovisionedSecrets flags jobs that serialise the
+// TestIssue309_OverprovisionedSecrets flags jobs that serialise the
 // entire `secrets` context via toJson/toJSON and pass it into a
 // step's script, env binding, or action `with:` input. The scoped
 // pattern `${{ secrets.NAME }}` stays silent.
-func TestIssue301_OverprovisionedSecrets(t *testing.T) {
+func TestIssue309_OverprovisionedSecrets(t *testing.T) {
 	cases := []struct {
 		fixture      string
 		expectedHits []string
@@ -2450,7 +3259,7 @@ func TestIssue301_OverprovisionedSecrets(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, tc := range cases {
@@ -2468,7 +3277,7 @@ func TestIssue301_OverprovisionedSecrets(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(wfDir, tc.fixture), data, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -2503,14 +3312,42 @@ func TestIssue209_GitHubEnvInjection(t *testing.T) {
 		fixture      string
 		expectedHits []string
 	}{
+		// Violations — each MUST flag.
 		{"violation_event_to_env.yml", []string{"violation_event_to_env/build"}},
 		{"violation_head_ref_to_path.yml", []string{"violation_head_ref_to_path/deploy"}},
-		{"clean_env_binding.yml", nil},
-		{"clean_literal.yml", nil},
+		{"violation_quoted_sink.yml", []string{"violation_quoted_sink/bad"}},
+		{"violation_tee_path.yml", []string{"violation_tee_path/bad"}},
+		{"violation_brace_env.yml", []string{"violation_brace_env/bad"}},
+		{"violation_message.yml", []string{"violation_message/bad"}},
+		{"violation_fork_default_branch.yml", []string{"violation_fork_default_branch/bad"}},
+		// Env-bound: the env: binding satisfies ISSUE-207 (no command injection)
+		// but NOT 209 — a newline still poisons $GITHUB_ENV, any value poisons PATH.
+		{"violation_env_bound_body.yml", []string{"violation_env_bound_body/bad"}},
+		{"violation_env_bound_path.yml", []string{"violation_env_bound_path/bad"}},
+		// Split sink/dereference: the redirect and the $VAR are on different
+		// lines of the run block (heredoc), so per-line matching misses it, but
+		// the body still lands in $GITHUB_ENV.
+		{"violation_env_bound_heredoc.yml", []string{"violation_env_bound_heredoc/bad"}},
+		// base64 present on the line, but applied to an unrelated substitution,
+		// not to the untrusted var — must not be suppressed. Covered in both
+		// orders: base64 after the var, and base64 before it.
+		{"violation_base64_elsewhere.yml", []string{"violation_base64_elsewhere/bad"}},
+		{"violation_base64_before.yml", []string{"violation_base64_before/bad"}},
+		// Clean — each MUST stay silent (true-negative / false-positive guards).
+		{"clean_env_binding.yml", nil},          // env-bound title (single-line) to $GITHUB_ENV
+		{"clean_env_bound_ref_to_env.yml", nil}, // env-bound ref (single-line) to $GITHUB_ENV
+		{"clean_env_base64.yml", nil},           // env-bound body, but base64-encoded
+		{"clean_literal.yml", nil},              // static value
+		{"clean_pr_number.yml", nil},            // numeric field, not injectable
+		{"clean_head_sha.yml", nil},             // SHA, not injectable
+		{"clean_action_enum.yml", nil},          // enum, not injectable
+		{"clean_base_default_branch.yml", nil},  // base repo metadata (#230), not the fork's
+		{"clean_tojson.yml", nil},               // toJSON escapes the newline
+		{"clean_cross_line.yml", nil},           // sink and expression on different lines
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, tc := range cases {
@@ -2528,7 +3365,7 @@ func TestIssue209_GitHubEnvInjection(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(wfDir, tc.fixture), data, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -2553,10 +3390,54 @@ func TestIssue209_GitHubEnvInjection(t *testing.T) {
 	}
 }
 
+// TestIssue209UnsafePatternsMatchTemplateInjection enforces that the
+// github-env-injection rule's untrusted-expression list stays byte-identical
+// to the template-injection rule's. The OPA engine compiles each policy in
+// isolation so they cannot share a symbol; this guards against the two
+// drifting (which previously let ISSUE-209 over-match numeric/enum fields).
+func TestIssue209UnsafePatternsMatchTemplateInjection(t *testing.T) {
+	got := extractRegoUnsafePatterns(t, "github_env_injection.rego")
+	want := extractRegoUnsafePatterns(t, "template_injection.rego")
+	if len(want) == 0 {
+		t.Fatal("extracted zero patterns from template_injection.rego — extractor is broken")
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("github_env_injection.rego unsafe_patterns drifted from template_injection.rego.\n  209: %q\n  207: %q", got, want)
+	}
+}
+
+// extractRegoUnsafePatterns returns the backtick-quoted regex strings inside
+// the `unsafe_patterns := [ ... ]` block of a rego file in this package dir.
+func extractRegoUnsafePatterns(t *testing.T, file string) []string {
+	t.Helper()
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	src := string(data)
+	// Newline-anchored so it does not also match `newline_unsafe_patterns := [`.
+	start := strings.Index(src, "\nunsafe_patterns := [")
+	if start < 0 {
+		t.Fatalf("%s: no unsafe_patterns block found", file)
+	}
+	rest := src[start:]
+	// The closing bracket sits on its own line; the `]` characters inside the
+	// patterns (e.g. `[^}]`) are mid-line, so match a newline-anchored bracket.
+	end := strings.Index(rest, "\n]")
+	if end < 0 {
+		t.Fatalf("%s: unterminated unsafe_patterns block", file)
+	}
+	var out []string
+	for _, m := range regexp.MustCompile("`([^`]*)`").FindAllStringSubmatch(rest[:end], -1) {
+		out = append(out, m[1])
+	}
+	return out
+}
+
 // TestIssue105_ContainerHardcodedCredentials flags
 // jobs.<name>.container.credentials.password literals. Template
 // expressions (${{ secrets.X }}) pass through; missing credentials
-// block is a no-op. Exercises the production ScanGitHubWorkflows
+// block is a no-op. Exercises the production ScanGitHubWorkflowsWithProgress
 // collector so the test covers the full extraction path.
 func TestIssue105_ContainerHardcodedCredentials(t *testing.T) {
 	cases := []struct {
@@ -2569,7 +3450,7 @@ func TestIssue105_ContainerHardcodedCredentials(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, tc := range cases {
@@ -2587,7 +3468,7 @@ func TestIssue105_ContainerHardcodedCredentials(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(wfDir, tc.fixture), data, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -2618,7 +3499,7 @@ func TestIssue105_ContainerHardcodedCredentials(t *testing.T) {
 // exemption, and SHA/local exemptions.
 func TestIssue104_ActionUnpinned(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	dir := filepath.Join("testdata", "ISSUE-701", "github")
@@ -2629,6 +3510,9 @@ func TestIssue104_ActionUnpinned(t *testing.T) {
 	}{
 		{"violation_tag_ref.yml", map[string]any{"actionsMustBePinnedByCommitSha": map[string]any{}}, 3},
 		{"clean_sha_pinned.yml", map[string]any{"actionsMustBePinnedByCommitSha": map[string]any{}}, 0},
+		// SHAs are case-insensitive in git/the API: an uppercase pin is
+		// still immutable and must not be reported as a mutable ref.
+		{"clean_sha_pinned_uppercase.yml", map[string]any{"actionsMustBePinnedByCommitSha": map[string]any{}}, 0},
 		{"trusted_owner_tag.yml", map[string]any{"actionsMustBePinnedByCommitSha": map[string]any{"trustedOwners": []any{"actions", "github"}}}, 1},
 		{"violation_tag_ref.yml", nil, 0},
 		// Regression: reusable workflows called via job-level `uses:`
@@ -2675,7 +3559,7 @@ func TestIssue210_BotConditions(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, tc := range cases {
@@ -2693,7 +3577,7 @@ func TestIssue210_BotConditions(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(wfDir, tc.fixture), data, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -2732,7 +3616,7 @@ func TestIssue303_UnredactedSecrets(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, tc := range cases {
@@ -2750,7 +3634,7 @@ func TestIssue303_UnredactedSecrets(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(wfDir, tc.fixture), data, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -2775,11 +3659,11 @@ func TestIssue303_UnredactedSecrets(t *testing.T) {
 	}
 }
 
-// TestIssue106_CachePoisoning flags release/publish workflows that
+// TestIssue705_CachePoisoning flags release/publish workflows that
 // restore a build cache without a release-ref-scoped key. A plain CI
 // workflow or a release workflow with the ref woven into the cache
 // key stays silent.
-func TestIssue106_CachePoisoning(t *testing.T) {
+func TestIssue705_CachePoisoning(t *testing.T) {
 	cases := []struct {
 		fixture      string
 		expectedHits []string
@@ -2787,11 +3671,29 @@ func TestIssue106_CachePoisoning(t *testing.T) {
 		{"violation_release_unkeyed.yml", []string{"violation_release_unkeyed/publish"}},
 		{"violation_publish_action.yml", []string{"violation_publish_action/build"}},
 		{"clean_release_scoped_key.yml", nil},
+		{"clean_cache_disabled.yml", nil},
 		{"clean_ci_no_publish.yml", nil},
+		// PR #300 review: FP — no restorable cache must stay silent.
+		{"clean_setup_node_nocache.yml", nil},
+		{"clean_gradle_cache_disabled.yml", nil},
+		{"clean_setup_go_false_caps.yml", nil},
+		// PR #300 review: FN — unscoped restore-keys fallback.
+		{"violation_restore_keys.yml", []string{"violation_restore_keys/publish"}},
+		// PR #300 review: FN — publish script (push+tags) is release intent.
+		{"violation_pushtags_publish_script.yml", []string{"violation_pushtags_publish_script/publish"}},
+		// PR #300 review: FN — Swatinem/rust-cache + cargo publish.
+		{"violation_rust_cache.yml", []string{"violation_rust_cache/publish"}},
+		// PR #300 review: FN — inert cache: false on always-restore actions/cache.
+		{"violation_inert_cache_false.yml", []string{"violation_inert_cache_false/publish"}},
+		// PR #300 bot review: publishScriptExcludePatterns vetoes `npm publish --dry-run`.
+		{"clean_publish_dry_run.yml", nil},
+		// PR #300 bot review: enableContains — build-push-action GHA cache flags, registry cache does not.
+		{"violation_buildpush_gha_cache.yml", []string{"violation_buildpush_gha_cache/publish"}},
+		{"clean_buildpush_registry_cache.yml", nil},
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, tc := range cases {
@@ -2809,11 +3711,11 @@ func TestIssue106_CachePoisoning(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(wfDir, tc.fixture), data, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
-			findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+			findings, err := engine.Evaluate(context.Background(), pipeline, issue705DefaultConfig())
 			if err != nil {
 				t.Fatalf("evaluate: %v", err)
 			}
@@ -2834,9 +3736,268 @@ func TestIssue106_CachePoisoning(t *testing.T) {
 	}
 }
 
-// TestIssue601_AnonymousDefinition flags workflow files without a
-// top-level `name:`. One finding per file (not per job).
-func TestIssue601_AnonymousDefinition(t *testing.T) {
+// issue705DefaultConfig mirrors the shipped .plumber.yaml lists for the
+// cache-poisoning control. The action/script inventories are config, not
+// hardcoded, so the rego reads them from input.config.cachePoisoning.
+func issue705DefaultConfig() map[string]any {
+	return map[string]any{
+		"cachePoisoning": map[string]any{
+			"publishActions": []string{
+				"pypa/gh-action-pypi-publish",
+				"JS-DevTools/npm-publish",
+				"gradle/publish-plugin",
+				"softprops/action-gh-release",
+				"ncipollo/release-action",
+				"goreleaser/goreleaser-action",
+				"crazy-max/ghaction-docker-buildx",
+				"changesets/action",
+			},
+			"cacheActions": []map[string]any{
+				{"action": "actions/cache", "mode": "always"},
+				{"action": "actions/cache/restore", "mode": "always"},
+				{"action": "Swatinem/rust-cache", "mode": "always"},
+				{"action": "actions/setup-go", "mode": "default", "disableInput": "cache", "disableValue": false},
+				{"action": "gradle/actions/setup-gradle", "mode": "default", "disableInput": "cache-disabled", "disableValue": true},
+				{"action": "actions/setup-node", "mode": "opt-in", "enableInput": "cache"},
+				{"action": "actions/setup-python", "mode": "opt-in", "enableInput": "cache"},
+				{"action": "actions/setup-java", "mode": "opt-in", "enableInput": "cache"},
+				{"action": "pnpm/action-setup", "mode": "opt-in", "enableInput": "cache"},
+				{"action": "docker/build-push-action", "mode": "opt-in", "enableInput": "cache-from", "enableContains": "type=gha"},
+			},
+			"publishScriptPatterns": []string{
+				`(?i)(npm|pnpm|yarn|bun)\s+publish`,
+				`(?i)cargo\s+publish`,
+				`(?i)twine\s+upload`,
+				`(?i)poetry\s+publish`,
+				`(?i)gh\s+release\s+create`,
+				`(?i)goreleaser\s+release`,
+				`(?i)semantic-release`,
+				`(?i)gradlew?\b[^\n]*\bpublish`,
+				`(?i)\bmvnw?\b[^\n]*\bdeploy\b`,
+				`(?i)dotnet\s+nuget\s+push`,
+				`(?i)gem\s+push`,
+				`(?i)docker\s+push`,
+			},
+			"publishScriptExcludePatterns": []string{
+				`(?i)--dry-run`,
+				`(?i)publishToMavenLocal`,
+			},
+		},
+	}
+}
+
+// TestIssue705_CachePoisoning_ExcludeVeto proves publishScriptExcludePatterns
+// is what silences a `--dry-run` verification job: without the exclude the
+// same job flags, with it the job is clean. Guards the _script_excluded veto.
+func TestIssue705_CachePoisoning_ExcludeVeto(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	tmp := t.TempDir()
+	wfDir := filepath.Join(tmp, ".github", "workflows")
+	if err := os.MkdirAll(wfDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join("testdata", "ISSUE-705", "github", "clean_publish_dry_run.yml"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wfDir, "clean_publish_dry_run.yml"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	count := func(t *testing.T, cfg map[string]any) int {
+		t.Helper()
+		findings, err := engine.Evaluate(context.Background(), pipeline, cfg)
+		if err != nil {
+			t.Fatalf("evaluate: %v", err)
+		}
+		n := 0
+		for _, f := range findings {
+			if f.Code == "ISSUE-705" {
+				n++
+			}
+		}
+		return n
+	}
+	cache := []map[string]any{{"action": "actions/cache", "mode": "always"}}
+
+	t.Run("without exclude the dry-run job flags", func(t *testing.T) {
+		cfg := map[string]any{"cachePoisoning": map[string]any{
+			"publishScriptPatterns": []string{`(?i)npm\s+publish`},
+			"cacheActions":          cache,
+		}}
+		if n := count(t, cfg); n != 1 {
+			t.Fatalf("expected 1 finding without exclude, got %d", n)
+		}
+	})
+
+	t.Run("with --dry-run exclude the job is silent", func(t *testing.T) {
+		cfg := map[string]any{"cachePoisoning": map[string]any{
+			"publishScriptPatterns":        []string{`(?i)npm\s+publish`},
+			"publishScriptExcludePatterns": []string{`(?i)--dry-run`},
+			"cacheActions":                 cache,
+		}}
+		if n := count(t, cfg); n != 0 {
+			t.Fatalf("expected 0 findings with exclude, got %d", n)
+		}
+	})
+}
+
+// TestIssue705_CachePoisoning_Configurable proves the action inventory is
+// config-driven: an org-specific publish action flags only when the org
+// declares it in publishActions, not because it is hardcoded.
+func TestIssue705_CachePoisoning_Configurable(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	scan := func(t *testing.T) *ir.NormalizedPipeline {
+		t.Helper()
+		tmp := t.TempDir()
+		wfDir := filepath.Join(tmp, ".github", "workflows")
+		if err := os.MkdirAll(wfDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join("testdata", "ISSUE-705", "github", "violation_custom_publish_action.yml"))
+		if err != nil {
+			t.Fatalf("read fixture: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(wfDir, "violation_custom_publish_action.yml"), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		return pipeline
+	}
+	countHits := func(t *testing.T, cfg map[string]any) int {
+		t.Helper()
+		findings, err := engine.Evaluate(context.Background(), scan(t), cfg)
+		if err != nil {
+			t.Fatalf("evaluate: %v", err)
+		}
+		n := 0
+		for _, f := range findings {
+			if f.Code == "ISSUE-705" {
+				n++
+			}
+		}
+		return n
+	}
+
+	cacheAlways := []map[string]any{{"action": "actions/cache", "mode": "always"}}
+
+	t.Run("custom publish action not configured stays silent", func(t *testing.T) {
+		cfg := map[string]any{"cachePoisoning": map[string]any{
+			"publishActions": []string{"pypa/gh-action-pypi-publish"},
+			"cacheActions":   cacheAlways,
+		}}
+		if n := countHits(t, cfg); n != 0 {
+			t.Fatalf("expected 0 findings, got %d", n)
+		}
+	})
+
+	t.Run("custom publish action configured flags", func(t *testing.T) {
+		cfg := map[string]any{"cachePoisoning": map[string]any{
+			"publishActions": []string{"my-org/ship-it"},
+			"cacheActions":   cacheAlways,
+		}}
+		if n := countHits(t, cfg); n != 1 {
+			t.Fatalf("expected 1 finding, got %d", n)
+		}
+	})
+
+	t.Run("allowedJobs glob suppresses a flagged job", func(t *testing.T) {
+		cfg := map[string]any{"cachePoisoning": map[string]any{
+			"publishActions": []string{"my-org/ship-it"},
+			"cacheActions":   cacheAlways,
+			"allowedJobs":    []string{"*/release"},
+		}}
+		if n := countHits(t, cfg); n != 0 {
+			t.Fatalf("expected 0 findings (job allowlisted), got %d", n)
+		}
+	})
+}
+
+// TestIssue601_SecurityPolicyProject flags a GitLab project that does not link
+// the expected security policy project. Singleton. Abstains when the linkage
+// could not be read (known=false) or was not collected.
+func TestIssue601_SecurityPolicyProject(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	count601 := func(p *ir.NormalizedPipeline, cfg map[string]any) int {
+		findings, err := engine.Evaluate(context.Background(), p, cfg)
+		if err != nil {
+			t.Fatalf("evaluate: %v", err)
+		}
+		n := 0
+		for _, f := range findings {
+			if f.Code == "ISSUE-601" {
+				n++
+			}
+		}
+		return n
+	}
+	gl := func(sp *ir.SecurityPolicyProjectState) *ir.NormalizedPipeline {
+		return &ir.NormalizedPipeline{Provider: ir.ProviderGitLab, SecurityPolicyProject: sp}
+	}
+	anyLinkage := map[string]any{"projectMustHaveSecurityPolicySource": map[string]any{}}
+	expect9 := map[string]any{"projectMustHaveSecurityPolicySource": map[string]any{"expectedProjectId": 9}}
+
+	// Require-any: nothing linked -> fires; something linked -> passes.
+	if got := count601(gl(&ir.SecurityPolicyProjectState{Known: true, LinkedProjectID: 0}), anyLinkage); got != 1 {
+		t.Fatalf("require-any, nothing linked: expected 1 ISSUE-601, got %d", got)
+	}
+	if got := count601(gl(&ir.SecurityPolicyProjectState{Known: true, LinkedProjectID: 5, LinkedProjectPath: "grp/pol"}), anyLinkage); got != 0 {
+		t.Fatalf("require-any, a project linked: expected 0 ISSUE-601, got %d", got)
+	}
+
+	// Expected id: wrong linked -> fires; matching -> passes.
+	if got := count601(gl(&ir.SecurityPolicyProjectState{Known: true, LinkedProjectID: 5}), expect9); got != 1 {
+		t.Fatalf("expected id 9, linked 5: expected 1 ISSUE-601, got %d", got)
+	}
+	if got := count601(gl(&ir.SecurityPolicyProjectState{Known: true, LinkedProjectID: 9}), expect9); got != 0 {
+		t.Fatalf("expected id 9, linked 9: expected 0 ISSUE-601, got %d", got)
+	}
+
+	// Path mode: expectedProjectPath, compared case-insensitively.
+	expectPath := map[string]any{"projectMustHaveSecurityPolicySource": map[string]any{"expectedProjectPath": "Grp/Policies"}}
+	if got := count601(gl(&ir.SecurityPolicyProjectState{Known: true, LinkedProjectID: 5, LinkedProjectPath: "grp/policies"}), expectPath); got != 0 {
+		t.Fatalf("path mode, case-insensitive match: expected 0 ISSUE-601, got %d", got)
+	}
+	if got := count601(gl(&ir.SecurityPolicyProjectState{Known: true, LinkedProjectID: 5, LinkedProjectPath: "grp/other"}), expectPath); got != 1 {
+		t.Fatalf("path mode, mismatch: expected 1 ISSUE-601, got %d", got)
+	}
+
+	// Precedence: when both id and path are set, the id is authoritative — a
+	// matching id passes even if the path would mismatch.
+	both := map[string]any{"projectMustHaveSecurityPolicySource": map[string]any{"expectedProjectId": 9, "expectedProjectPath": "grp/other"}}
+	if got := count601(gl(&ir.SecurityPolicyProjectState{Known: true, LinkedProjectID: 9, LinkedProjectPath: "grp/policies"}), both); got != 0 {
+		t.Fatalf("id precedence: matching id must pass despite path mismatch, got %d ISSUE-601", got)
+	}
+
+	// Abstain: linkage not read authoritatively (known=false) -> no finding even
+	// with an expectation, and no projection at all -> no finding.
+	if got := count601(gl(&ir.SecurityPolicyProjectState{Known: false}), expect9); got != 0 {
+		t.Fatalf("known=false must abstain (not-evaluable), got %d ISSUE-601", got)
+	}
+	if got := count601(gl(nil), expect9); got != 0 {
+		t.Fatalf("no security-policy projection must abstain, got %d ISSUE-601", got)
+	}
+}
+
+// TestIssue422_AnonymousDefinition flags workflow files without a
+// top-level `name:`. One finding per file (not per job). Renumbered from
+// ISSUE-601 when the security-policy control took 601 (#417).
+func TestIssue422_AnonymousDefinition(t *testing.T) {
 	cases := []struct {
 		fixture   string
 		wantCount int
@@ -2846,7 +4007,7 @@ func TestIssue601_AnonymousDefinition(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, tc := range cases {
@@ -2856,7 +4017,7 @@ func TestIssue601_AnonymousDefinition(t *testing.T) {
 			if err := os.MkdirAll(wfDir, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			src := filepath.Join("testdata", "ISSUE-601", "github", tc.fixture)
+			src := filepath.Join("testdata", "ISSUE-422", "github", tc.fixture)
 			data, err := os.ReadFile(src)
 			if err != nil {
 				t.Fatalf("read fixture: %v", err)
@@ -2864,7 +4025,7 @@ func TestIssue601_AnonymousDefinition(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(wfDir, tc.fixture), data, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -2874,7 +4035,7 @@ func TestIssue601_AnonymousDefinition(t *testing.T) {
 			}
 			hits := 0
 			for _, f := range findings {
-				if f.Code == "ISSUE-601" {
+				if f.Code == "ISSUE-422" {
 					hits++
 				}
 			}
@@ -2885,9 +4046,9 @@ func TestIssue601_AnonymousDefinition(t *testing.T) {
 	}
 }
 
-// TestIssue602_MissingConcurrency flags workflow files with no
+// TestIssue422_MissingConcurrency flags workflow files with no
 // concurrency block at either workflow or job level.
-func TestIssue602_MissingConcurrency(t *testing.T) {
+func TestIssue422_MissingConcurrency(t *testing.T) {
 	cases := []struct {
 		fixture   string
 		wantCount int
@@ -2898,7 +4059,7 @@ func TestIssue602_MissingConcurrency(t *testing.T) {
 	}
 
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, tc := range cases {
@@ -2916,7 +4077,7 @@ func TestIssue602_MissingConcurrency(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(wfDir, tc.fixture), data, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -2965,7 +4126,7 @@ func TestIssue212_UnsoundContains(t *testing.T) {
 }
 
 // runGitHubFixtureCases drives a list of (fixture, expected jobs)
-// cases through ScanGitHubWorkflows + the embedded policies, then
+// cases through ScanGitHubWorkflowsWithProgress + the embedded policies, then
 // asserts the set of job names hit by the given issue code matches.
 func runGitHubFixtureCases(t *testing.T, code string, cases []struct {
 	fixture      string
@@ -2986,7 +4147,7 @@ func runGitHubFixtureCasesWithConfig(t *testing.T, code string, cases []struct {
 ) {
 	t.Helper()
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, tc := range cases {
@@ -3004,7 +4165,7 @@ func runGitHubFixtureCasesWithConfig(t *testing.T, code string, cases []struct {
 			if err := os.WriteFile(filepath.Join(wfDir, tc.fixture), data, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -3081,7 +4242,7 @@ func TestIssue606_DependabotInsecureExec(t *testing.T) {
 		{"clean.yml", 0},
 	}
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, c := range cases {
@@ -3104,7 +4265,7 @@ func TestIssue606_DependabotInsecureExec(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(tmp, ".github", "workflows", "w.yml"), minimal, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -3166,7 +4327,7 @@ func TestIssue607_DependabotMissingCooldown(t *testing.T) {
 		{"clean_with_cooldown.yml", 0},
 	}
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	for _, c := range cases {
@@ -3187,7 +4348,7 @@ func TestIssue607_DependabotMissingCooldown(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(tmp, ".github", "workflows", "w.yml"), minimal, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			pipeline, _, err := githubpkg.ScanGitHubWorkflows("owner/repo", "main", tmp, "", false)
+			pipeline, _, err := githubpkg.ScanGitHubWorkflowsWithProgress("owner/repo", "main", tmp, "", false, true, nil)
 			if err != nil {
 				t.Fatalf("scan: %v", err)
 			}
@@ -3238,8 +4399,9 @@ func TestIssue415_PullRequestTargetWithHeadCheckout(t *testing.T) {
 }
 
 // TestIssue215_TemplateInjectionVars flags scripts that expand
-// `vars.*` or `inputs.*` directly into a shell command; env-binding
-// pattern stays silent.
+// `vars.*`, `inputs.*` or the legacy `github.event.inputs.*` directly
+// into a shell command, under any trigger; the env-binding pattern
+// stays silent.
 func TestIssue215_TemplateInjectionVars(t *testing.T) {
 	cases := []struct {
 		fixture      string
@@ -3247,6 +4409,11 @@ func TestIssue215_TemplateInjectionVars(t *testing.T) {
 	}{
 		{"violation_vars_docker_login.yml", []string{"violation_vars_docker_login/login"}},
 		{"violation_inputs_reusable.yml", []string{"violation_inputs_reusable/run"}},
+		{"violation_github_event_inputs_reusable.yml", []string{"violation_github_event_inputs_reusable/run"}},
+		// Dispatch-only fires too: `${{ inputs.x }}` on the same line
+		// would, so exempting the legacy spelling would give one value
+		// two verdicts.
+		{"violation_github_event_inputs_dispatch.yml", []string{"violation_github_event_inputs_dispatch/run"}},
 		{"clean_env_binding.yml", nil},
 	}
 	runGitHubFixtureCases(t, "ISSUE-215", cases)
@@ -3279,7 +4446,7 @@ func TestIssue308_SecretsDynamicIndex(t *testing.T) {
 // a finding.
 func TestIssue402_RefConfusion(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -3328,6 +4495,295 @@ func TestIssue402_RefConfusion(t *testing.T) {
 	}
 }
 
+// TestIssue707_ImpostorCommit flags a 40-hex SHA pin whose commit the
+// upstream API DEFINITIVELY reports as absent (metadata.refKnownAbsent).
+// A SHA that resolves, a SHA that merely could-not-be-verified (private,
+// rate-limited, network error — refKnownAbsent stays false), a non-SHA
+// ref, and missing metadata all stay silent.
+func TestIssue707_ImpostorCommit(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	const deadSHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" // 40 hex, does not exist
+
+	cases := []struct {
+		name     string
+		action   ir.Action
+		wantHits int
+	}{
+		{
+			name:     "SHA confirmed absent flagged",
+			action:   ir.Action{Uses: "actions/checkout@" + deadSHA, Metadata: &ir.ActionMetadata{RefKnownAbsent: true}},
+			wantHits: 1,
+		},
+		{
+			// Git / the API resolve SHAs case-insensitively, so an
+			// uppercase pin must not dodge the check.
+			name:     "uppercase SHA confirmed absent flagged",
+			action:   ir.Action{Uses: "actions/checkout@DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF", Metadata: &ir.ActionMetadata{RefKnownAbsent: true}},
+			wantHits: 1,
+		},
+		{
+			name:     "SHA that resolves is silent",
+			action:   ir.Action{Uses: "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", Metadata: &ir.ActionMetadata{RefKind: "commit", RefExists: true}},
+			wantHits: 0,
+		},
+		{
+			name:     "SHA that could not be verified is silent",
+			action:   ir.Action{Uses: "private-org/action@" + deadSHA, Metadata: &ir.ActionMetadata{}},
+			wantHits: 0,
+		},
+		{
+			// ISSUE-401: a 40-hex SHA naming an annotated tag OBJECT is
+			// a fifth, distinct shape. The commits endpoint answers 422
+			// for it, but git/tags resolves it, so the collector reports
+			// it as an existing commit and this control must stay quiet.
+			name: "SHA of an annotated tag object is silent",
+			action: ir.Action{
+				Uses: "pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d",
+				Metadata: &ir.ActionMetadata{
+					RefKind:      "commit",
+					RefExists:    true,
+					RefCommitSha: "a7487c7e89a18df4991f7f222e4898a00d66ddda",
+				},
+			},
+			wantHits: 0,
+		},
+		{
+			name:     "non-SHA tag ref is silent",
+			action:   ir.Action{Uses: "owner/repo@v99", Metadata: &ir.ActionMetadata{RefKnownAbsent: true}},
+			wantHits: 0,
+		},
+		{
+			name:     "missing metadata abstains",
+			action:   ir.Action{Uses: "owner/repo@" + deadSHA},
+			wantHits: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pipeline := &ir.NormalizedPipeline{
+				Provider: ir.ProviderGitHub,
+				Jobs:     []ir.Job{{Name: "build", Uses: []ir.Action{tc.action}}},
+			}
+			findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+			if err != nil {
+				t.Fatalf("evaluate: %v", err)
+			}
+			hits := 0
+			for _, f := range findings {
+				if f.Code == "ISSUE-707" {
+					hits++
+				}
+			}
+			if hits != tc.wantHits {
+				t.Fatalf("%s: expected %d ISSUE-707 finding(s), got %d", tc.name, tc.wantHits, hits)
+			}
+		})
+	}
+}
+
+// TestIssue709_StaleActionRef locks the case-insensitive SHA handling
+// in stale_action_ref.rego (_pinned_sha lowercases before matching AND
+// returns the lowercased SHA). An uppercase pin that IS the latest
+// release must not be reported as stale: without the lower(), the
+// uppercase ref would never string-equal the API's lowercase
+// latestReleaseSha and an up-to-date pin would fire a spurious
+// ISSUE-709. (PR #332 review — case-insensitive SHA parity)
+func TestIssue709_StaleActionRef(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	const latestSHA = "11bd71901bbe5b1630ceea73d27597364c9af683"
+
+	cases := []struct {
+		name     string
+		action   ir.Action
+		wantHits int
+	}{
+		{
+			name: "uppercase pin at the latest release is not stale",
+			action: ir.Action{
+				Uses:     "actions/checkout@" + strings.ToUpper(latestSHA),
+				Metadata: &ir.ActionMetadata{LatestReleaseSha: latestSHA, LatestTag: "v4"},
+			},
+			wantHits: 0,
+		},
+		{
+			name: "pin behind the latest release is stale",
+			action: ir.Action{
+				Uses:     "actions/checkout@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+				Metadata: &ir.ActionMetadata{LatestReleaseSha: latestSHA, LatestTag: "v4"},
+			},
+			wantHits: 1,
+		},
+		{
+			name:     "missing metadata abstains",
+			action:   ir.Action{Uses: "actions/checkout@" + latestSHA},
+			wantHits: 0,
+		},
+		{
+			// ISSUE-401: the pin names the annotated tag object of the
+			// latest release. latestReleaseSha is the dereferenced
+			// commit, so comparing the raw SHAs calls an up-to-date pin
+			// stale.
+			name: "pin naming the latest release's tag object is not stale",
+			action: ir.Action{
+				Uses: "actions/checkout@7088e561eb65bb68695d245aa206f005ef30921d",
+				Metadata: &ir.ActionMetadata{
+					RefKind:          "commit",
+					RefExists:        true,
+					RefCommitSha:     latestSHA,
+					LatestReleaseSha: latestSHA,
+					LatestTag:        "v4",
+				},
+			},
+			wantHits: 0,
+		},
+		{
+			name: "tag object pin behind the latest release is still stale",
+			action: ir.Action{
+				Uses: "actions/checkout@7088e561eb65bb68695d245aa206f005ef30921d",
+				Metadata: &ir.ActionMetadata{
+					RefKind:          "commit",
+					RefExists:        true,
+					RefCommitSha:     "a7487c7e89a18df4991f7f222e4898a00d66ddda",
+					LatestReleaseSha: latestSHA,
+					LatestTag:        "v4",
+				},
+			},
+			wantHits: 1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pipeline := &ir.NormalizedPipeline{
+				Provider: ir.ProviderGitHub,
+				Jobs:     []ir.Job{{Name: "build", Uses: []ir.Action{tc.action}}},
+			}
+			findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+			if err != nil {
+				t.Fatalf("evaluate: %v", err)
+			}
+			hits := 0
+			for _, f := range findings {
+				if f.Code == "ISSUE-709" {
+					hits++
+				}
+			}
+			if hits != tc.wantHits {
+				t.Fatalf("%s: expected %d ISSUE-709 finding(s), got %d", tc.name, tc.wantHits, hits)
+			}
+		})
+	}
+}
+
+// TestIssue708_RefVersionMismatch locks the same case-insensitive SHA
+// parity in ref_version_mismatch.rego: the rule lowercases the pinned
+// ref before both the pattern match and the commentTagSha comparison,
+// so an uppercase pin whose trailing comment names the right tag is
+// not reported as a lying comment.
+func TestIssue708_RefVersionMismatch(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	const taggedSHA = "11bd71901bbe5b1630ceea73d27597364c9af683"
+
+	cases := []struct {
+		name     string
+		action   ir.Action
+		wantHits int
+	}{
+		{
+			name: "uppercase pin with a truthful comment is silent",
+			action: ir.Action{
+				Uses:     "actions/checkout@" + strings.ToUpper(taggedSHA),
+				Comment:  "# v4.1.7",
+				Metadata: &ir.ActionMetadata{CommentVersion: "4.1.7", CommentTagSha: taggedSHA},
+			},
+			wantHits: 0,
+		},
+		{
+			name: "pin whose comment names a different tag's SHA is flagged",
+			action: ir.Action{
+				Uses:     "actions/checkout@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+				Comment:  "# v4.1.7",
+				Metadata: &ir.ActionMetadata{CommentVersion: "4.1.7", CommentTagSha: taggedSHA},
+			},
+			wantHits: 1,
+		},
+		{
+			name:     "missing metadata abstains",
+			action:   ir.Action{Uses: "actions/checkout@" + taggedSHA, Comment: "# v4.1.7"},
+			wantHits: 0,
+		},
+		{
+			// ISSUE-401: the pin names the annotated tag OBJECT for the
+			// very version the comment claims. commentTagSha is the
+			// dereferenced commit, so the raw SHAs differ while the
+			// comment is telling the truth.
+			name: "pin naming the comment tag's annotated tag object is silent",
+			action: ir.Action{
+				Uses:    "pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d",
+				Comment: "# v4.1.0",
+				Metadata: &ir.ActionMetadata{
+					RefKind:        "commit",
+					RefExists:      true,
+					RefCommitSha:   "a7487c7e89a18df4991f7f222e4898a00d66ddda",
+					CommentVersion: "4.1.0",
+					CommentTagSha:  "a7487c7e89a18df4991f7f222e4898a00d66ddda",
+				},
+			},
+			wantHits: 0,
+		},
+		{
+			// The dereference must not become a blanket amnesty: a tag
+			// object pin whose comment names a different release is
+			// still a misleading comment.
+			name: "tag object pin whose comment names another release is flagged",
+			action: ir.Action{
+				Uses:    "pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d",
+				Comment: "# v3.0.0",
+				Metadata: &ir.ActionMetadata{
+					RefKind:        "commit",
+					RefExists:      true,
+					RefCommitSha:   "a7487c7e89a18df4991f7f222e4898a00d66ddda",
+					CommentVersion: "3.0.0",
+					CommentTagSha:  taggedSHA,
+				},
+			},
+			wantHits: 1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pipeline := &ir.NormalizedPipeline{
+				Provider: ir.ProviderGitHub,
+				Jobs:     []ir.Job{{Name: "build", Uses: []ir.Action{tc.action}}},
+			}
+			findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+			if err != nil {
+				t.Fatalf("evaluate: %v", err)
+			}
+			hits := 0
+			for _, f := range findings {
+				if f.Code == "ISSUE-708" {
+					hits++
+				}
+			}
+			if hits != tc.wantHits {
+				t.Fatalf("%s: expected %d ISSUE-708 finding(s), got %d", tc.name, tc.wantHits, hits)
+			}
+		})
+	}
+}
+
 // TestIssue402_GitLabRefConfusion flags GitLab includes whose ref
 // resolves upstream as both a tag and a branch (the collector sets
 // Include.RefIsAmbiguous). Fires only on a positive double-hit; a clean
@@ -3335,7 +4791,7 @@ func TestIssue402_RefConfusion(t *testing.T) {
 // probe never invents a finding.
 func TestIssue402_GitLabRefConfusion(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -3391,7 +4847,7 @@ func TestIssue402_GitLabRefConfusion(t *testing.T) {
 // negative (silent abstain, no false positive).
 func TestIssue114_KnownVulnerableAction(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -3401,7 +4857,7 @@ func TestIssue114_KnownVulnerableAction(t *testing.T) {
 			Jobs: []ir.Job{{
 				Name: "build",
 				Uses: []ir.Action{
-					{Uses: "tj-actions/changed-files@v45", Metadata: &ir.ActionMetadata{RefKind: "tag", RefExists: true, Advisories: []string{"GHSA-mrrh-fwg8-r2c3"}}},
+					{Uses: "tj-actions/changed-files@v45", Line: 10, Name: "Get changed files", Metadata: &ir.ActionMetadata{RefKind: "tag", RefExists: true, Advisories: []string{"GHSA-mrrh-fwg8-r2c3"}}},
 					{Uses: "actions/checkout@v4", Metadata: &ir.ActionMetadata{RefKind: "tag", RefExists: true}},
 				},
 			}},
@@ -3419,6 +4875,9 @@ func TestIssue114_KnownVulnerableAction(t *testing.T) {
 			wantLink := "https://github.com/advisories/GHSA-mrrh-fwg8-r2c3"
 			if !strings.Contains(f.Message, wantLink) {
 				t.Fatalf("ISSUE-703 message missing advisory URL\n  got: %s\n  want substring: %s", f.Message, wantLink)
+			}
+			if step, ok := f.Data["step"].(string); !ok || step != "Get changed files" {
+				t.Errorf("ISSUE-703 finding missing/wrong step field: %v", f.Data["step"])
 			}
 		}
 		if hits != 1 {
@@ -3482,13 +4941,107 @@ func TestIssue114_KnownVulnerableAction(t *testing.T) {
 	})
 }
 
+// TestIssue714_MutableRemoteExec locks in the graduated mutable-remote-exec
+// rule: the tier keys the code — exec→ISSUE-714 (high), obfuscated→ISSUE-715
+// (critical), unverified→ISSUE-716 (low) — for both the consumer side
+// (a used action) and the producer side (the scanned repo IS the action).
+// The "data" tier and a missing signal stay silent.
+func TestIssue714_MutableRemoteExec(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+
+	codeHits := func(pipeline *ir.NormalizedPipeline, code string) (int, string) {
+		findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+		if err != nil {
+			t.Fatalf("evaluate: %v", err)
+		}
+		hits, msg := 0, ""
+		for _, f := range findings {
+			if f.Code == code {
+				hits++
+				msg = f.Message
+			}
+		}
+		return hits, msg
+	}
+
+	consumer := func(tier, url string) *ir.NormalizedPipeline {
+		return &ir.NormalizedPipeline{
+			Provider: ir.ProviderGitHub,
+			Jobs: []ir.Job{{
+				Name: "build",
+				Uses: []ir.Action{{
+					Uses:     "vendor/action@v1",
+					Line:     10,
+					Name:     "Fetch and run",
+					Metadata: &ir.ActionMetadata{MutableRemoteExec: &ir.MutableRemoteExec{Tier: tier, URL: url}},
+				}},
+			}},
+		}
+	}
+	producer := func(tier, url string) *ir.NormalizedPipeline {
+		return &ir.NormalizedPipeline{
+			Provider:              ir.ProviderGitHub,
+			SelfActionMutableExec: &ir.MutableRemoteExec{Tier: tier, URL: url},
+		}
+	}
+
+	t.Run("exec → ISSUE-714 high (consumer & producer)", func(t *testing.T) {
+		u := "raw.githubusercontent.com/anchore/grype/main/install.sh"
+		if h, msg := codeHits(consumer("exec", u), "ISSUE-714"); h != 1 || !strings.Contains(msg, u) {
+			t.Fatalf("consumer exec: hits=%d msg=%q", h, msg)
+		}
+		if h, _ := codeHits(producer("exec", u), "ISSUE-714"); h != 1 {
+			t.Fatalf("producer exec: want 1 ISSUE-714, got %d", h)
+		}
+	})
+
+	t.Run("obfuscated → ISSUE-715 critical (consumer & producer)", func(t *testing.T) {
+		if h, _ := codeHits(consumer("obfuscated", "base64 -d | sh"), "ISSUE-715"); h != 1 {
+			t.Fatalf("consumer obfuscated: want 1 ISSUE-715, got %d", h)
+		}
+		// obfuscated must NOT also fire the high exec code
+		if h, _ := codeHits(consumer("obfuscated", "x"), "ISSUE-714"); h != 0 {
+			t.Fatalf("obfuscated must not fire ISSUE-714, got %d", h)
+		}
+		if h, _ := codeHits(producer("obfuscated", "eval(atob(x))"), "ISSUE-715"); h != 1 {
+			t.Fatalf("producer obfuscated: want 1 ISSUE-715, got %d", h)
+		}
+	})
+
+	t.Run("unverified → ISSUE-716 low, never a pass", func(t *testing.T) {
+		if h, _ := codeHits(consumer("unverified", ""), "ISSUE-716"); h != 1 {
+			t.Fatalf("consumer unverified: want 1 ISSUE-716, got %d", h)
+		}
+	})
+
+	t.Run("data tier and absent signal stay silent", func(t *testing.T) {
+		for _, code := range []string{"ISSUE-714", "ISSUE-715", "ISSUE-716"} {
+			if h, _ := codeHits(consumer("data", "x"), code); h != 0 {
+				t.Fatalf("data tier fired %s (%d)", code, h)
+			}
+		}
+		absent := &ir.NormalizedPipeline{
+			Provider: ir.ProviderGitHub,
+			Jobs:     []ir.Job{{Name: "b", Uses: []ir.Action{{Uses: "actions/checkout@v4", Metadata: &ir.ActionMetadata{RefKind: "tag"}}}}},
+		}
+		for _, code := range []string{"ISSUE-714", "ISSUE-715", "ISSUE-716"} {
+			if h, _ := codeHits(absent, code); h != 0 {
+				t.Fatalf("absent signal fired %s (%d)", code, h)
+			}
+		}
+	})
+}
+
 // TestIssue108_ActionArchivedRepo locks in the three branches of the
 // archived-repo rule: archived=true positive, archived=false negative,
 // and missing-metadata silent abstain (no false positive when the
 // GitHub API enrichment did not run).
 func TestIssue108_ActionArchivedRepo(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -3498,7 +5051,7 @@ func TestIssue108_ActionArchivedRepo(t *testing.T) {
 			Jobs: []ir.Job{{
 				Name: "release",
 				Uses: []ir.Action{
-					{Uses: "archived-org/release-action@v1", Metadata: &ir.ActionMetadata{RepoArchived: true}},
+					{Uses: "archived-org/release-action@v1", Line: 10, Name: "Release", Metadata: &ir.ActionMetadata{RepoArchived: true}},
 				},
 			}},
 		}
@@ -3514,6 +5067,9 @@ func TestIssue108_ActionArchivedRepo(t *testing.T) {
 			hits++
 			if uses, ok := f.Data["uses"].(string); !ok || uses != "archived-org/release-action@v1" {
 				t.Errorf("ISSUE-702 finding missing/wrong uses field: %v", f.Data["uses"])
+			}
+			if step, ok := f.Data["step"].(string); !ok || step != "Release" {
+				t.Errorf("ISSUE-702 finding missing/wrong step field: %v", f.Data["step"])
 			}
 		}
 		if hits != 1 {
@@ -3571,7 +5127,7 @@ func TestIssue108_ActionArchivedRepo(t *testing.T) {
 // (local/docker refs, missing config, missing star metadata).
 func TestIssue713_ActionAuthorizedSources(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -3623,9 +5179,9 @@ func TestIssue713_ActionAuthorizedSources(t *testing.T) {
 
 	t.Run("unauthorized owner fires", func(t *testing.T) {
 		got := hits713(t, allowlistCfg, []ir.Action{
-			{Uses: "actions/checkout@v4"},   // trusted (official)
-			{Uses: "random/evil-action@v1"}, // not trusted
-			{Uses: "jdx/other-action@v1"},   // jdx exact entry is mise-action only
+			{Uses: "actions/checkout@v4"},                                           // trusted (official)
+			{Uses: "random/evil-action@v1", Line: 10, Name: "Run untrusted action"}, // not trusted
+			{Uses: "jdx/other-action@v1"},                                           // jdx exact entry is mise-action only
 		}, "")
 		want := []string{"jdx/other-action@v1", "random/evil-action@v1"}
 		if !stringSlicesEqual(got, want) {
@@ -3825,6 +5381,70 @@ func TestIssue214_UnpinnedPackageInstall(t *testing.T) {
 	runGitHubFixtureCases(t, "ISSUE-214", cases)
 }
 
+// TestProviderGuards_SuppressGitHubOnlyRulesOnGitLab exercises the
+// `input.pipeline.provider == "github"` guards in unpinned_package_install.rego
+// (ISSUE-214) and workflow_obfuscation.rego (ISSUE-420) in isolation
+// (getplumber/plumber#349). Those rules read generic IR fields (job.scripts /
+// job.variables) that GitLab pipelines populate too, so without the guard they
+// fire on a GitLab run. The guard is defense-in-depth: the catalog gate
+// (FilterFindingsByEnabledControls) also drops these GitHub-only findings, so a
+// test routed through evaluatePolicies cannot tell the rego guard from the
+// gate — delete the guard and that path still passes. These cases call
+// engine.Evaluate directly (no catalog filter): the same job shape must FIRE on
+// GitHub (proving the fixture is a genuine violation, so the GitLab assertion
+// is not vacuous) and stay SILENT on GitLab (proving the guard suppresses it).
+func TestProviderGuards_SuppressGitHubOnlyRulesOnGitLab(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+
+	countCode := func(t *testing.T, provider ir.Provider, job ir.Job, code string) int {
+		t.Helper()
+		pipeline := &ir.NormalizedPipeline{Provider: provider, Jobs: []ir.Job{job}}
+		findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+		if err != nil {
+			t.Fatalf("evaluate: %v", err)
+		}
+		n := 0
+		for _, f := range findings {
+			if f.Code == code {
+				n++
+			}
+		}
+		return n
+	}
+
+	cases := []struct {
+		name string
+		code string
+		job  ir.Job
+	}{
+		{
+			name: "ISSUE-214 bare pip install (unpinned_package_install.rego)",
+			code: "ISSUE-214",
+			job:  ir.Job{Name: "build", Scripts: []string{"pip install requests"}},
+		},
+		{
+			// \u200b is a U+200B zero-width space embedded in the script line.
+			name: "ISSUE-420 zero-width unicode (workflow_obfuscation.rego)",
+			code: "ISSUE-420",
+			job:  ir.Job{Name: "deploy", Scripts: []string{"echo hello\u200bworld"}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := countCode(t, ir.ProviderGitHub, tc.job, tc.code); got == 0 {
+				t.Fatalf("%s: expected the shape to fire on a GitHub pipeline (else the GitLab check is vacuous), got 0", tc.code)
+			}
+			if got := countCode(t, ir.ProviderGitLab, tc.job, tc.code); got != 0 {
+				t.Errorf("%s: provider guard missing/broken — fired %d time(s) on a GitLab pipeline, want 0", tc.code, got)
+			}
+		})
+	}
+}
+
 // TestIssue112_ReleaseWorkflowUnsigned flags release jobs that
 // publish artefacts without any signing step.
 func TestIssue112_ReleaseWorkflowUnsigned(t *testing.T) {
@@ -3842,7 +5462,7 @@ func TestIssue112_ReleaseWorkflowUnsigned(t *testing.T) {
 // no SAST action invocation.
 func TestIssue609_SASTWorkflowMissing(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	t.Run("no-sast", func(t *testing.T) {
@@ -3887,7 +5507,7 @@ func TestIssue609_SASTWorkflowMissing(t *testing.T) {
 // workflows but neither dependabot nor renovate config.
 func TestIssue608_DependencyUpdateToolMissing(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	baseJobs := []ir.Job{{Name: "build", OriginFile: "/tmp/.github/workflows/build.yml"}}
@@ -3936,7 +5556,7 @@ func TestIssue608_DependencyUpdateToolMissing(t *testing.T) {
 // but no SECURITY.md.
 func TestIssue610_SecurityPolicyMissing(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	baseJobs := []ir.Job{{Name: "build", OriginFile: "/tmp/.github/workflows/build.yml"}}
@@ -3972,7 +5592,7 @@ func TestIssue610_SecurityPolicyMissing(t *testing.T) {
 // without a @sha256 digest.
 func TestIssue107_DockerfileUnpinnedBase(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 	pipeline := &ir.NormalizedPipeline{
@@ -4009,7 +5629,7 @@ func TestIssue107_DockerfileUnpinnedBase(t *testing.T) {
 // (e) the outer-OR satisfaction short-circuit.
 func TestIssue416_RequiredActionMissing(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
@@ -4039,7 +5659,8 @@ func TestIssue416_RequiredActionMissing(t *testing.T) {
 		hits := map[string]bool{}
 		for _, f := range findings {
 			if f.Code == "ISSUE-417" {
-				hits[f.Job] = true
+				requiredAction, _ := f.Data["requiredAction"].(string)
+				hits[requiredAction] = true
 			}
 		}
 		for _, want := range []string{"myorg/sast-scan", "myorg/policy/.github/workflows/policy.yml", "myorg/full-security"} {
@@ -4047,6 +5668,12 @@ func TestIssue416_RequiredActionMissing(t *testing.T) {
 				t.Errorf("expected ISSUE-417 finding for %q; got hits=%v", want, hits)
 			}
 		}
+		assertSubjectKey(t, findings, "ISSUE-417", "requiredAction", []string{
+			"myorg/sast-scan",
+			"myorg/policy/.github/workflows/policy.yml",
+			"myorg/full-security",
+		})
+		assertNoJob(t, findings, "ISSUE-417")
 	})
 
 	t.Run("step-level uses with pinned SHA satisfies ref-agnostic match", func(t *testing.T) {
@@ -4121,7 +5748,7 @@ func TestIssue416_RequiredActionMissing(t *testing.T) {
 		}
 		matched := false
 		for _, f := range findings {
-			if f.Code == "ISSUE-417" && f.Job == "myorg/sast-scan" {
+			if f.Code == "ISSUE-417" && f.Data["requiredAction"] == "myorg/sast-scan" {
 				matched = true
 			}
 		}
@@ -4172,53 +5799,151 @@ func TestIssue416_RequiredActionMissing(t *testing.T) {
 	})
 }
 
-
-// TestIssue301_LeakedSecrets covers the leaked_secrets rule. Detection is
-// done in the collector (collector/gitleaks_scan.go); the rego rule turns
-// each redacted GitleaksHit on the pipeline IR into an ISSUE-301 finding,
-// gated by input.config.pipelineMustNotLeakSecretsInConfig.
-func TestIssue301_LeakedSecrets(t *testing.T) {
+// TestIssue323_FindingsCarryStructuredEvidence — issue #323: every
+// line-anchored finding must expose its offending content as a
+// structured Data field (the action ref as `uses`, the Dockerfile base
+// as `image`, the checkout ref as `ref`, …), not only interpolated into
+// the human-readable message. The per-control JSON issues[] projection
+// strips message/file/line, so Data is the only channel through which
+// machine consumers (Radar, dashboards) receive the evidence.
+func TestIssue323_FindingsCarryStructuredEvidence(t *testing.T) {
 	engine := opaengine.New()
-	if err := engine.LoadFromFS(policies.FS); err != nil {
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
 		t.Fatalf("load embedded policies: %v", err)
 	}
 
-	pipelineWithHits := func() *ir.NormalizedPipeline {
-		return &ir.NormalizedPipeline{
-			Provider: ir.ProviderGitLab,
-			GitleaksHits: []ir.GitleaksHit{
-				{
-					RuleID:      "slack-bot-token",
-					Description: "Slack bot token",
-					Preview:     "xoxb***uvwx",
-					File:        "merged-gitlab-ci.yml",
-					Line:        42,
-				},
-			},
-		}
-	}
-	pipelineClean := func() *ir.NormalizedPipeline {
-		return &ir.NormalizedPipeline{Provider: ir.ProviderGitLab}
-	}
-	enabledCfg := map[string]any{
-		"pipelineMustNotLeakSecretsInConfig": map[string]any{"enabled": true},
-	}
+	const oldSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const deadSHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 	cases := []struct {
-		name      string
-		pipeline  *ir.NormalizedPipeline
-		cfg       map[string]any
-		wantHits  int
+		name     string
+		pipeline *ir.NormalizedPipeline
+		cfg      map[string]any
+		code     string
+		want     map[string]string
 	}{
-		// Control enabled + hits on the IR -> finding fires (positive case).
-		{"enabled+hits", pipelineWithHits(), enabledCfg, 1},
-		// Control enabled + zero hits -> silent (negative case).
-		{"enabled+clean", pipelineClean(), enabledCfg, 0},
-		// Control disabled (config absent) + hits present -> silent
-		// (abstain case). Belts-and-braces: the collector itself also
-		// short-circuits, so in practice the IR carries no hits when the
-		// control is off.
-		{"disabled+hits", pipelineWithHits(), nil, 0},
+		{
+			name: "ISSUE-701 step-level action carries uses",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name: "build",
+				Uses: []ir.Action{{Uses: "aquasecurity/trivy-action@0.28.0", Line: 10, Name: "Run Trivy scan"}},
+			}}},
+			cfg:  map[string]any{"actionsMustBePinnedByCommitSha": map[string]any{}},
+			code: "ISSUE-701",
+			want: map[string]string{"uses": "aquasecurity/trivy-action@0.28.0", "step": "Run Trivy scan"},
+		},
+		{
+			name: "ISSUE-701 reusable workflow carries uses",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name:                 "call",
+				ReusableWorkflowUses: "other/repo/.github/workflows/x.yml@main",
+			}}},
+			cfg:  map[string]any{"actionsMustBePinnedByCommitSha": map[string]any{}},
+			code: "ISSUE-701",
+			want: map[string]string{"uses": "other/repo/.github/workflows/x.yml@main"},
+		},
+		{
+			name: "ISSUE-307 artipacked carries uses",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name: "build",
+				Uses: []ir.Action{{Uses: "actions/checkout@v4", Line: 10, Name: "Checkout"}},
+			}}},
+			code: "ISSUE-307",
+			want: map[string]string{"uses": "actions/checkout@v4", "step": "Checkout"},
+		},
+		{
+			name: "ISSUE-402 ambiguous action ref carries uses",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name: "build",
+				Uses: []ir.Action{{Uses: "owner/repo@v1", Line: 10, Name: "Build", Metadata: &ir.ActionMetadata{RefKind: "tag", RefExists: true, RefIsAmbiguous: true}}},
+			}}},
+			code: "ISSUE-402",
+			want: map[string]string{"uses": "owner/repo@v1", "step": "Build"},
+		},
+		{
+			name: "ISSUE-421 static publish token carries uses",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name: "publish",
+				Uses: []ir.Action{{Uses: "pypa/gh-action-pypi-publish@v1", Line: 10, Name: "Publish to PyPI", With: map[string]any{"password": "${{ secrets.PYPI_TOKEN }}"}}},
+			}}},
+			code: "ISSUE-421",
+			want: map[string]string{"uses": "pypa/gh-action-pypi-publish@v1", "step": "Publish to PyPI"},
+		},
+		{
+			name: "ISSUE-705 unscoped cache restore carries uses",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name:     "publish",
+				Triggers: []string{"release"},
+				Uses:     []ir.Action{{Uses: "actions/cache@v4", Line: 10, Name: "Restore cache", With: map[string]any{"key": "build-cache"}}},
+			}}},
+			cfg:  issue705DefaultConfig(),
+			code: "ISSUE-705",
+			want: map[string]string{"uses": "actions/cache@v4", "step": "Restore cache"},
+		},
+		{
+			name: "ISSUE-706 dockerfile base carries image",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Dockerfiles: []ir.Dockerfile{{
+				Path:  "Dockerfile",
+				Bases: []ir.DockerfileBase{{Image: "golang:1.25", Line: 1}},
+			}}},
+			code: "ISSUE-706",
+			want: map[string]string{"image": "golang:1.25"},
+		},
+		{
+			name: "ISSUE-707 impostor commit carries uses",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name: "build",
+				Uses: []ir.Action{{Uses: "actions/checkout@" + deadSHA, Line: 10, Name: "Checkout", Metadata: &ir.ActionMetadata{RefKnownAbsent: true}}},
+			}}},
+			code: "ISSUE-707",
+			want: map[string]string{"uses": "actions/checkout@" + deadSHA, "step": "Checkout"},
+		},
+		{
+			name: "ISSUE-708 sha/comment mismatch carries uses and comment",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name: "build",
+				Uses: []ir.Action{{Uses: "owner/repo@" + oldSHA, Line: 10, Name: "Checkout", Comment: "v4.1.0", Metadata: &ir.ActionMetadata{CommentVersion: "v4.1.0", CommentTagSha: deadSHA}}},
+			}}},
+			code: "ISSUE-708",
+			want: map[string]string{"uses": "owner/repo@" + oldSHA, "comment": "v4.1.0", "step": "Checkout"},
+		},
+		{
+			name: "ISSUE-708 tag/comment mismatch carries uses and comment",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name: "build",
+				Uses: []ir.Action{{Uses: "owner/repo@v3", Comment: "v4.0.0", Metadata: &ir.ActionMetadata{RefKind: "tag"}}},
+			}}},
+			code: "ISSUE-708",
+			want: map[string]string{"uses": "owner/repo@v3", "comment": "v4.0.0"},
+		},
+		{
+			name: "ISSUE-709 stale pin carries uses",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name: "build",
+				Uses: []ir.Action{{Uses: "owner/repo@" + oldSHA, Line: 10, Name: "Checkout", Metadata: &ir.ActionMetadata{LatestReleaseSha: deadSHA, LatestTag: "v5"}}},
+			}}},
+			code: "ISSUE-709",
+			want: map[string]string{"uses": "owner/repo@" + oldSHA, "step": "Checkout"},
+		},
+		{
+			name: "ISSUE-711 superfluous action carries uses",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name: "build",
+				Uses: []ir.Action{{Uses: "nick-invision/retry@v2", Line: 10, Name: "Retry"}},
+			}}},
+			code: "ISSUE-711",
+			want: map[string]string{"uses": "nick-invision/retry@v2", "step": "Retry"},
+		},
+		{
+			name: "ISSUE-804 pull_request_target head checkout carries uses and ref",
+			pipeline: &ir.NormalizedPipeline{Provider: ir.ProviderGitHub, Jobs: []ir.Job{{
+				Name:     "pwn",
+				Triggers: []string{"pull_request_target"},
+				Uses:     []ir.Action{{Uses: "actions/checkout@v4", Line: 10, Name: "Checkout PR head", With: map[string]any{"ref": "${{ github.event.pull_request.head.sha }}"}}},
+			}}},
+			code: "ISSUE-804",
+			want: map[string]string{"uses": "actions/checkout@v4", "ref": "${{ github.event.pull_request.head.sha }}", "step": "Checkout PR head"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -4227,28 +5952,119 @@ func TestIssue301_LeakedSecrets(t *testing.T) {
 			if err != nil {
 				t.Fatalf("evaluate: %v", err)
 			}
-			hits := 0
-			var sample string
-			for _, f := range findings {
-				if f.Code == "ISSUE-301" {
-					hits++
-					sample = f.Message
+			var hit *opaengine.Finding
+			for i := range findings {
+				if findings[i].Code == tc.code {
+					hit = &findings[i]
+					break
 				}
 			}
-			if hits != tc.wantHits {
-				t.Fatalf("expected %d ISSUE-301 findings, got %d", tc.wantHits, hits)
+			if hit == nil {
+				t.Fatalf("expected a %s finding, got none", tc.code)
 			}
-			// Defence in depth: the redacted preview must never contain
-			// the raw test value that the collector would have replaced.
-			// (Our fixture preview is already "xoxb***uvwx".)
-			if tc.wantHits > 0 {
-				if !strings.Contains(sample, "xoxb***uvwx") {
-					t.Fatalf("expected message to carry redacted preview, got %q", sample)
-				}
-				if strings.Contains(sample, "1234567890123") {
-					t.Fatalf("message leaked raw secret characters: %q", sample)
+			for key, want := range tc.want {
+				got, _ := hit.Data[key].(string)
+				if got != want {
+					t.Errorf("Data[%q] = %q, want %q", key, got, want)
 				}
 			}
 		})
+	}
+}
+
+// ISSUE-403 is about an include, not a job. Its identity used to be the include
+// source smuggled through the job field, with componentName (a bare name, empty
+// for non-component includes) as the only structured key.
+func TestIssue403_OutdatedIncludeIdentifiesOnTheIncludePath(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	pipeline := &ir.NormalizedPipeline{
+		Provider: ir.ProviderGitLab,
+		Includes: []ir.Include{
+			{Kind: "component", Source: "gitlab.example.com/components/sast/sast", Ref: "1.0.0", Current: "1.1.0"},
+		},
+	}
+	findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	assertSubjectKey(t, findings, "ISSUE-403", "includePath",
+		[]string{"gitlab.example.com/components/sast/sast"})
+	assertNoJob(t, findings, "ISSUE-403")
+}
+
+// ISSUE-402's GitLab block is about an include. Its GitHub block, which flags an
+// ambiguous action ref inside a job, keeps its job name and its uses subject.
+func TestIssue402_AmbiguousIncludeIdentifiesOnTheIncludePath(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	pipeline := &ir.NormalizedPipeline{
+		Provider: ir.ProviderGitLab,
+		Includes: []ir.Include{
+			{Kind: "component", Source: "gitlab.example.com/components/sast/sast", Ref: "v1", RefIsAmbiguous: true},
+		},
+	}
+	findings, err := engine.Evaluate(context.Background(), pipeline, nil)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	assertSubjectKey(t, findings, "ISSUE-402", "includePath",
+		[]string{"gitlab.example.com/components/sast/sast"})
+	assertNoJob(t, findings, "ISSUE-402")
+}
+
+// TestUnresolvedImageGuardAbstains pins the `not job.image.unresolved`
+// guard the image rules gained in platform mode's audit (the re-raised
+// review debate): an image reference that still held a $VARIABLE parses
+// into registry/name/tag fields that are present and WRONG, so ISSUE-101
+// and ISSUE-102 must abstain on it - and the SAME literal reference without
+// the flag must still fire both, which is what keeps the guard from being
+// an evasion route for fully-literal violations.
+func TestUnresolvedImageGuardAbstains(t *testing.T) {
+	engine := opaengine.New()
+	if err := engine.LoadFromFSFiltered(policies.FS, nil); err != nil {
+		t.Fatalf("load embedded policies: %v", err)
+	}
+	cfg := map[string]any{
+		"imageMutableTag":        map[string]any{"forbiddenTags": []string{"latest"}},
+		"imageAuthorizedSources": map[string]any{"trustedUrls": []string{"registry.corp.example/"}},
+	}
+	job := func(unresolved bool) *ir.NormalizedPipeline {
+		return &ir.NormalizedPipeline{
+			Provider: ir.ProviderGitLab,
+			Jobs: []ir.Job{{
+				Name: "deploy",
+				Image: &ir.Image{
+					Registry:   "evil.example.com",
+					Name:       "app",
+					Tag:        "latest",
+					Unresolved: unresolved,
+				},
+			}},
+		}
+	}
+
+	unresolvedFindings, err := engine.Evaluate(context.Background(), job(true), cfg)
+	if err != nil {
+		t.Fatalf("evaluate unresolved: %v", err)
+	}
+	for _, code := range []string{"ISSUE-101", "ISSUE-102"} {
+		if got := countCode(unresolvedFindings, code); got != 0 {
+			t.Errorf("%s fired %d time(s) on an UNRESOLVED reference: the parsed fields describe a placeholder, not an image", code, got)
+		}
+	}
+
+	resolvedFindings, err := engine.Evaluate(context.Background(), job(false), cfg)
+	if err != nil {
+		t.Fatalf("evaluate resolved: %v", err)
+	}
+	for _, code := range []string{"ISSUE-101", "ISSUE-102"} {
+		if got := countCode(resolvedFindings, code); got == 0 {
+			t.Errorf("%s did not fire on the identical RESOLVED violation: the guard must never shield a literal reference", code)
+		}
 	}
 }

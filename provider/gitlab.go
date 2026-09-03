@@ -26,6 +26,12 @@ func (p *GitLabProvider) Controls(pc *configuration.PlumberConfig) []control.Con
 }
 
 func (p *GitLabProvider) ComputeCompliance(result *control.AnalysisResult, conf *configuration.Configuration) (float64, int) {
+	// --no-controls wins over the config: the controls enabled in
+	// .plumber.yaml are ignored, so nothing is evaluated and nothing is
+	// counted. The zero is what makes the gate a no-op.
+	if conf.NoControls {
+		return 0.0, 0
+	}
 	if result.CiMissing || !result.CiValid {
 		return 0.0, 0
 	}
@@ -41,6 +47,20 @@ func (p *GitLabProvider) ComputeCompliance(result *control.AnalysisResult, conf 
 	control.MarkSkippedByFilter(entries, conf.ControlsFilter, conf.SkipControlsFilter)
 	for _, e := range entries {
 		if e.Skipped {
+			continue
+		}
+		// A control whose data lane supplied nothing is neither passed nor
+		// failed, so it leaves the ratio entirely rather than counting as a
+		// pass on an empty findings list. Counting it would report 100% on a
+		// run that evaluated nothing — the exact false green the
+		// not_evaluable status exists to prevent.
+		//
+		// Keyed on result.NotEvaluable, NOT on StatusFor: StatusFor also
+		// returns StatusError for the older run-wide degradation signals,
+		// and excluding those would change what a STANDALONE run reports.
+		// (Those cases can still render as a pass, which is a real but
+		// pre-existing gap, and not this change's to alter silently.)
+		if _, unevaluated := result.NotEvaluable[e.ControlName]; unevaluated {
 			continue
 		}
 		controlCount++
@@ -66,12 +86,30 @@ func (p *GitLabProvider) RunRemote(_ *configuration.Configuration) (*control.Ana
 	return nil, ErrNoRemote
 }
 
+// noControlsAwareImageCompliance returns the per-image compliance flags, or
+// nil when the run evaluated nothing. The flags are derived from findings,
+// not from the score, so an empty findings slice would otherwise mark every
+// image forbiddenTag:false / authorized:true and assert the very image
+// checks --no-controls skipped, inside the artifact the flag exists to
+// produce. With nil the PBOM records the inventory and claims nothing.
+// conf is required, as everywhere else on this path (the writers read
+// conf.GitlabURL unconditionally).
+func noControlsAwareImageCompliance(result *control.AnalysisResult, conf *configuration.Configuration) *pbom.ImageComplianceData {
+	if conf.NoControls {
+		return nil
+	}
+	return pbom.BuildImageComplianceData(result)
+}
+
 func (p *GitLabProvider) WritePBOM(result *control.AnalysisResult, conf *configuration.Configuration, filePath string, score *control.PlumberScoreResult, scoreMode bool) error {
-	complianceData := pbom.BuildImageComplianceData(result)
+	complianceData := noControlsAwareImageCompliance(result, conf)
 	overrideData := pbom.BuildIncludeOverrideData(result)
 	gen := pbom.NewGenerator(result.ProjectPath, result.ProjectID, conf.GitlabURL, conf.Branch).
 		WithComplianceData(complianceData).
 		WithIncludeOverrideData(overrideData)
+	if conf.NoControls {
+		gen = gen.WithoutComplianceVerdicts()
+	}
 	bom := gen.Generate(result.PipelineImageData, result.PipelineOriginData)
 	bom.PlumberScore = pbom.BuildPlumberScoreSummary(score, scoreMode)
 
@@ -86,11 +124,14 @@ func (p *GitLabProvider) WritePBOM(result *control.AnalysisResult, conf *configu
 }
 
 func (p *GitLabProvider) WritePBOMCycloneDX(result *control.AnalysisResult, conf *configuration.Configuration, filePath string, score *control.PlumberScoreResult, scoreMode bool) error {
-	complianceData := pbom.BuildImageComplianceData(result)
+	complianceData := noControlsAwareImageCompliance(result, conf)
 	overrideData := pbom.BuildIncludeOverrideData(result)
 	gen := pbom.NewGenerator(result.ProjectPath, result.ProjectID, conf.GitlabURL, conf.Branch).
 		WithComplianceData(complianceData).
 		WithIncludeOverrideData(overrideData)
+	if conf.NoControls {
+		gen = gen.WithoutComplianceVerdicts()
+	}
 	bom := gen.Generate(result.PipelineImageData, result.PipelineOriginData)
 	bom.PlumberScore = pbom.BuildPlumberScoreSummary(score, scoreMode)
 	cdx := bom.ToCycloneDX("")
@@ -113,8 +154,8 @@ func (p *GitLabProvider) PostAnalysisActions(cmd *cobra.Command, result *control
 			// pipeline (#220).
 			fmt.Fprintf(os.Stderr, "Skipping merge request comment: data collection was incomplete; not overwriting with a partial result.\n")
 		} else if mrIID := glabCI.DetectMergeRequestIID(); mrIID != 0 {
-			fmt.Fprintf(os.Stderr, "Merge request pipeline detected (MR !%d), posting compliance comment...\n", mrIID)
-			if err := control.ManageMergeRequestComment(result.ProjectID, mrIID, result, conf.PlumberConfig, s.Compliance, s.Threshold, conf, s.Score, s.ScoreMode, s.ScorePoint); err != nil {
+			fmt.Fprintf(os.Stderr, "Merge request pipeline detected (MR !%d), posting Plumber comment...\n", mrIID)
+			if err := control.ManageMergeRequestComment(result.ProjectID, mrIID, result, conf.PlumberConfig, s.Passed, s.GateLine, conf, s.Score, s.ScoreMode, s.ScorePoint); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to post merge request comment: %v\n", err)
 			} else {
 				fmt.Fprintf(os.Stderr, "Merge request comment posted successfully\n")
@@ -126,8 +167,8 @@ func (p *GitLabProvider) PostAnalysisActions(cmd *cobra.Command, result *control
 		if !shouldUpdate {
 			fmt.Fprintf(os.Stderr, "Skipping badge update (%s)\n", skipReason)
 		} else {
-			fmt.Fprintf(os.Stderr, "Updating project compliance badge...\n")
-			if err := control.ManageProjectBadge(result.ProjectID, s.Compliance, s.Threshold, conf, s.Score, s.ScoreMode); err != nil {
+			fmt.Fprintf(os.Stderr, "Updating project badge...\n")
+			if err := control.ManageProjectBadge(result.ProjectID, conf, s.Score); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to update project badge: %v\n", err)
 			} else {
 				fmt.Fprintf(os.Stderr, "Project badge updated successfully\n")

@@ -4,15 +4,27 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
+	"time"
 
 	"github.com/getplumber/plumber/configuration"
 	"github.com/getplumber/plumber/gitlab"
 	opaengine "github.com/getplumber/plumber/internal/engine/opa"
 	"github.com/getplumber/plumber/internal/ir"
 	"github.com/getplumber/plumber/policies"
+	"github.com/getplumber/plumber/utils"
 	"github.com/sirupsen/logrus"
 )
+
+// maxLocalCIConfigBytes bounds a local .gitlab-ci.yml read from the analyzed
+// repository, whose size is not trusted.
+const maxLocalCIConfigBytes = 2 << 20 // 2 MiB
+
+// opaEvaluateTimeout bounds a single Rego/OPA evaluation. Policy evaluation
+// over a normal pipeline is sub-second; this ceiling only exists so a
+// pathologically large attacker-supplied pipeline/config cannot pin the scan
+// process on CPU indefinitely. On timeout the evaluation errors and the
+// provider's controls abstain, exactly like any other engine failure.
+const opaEvaluateTimeout = 2 * time.Minute
 
 // controlBranchMustBeProtected is the sole .plumber.yaml control key
 // the task flow still references directly — to decide whether to fetch
@@ -20,6 +32,210 @@ import (
 // Rego engine. Every other control is config-driven end-to-end through
 // the catalog in catalog.go.
 const controlBranchMustBeProtected = "branchMustBeProtected"
+const controlMutableRemoteExec = "actionsMustNotExecuteMutableRemoteCode"
+const controlMRApprovalRulesMinApprovals = "mergeRequestApprovalRulesMustRequireMinimumApprovals"
+const controlMRApprovalRulesCoverAllBranches = "mergeRequestApprovalRulesMustCoverAllProtectedBranches"
+const controlMRApprovalSettings = "mergeRequestApprovalSettingsMustBeCompliant"
+const controlMRSettings = "mergeRequestSettingsMustBeCompliant"
+
+// mrApprovalRuleControlEnabled reports whether either merge-request
+// approval-rule control (ISSUE-502/504) is active for this run. Both read the
+// approval rules the GitLab protection collection fetches, so that collection
+// must run when either is enabled even if branchMustBeProtected is not.
+func mrApprovalRuleControlEnabled(conf *configuration.Configuration) bool {
+	if c := conf.PlumberConfig.GetMergeRequestApprovalRulesMustRequireMinimumApprovalsConfig(); c != nil && c.IsEnabled() && shouldRunControl(controlMRApprovalRulesMinApprovals, conf) {
+		return true
+	}
+	if c := conf.PlumberConfig.GetMergeRequestApprovalRulesMustCoverAllProtectedBranchesConfig(); c != nil && c.IsEnabled() && shouldRunControl(controlMRApprovalRulesCoverAllBranches, conf) {
+		return true
+	}
+	return false
+}
+
+// approvalRulesReturnedNone reports whether the protection collection ran and
+// the GitLab approvals API returned zero rules — the ambiguous case where the
+// project is either on GitLab Free (feature unavailable, the API 200-empties)
+// or on Premium/Ultimate with no rules configured. The renderers surface a
+// Premium/Ultimate caveat for it via AnalysisResult.ApprovalRulesTierCaveat.
+func approvalRulesReturnedNone(protectionData *gitlab.GitlabProtectionAnalysisData) bool {
+	return protectionData != nil && protectionData.MRApprovalRulesKnown &&
+		len(protectionData.MRApprovalRules) == 0
+}
+
+// approvalRulesTierCaveatApplies reports whether to surface the Premium/Ultimate
+// caveat: an approval-rule control ran (mrApprovalRuleControlEnabled) AND the
+// approvals API returned zero rules (approvalRulesReturnedNone). The enabled
+// guard is load-bearing — a branch-protection-only run on a zero-rules project
+// satisfies approvalRulesReturnedNone but must NOT show the caveat.
+func approvalRulesTierCaveatApplies(conf *configuration.Configuration, protectionData *gitlab.GitlabProtectionAnalysisData) bool {
+	return mrApprovalRuleControlEnabled(conf) && approvalRulesReturnedNone(protectionData)
+}
+
+// mrApprovalSettingsHasNoProtections reports whether the protection collection
+// read the project's approval settings and NONE of them are locked down — the
+// fully-unlocked state a GitLab Free project returns, where the feature does not
+// exist and the approvals API 200-defaults every protection off. Unlike the
+// approval RULES case (a 200-empty list), the settings API gives no other tier
+// signal, so "no protection in effect" is the only heuristic available.
+//
+// The author field has INVERTED polarity: MergeRequestsAuthorApproval == true
+// means authors CAN approve (no protection), so unlocked wants it true while the
+// other five flags must be false. The check is deliberately conservative: any
+// single protection active proves the project CAN lock a setting down (so it is
+// on a paid tier) and suppresses the caveat.
+func mrApprovalSettingsHasNoProtections(protectionData *gitlab.GitlabProtectionAnalysisData) bool {
+	if protectionData == nil || protectionData.MRApprovalSettings == nil {
+		return false
+	}
+	s := protectionData.MRApprovalSettings
+	return s.MergeRequestsAuthorApproval && // authors CAN approve == not locked down
+		!s.MergeRequestsDisableCommittersApproval &&
+		!s.DisableOverridingApproversPerMergeRequest &&
+		!s.RequirePasswordToApprove &&
+		!s.ResetApprovalsOnPush &&
+		!s.SelectiveCodeOwnerRemovals
+}
+
+// mrApprovalSettingsTierCaveatApplies reports whether to surface the
+// Premium/Ultimate caveat for the approval-settings control (ISSUE-503): the
+// control ran (mrApprovalSettingsControlEnabled) AND the project has no approval
+// protection in effect (mrApprovalSettingsHasNoProtections), the tell-tale
+// GitLab-Free signature. The enabled guard is load-bearing the same way it is
+// for the rules caveat — a run that never turned this control on must not show
+// the caveat.
+func mrApprovalSettingsTierCaveatApplies(conf *configuration.Configuration, protectionData *gitlab.GitlabProtectionAnalysisData) bool {
+	return mrApprovalSettingsControlEnabled(conf) && mrApprovalSettingsHasNoProtections(protectionData)
+}
+
+// mrApprovalSettingsControlEnabled reports whether the merge-request
+// approval-settings control (ISSUE-503) is active for this run. It reads the
+// approval settings the GitLab protection collection fetches, so that
+// collection must run when it is enabled even if no other protection control
+// is.
+func mrApprovalSettingsControlEnabled(conf *configuration.Configuration) bool {
+	c := conf.PlumberConfig.GetMergeRequestApprovalSettingsMustBeCompliantConfig()
+	return c != nil && c.IsEnabled() && shouldRunControl(controlMRApprovalSettings, conf)
+}
+
+// mrSettingsControlEnabled reports whether the merge-request settings control
+// (ISSUE-506) is active for this run. It reads the project MR settings the
+// GitLab protection collection fetches, so that collection must run when it is
+// enabled even if no other protection control is.
+func mrSettingsControlEnabled(conf *configuration.Configuration) bool {
+	c := conf.PlumberConfig.GetMergeRequestSettingsMustBeCompliantConfig()
+	return c != nil && c.IsEnabled() && shouldRunControl(controlMRSettings, conf)
+}
+
+// mrSettingsPremiumFieldsNeedingUpgrade returns the Premium/Ultimate MR-setting
+// expectations that read as OFF while the config expects them ON (merge trains,
+// merged-results pipelines). These features require a paid tier and the project
+// payload carries no tier signal, so an OFF read is ambiguous: a Free project
+// that cannot enable them, or a paid project that simply left them off. An
+// expectation of false is satisfiable on any tier and never appears here. The
+// renderers turn this into a CONDITIONAL caveat next to ISSUE-506 (disable the
+// expectation on Free; enable the feature on a paid tier) rather than asserting
+// which tier the project is on, since the API cannot tell us.
+func mrSettingsPremiumFieldsNeedingUpgrade(conf *configuration.Configuration, protectionData *gitlab.GitlabProtectionAnalysisData) []string {
+	if !mrSettingsControlEnabled(conf) || protectionData == nil || protectionData.MRSettings == nil {
+		return nil
+	}
+	c := conf.PlumberConfig.GetMergeRequestSettingsMustBeCompliantConfig()
+	s := protectionData.MRSettings
+	var fields []string
+	if c.MergePipelinesEnabled != nil && *c.MergePipelinesEnabled && !s.MergePipelinesEnabled {
+		fields = append(fields, "mergePipelinesEnabled")
+	}
+	if c.MergeTrainsEnabled != nil && *c.MergeTrainsEnabled && !s.MergeTrainsEnabled {
+		fields = append(fields, "mergeTrainsEnabled")
+	}
+	return fields
+}
+
+const controlSecurityPolicy = "projectMustHaveSecurityPolicySource"
+
+// securityPolicyControlEnabled reports whether the security-policy-project
+// linkage control (ISSUE-601) is active for this run. Its linkage is read by
+// its own GraphQL collection, independent of the REST protection endpoints, so
+// this does NOT imply the protection collection has to run.
+func securityPolicyControlEnabled(conf *configuration.Configuration) bool {
+	if conf == nil || conf.PlumberConfig == nil {
+		return false
+	}
+	c := conf.PlumberConfig.GetProjectMustHaveSecurityPolicySourceConfig()
+	return c != nil && c.IsEnabled() && shouldRunControl(controlSecurityPolicy, conf)
+}
+
+// protectionDataNeeded reports whether any control needs the GitLab protection
+// collection this run: branchMustBeProtected, either approval-rule control, the
+// approval-settings control, or the MR-settings control (they all read the one
+// GitlabProtectionAnalysisData). The security-policy control is deliberately
+// absent: it has its own GraphQL collection, so it must not be able to force
+// these REST fetches, nor be blocked when they fail.
+func protectionDataNeeded(conf *configuration.Configuration) bool {
+	if shouldRunControl(controlBranchMustBeProtected, conf) {
+		if cfg := conf.PlumberConfig.GetBranchMustBeProtectedConfig(); cfg != nil && cfg.IsEnabled() {
+			return true
+		}
+	}
+	return mrApprovalRuleControlEnabled(conf) || mrApprovalSettingsControlEnabled(conf) ||
+		mrSettingsControlEnabled(conf)
+}
+
+// controlCicdVariablesMustBeProtected / ...Masked are the two .plumber.yaml
+// control keys the task flow references directly, to decide whether to fetch
+// the project's settings-variable listing (an extra API call) before invoking
+// the Rego engine. Both share one collector (CollectGitlabVariables).
+const controlCicdVariablesMustBeProtected = "cicdVariablesMustBeProtected"
+const controlCicdVariablesMustBeMasked = "cicdVariablesMustBeMasked"
+
+// cicdVariableControlEnabled reports whether either settings-variable control
+// is active for this run, so the variable listing is fetched only when a
+// control needs it.
+func cicdVariableControlEnabled(conf *configuration.Configuration) bool {
+	if p := conf.PlumberConfig.GetCicdVariablesMustBeProtectedConfig(); p != nil && p.IsEnabled() && shouldRunControl(controlCicdVariablesMustBeProtected, conf) {
+		return true
+	}
+	if m := conf.PlumberConfig.GetCicdVariablesMustBeMaskedConfig(); m != nil && m.IsEnabled() && shouldRunControl(controlCicdVariablesMustBeMasked, conf) {
+		return true
+	}
+	return false
+}
+
+// securityPolicyTierCaveatApplies reports whether to surface the conditional
+// Ultimate caveat for ISSUE-601: the control ran, the linkage was read
+// authoritatively, and NO policy project is linked — the tier-ambiguous case
+// (a non-Ultimate project cannot link one, but an Ultimate project may simply
+// have left it unset). A wrong-project-linked read is a real misconfiguration
+// on a paid tier, not a tier caveat, and a non-authoritative read is
+// not-evaluable, so neither triggers it.
+func securityPolicyTierCaveatApplies(conf *configuration.Configuration, data *gitlab.SecurityPolicyData) bool {
+	if !securityPolicyControlEnabled(conf) || data == nil || !data.Known {
+		return false
+	}
+	return data.Project == nil
+}
+
+// shouldScanMutableExec reports whether the collector should fetch and
+// scan action source for actionsMustNotExecuteMutableRemoteCode
+// (ISSUE-714/715). The scan is expensive (up to ~7 sequential HTTP
+// requests per unique action), so it runs only when the control is
+// actually active: not benched in code, enabled in .plumber.yaml, and
+// not excluded by --controls / --skip-controls. When false the collector
+// skips the fetch entirely, so disabling the control removes its
+// scan-time and rate-limit cost — not just its findings.
+func shouldScanMutableExec(conf *configuration.Configuration) bool {
+	if conf == nil || conf.PlumberConfig == nil {
+		return false
+	}
+	if configuration.IsBenched("github", controlMutableRemoteExec) {
+		return false
+	}
+	cfg := conf.PlumberConfig.ControlsFor("github").ActionsMustNotExecuteMutableRemoteCode
+	if cfg == nil || !cfg.IsEnabled() {
+		return false
+	}
+	return shouldRunControl(controlMutableRemoteExec, conf)
+}
 
 // shouldRunControl applies --controls / --skip-controls filtering for a control.
 // If --controls is set, only listed controls are eligible.
@@ -84,7 +300,10 @@ func runRegoEngine(
 	originData *gitlab.GitlabPipelineOriginData,
 	imageData *gitlab.GitlabPipelineImageData,
 	protectionData *gitlab.GitlabProtectionAnalysisData,
-) ([]opaengine.Finding, string) {
+	variablesData *gitlab.GitlabVariablesAnalysisData,
+	securityPolicyData *gitlab.SecurityPolicyData,
+	result *AnalysisResult,
+) []opaengine.Finding {
 	pipeline := gitlab.ToNormalizedPipeline(
 		conf.ProjectPath,
 		project.DefaultBranch,
@@ -92,17 +311,16 @@ func runRegoEngine(
 		originData,
 		imageData,
 		protectionData,
+		variablesData,
+		securityPolicyData,
 	)
-	// Optional gitleaks enrichment for pipelineMustNotLeakSecretsInConfig
-	// (ISSUE-301). The scanner abstains silently when the control is
-	// disabled or gitleaks is not installed; failures are logged at
-	// warn level and never fail the run. The second return carries the
-	// abstain reason (if any) so the caller can mark the control SKIPPED
-	// instead of letting the empty-hits default render as 100% green.
-	if err := gitlab.ScanGitleaksForGitlab(l, conf, originData, pipeline); err != nil {
-		l.WithError(err).Warn("gitleaks scan failed; ISSUE-301 will not fire")
+	// Retained so a later per-policy evaluation can re-run the rules over the
+	// SAME collected data under a different policy's parameters, without
+	// re-collecting anything from the git host.
+	if result != nil {
+		result.Pipeline = pipeline
 	}
-	return evaluatePolicies(l, conf, "gitlab", pipeline), pipeline.GitleaksAbstainReason
+	return evaluatePolicies(l, conf, "gitlab", pipeline)
 }
 
 // evaluatePolicies loads the embedded Rego policies and evaluates them
@@ -113,11 +331,20 @@ func runRegoEngine(
 // restrict which controls' findings reach the caller. Callers pass
 // "gitlab" or "github". Anything else returns no findings.
 func evaluatePolicies(l *logrus.Entry, conf *configuration.Configuration, provider string, pipeline *ir.NormalizedPipeline) []opaengine.Finding {
-	l.WithField("provider", provider).Info("Running Rego/OPA rule engine")
 	// Empty (non-nil) so the eventual JSON output marshals an empty
 	// findings array as `[]`, not `null` — `null` makes downstream
 	// jq pipelines like `.findings[]` blow up on a clean run.
 	empty := []opaengine.Finding{}
+	// --no-controls: the user asked for no controls, so nothing is loaded
+	// and nothing is evaluated. Filtering the findings afterwards would not
+	// be equivalent: Engine.Evaluate returns on the first module error, so a
+	// single crashing policy takes every finding with it. A run that
+	// evaluates nothing is a run no policy can break.
+	if conf.NoControls {
+		l.WithField("provider", provider).Info("Control evaluation disabled (--no-controls)")
+		return empty
+	}
+	l.WithField("provider", provider).Info("Running Rego/OPA rule engine")
 	engine := opaengine.New()
 	skip := func(filename string, content []byte) bool {
 		return IsRegoFileBenchedForProvider(content, provider)
@@ -127,7 +354,9 @@ func evaluatePolicies(l *logrus.Entry, conf *configuration.Configuration, provid
 		return empty
 	}
 	controls := conf.PlumberConfig.ControlsFor(provider)
-	findings, err := engine.Evaluate(context.Background(), pipeline, buildEngineConfig(controls))
+	ctx, cancel := context.WithTimeout(context.Background(), opaEvaluateTimeout)
+	defer cancel()
+	findings, err := engine.Evaluate(ctx, pipeline, buildEngineConfig(controls))
 	if err != nil {
 		l.WithError(err).Warn("Rego/OPA engine evaluation failed")
 		return empty
@@ -150,6 +379,20 @@ func buildEngineConfig(controls *configuration.ControlsConfig) map[string]any {
 	}
 	cfg := map[string]any{}
 
+	if c := controls.ProjectMustHaveSecurityPolicySource; c != nil {
+		// expectedProjectId / expectedProjectPath reach the engine only when set:
+		// the Rego rule treats their absence as "require any linkage", the id as
+		// the authoritative match, and the path as a case-insensitive fallback.
+		entry := map[string]any{}
+		if c.ExpectedProjectId != nil {
+			entry["expectedProjectId"] = *c.ExpectedProjectId
+		}
+		if c.ExpectedProjectPath != nil {
+			entry["expectedProjectPath"] = *c.ExpectedProjectPath
+		}
+		cfg["projectMustHaveSecurityPolicySource"] = entry
+	}
+
 	if c := controls.ContainerImageMustNotUseForbiddenTags; c != nil {
 		if len(c.Tags) > 0 {
 			cfg["imageMutableTag"] = map[string]any{
@@ -169,13 +412,42 @@ func buildEngineConfig(controls *configuration.ControlsConfig) map[string]any {
 		}
 	}
 
-	// pipelineMustNotLeakSecretsInConfig: the rego rule only needs to
-	// know the control is enabled (it gates on input.config presence);
-	// the actual detection lives in the collector and the hits are on
-	// pipeline.GitleaksHits.
-	if c := controls.PipelineMustNotLeakSecretsInConfig; c != nil && c.IsEnabled() {
-		cfg["pipelineMustNotLeakSecretsInConfig"] = map[string]any{
-			"enabled": true,
+	if c := controls.ReleaseWorkflowsMustNotRestoreUntrustedCache; c != nil {
+		entry := map[string]any{}
+		if len(c.PublishActions) > 0 {
+			entry["publishActions"] = c.PublishActions
+		}
+		if len(c.CacheActions) > 0 {
+			specs := make([]map[string]any, 0, len(c.CacheActions))
+			for _, s := range c.CacheActions {
+				m := map[string]any{"action": s.Action, "mode": s.Mode}
+				if s.DisableInput != "" {
+					m["disableInput"] = s.DisableInput
+				}
+				if s.DisableValue != nil {
+					m["disableValue"] = *s.DisableValue
+				}
+				if s.EnableInput != "" {
+					m["enableInput"] = s.EnableInput
+				}
+				if s.EnableContains != "" {
+					m["enableContains"] = s.EnableContains
+				}
+				specs = append(specs, m)
+			}
+			entry["cacheActions"] = specs
+		}
+		if len(c.PublishScriptPatterns) > 0 {
+			entry["publishScriptPatterns"] = c.PublishScriptPatterns
+		}
+		if len(c.PublishScriptExcludePatterns) > 0 {
+			entry["publishScriptExcludePatterns"] = c.PublishScriptExcludePatterns
+		}
+		if len(c.AllowedJobs) > 0 {
+			entry["allowedJobs"] = c.AllowedJobs
+		}
+		if len(entry) > 0 {
+			cfg["cachePoisoning"] = entry
 		}
 	}
 
@@ -221,6 +493,69 @@ func buildEngineConfig(controls *configuration.ControlsConfig) map[string]any {
 			entry["minMergeAccessLevel"] = *c.MinMergeAccessLevel
 		}
 		cfg["branchMustBeProtected"] = entry
+	}
+
+	if c := controls.MergeRequestApprovalRulesMustRequireMinimumApprovals; c != nil {
+		entry := map[string]any{}
+		if c.MinimumRequiredApprovals != nil {
+			entry["minimumRequiredApprovals"] = *c.MinimumRequiredApprovals
+		}
+		cfg["mergeRequestApprovalRulesMustRequireMinimumApprovals"] = entry
+	}
+
+	if c := controls.MergeRequestApprovalSettingsMustBeCompliant; c != nil {
+		// Only SET expectations reach the engine: the Rego rule treats an
+		// absent key as "not checked", which is what makes every expectation
+		// optional.
+		entry := map[string]any{}
+		if c.PreventApprovalByAuthor != nil {
+			entry["preventApprovalByAuthor"] = *c.PreventApprovalByAuthor
+		}
+		if c.PreventApprovalsByCommitters != nil {
+			entry["preventApprovalsByCommitters"] = *c.PreventApprovalsByCommitters
+		}
+		if c.PreventEditingApprovalRulesInMR != nil {
+			entry["preventEditingApprovalRulesInMR"] = *c.PreventEditingApprovalRulesInMR
+		}
+		if c.RequireReAuthToApprove != nil {
+			entry["requireReAuthToApprove"] = *c.RequireReAuthToApprove
+		}
+		if c.BehaviorWhenCommitIsAdded != nil {
+			entry["behaviorWhenCommitIsAdded"] = *c.BehaviorWhenCommitIsAdded
+		}
+		cfg["mergeRequestApprovalSettingsMustBeCompliant"] = entry
+	}
+
+	if c := controls.MergeRequestSettingsMustBeCompliant; c != nil {
+		// Only SET expectations reach the engine: the Rego rule treats an
+		// absent key as "not checked", which is what makes every expectation
+		// optional (unlike the legacy platform's unconditional equality).
+		entry := map[string]any{}
+		if c.MergeMethod != nil {
+			entry["mergeMethod"] = *c.MergeMethod
+		}
+		if c.SquashOption != nil {
+			entry["squashOption"] = *c.SquashOption
+		}
+		if c.MergePipelinesEnabled != nil {
+			entry["mergePipelinesEnabled"] = *c.MergePipelinesEnabled
+		}
+		if c.MergeTrainsEnabled != nil {
+			entry["mergeTrainsEnabled"] = *c.MergeTrainsEnabled
+		}
+		if c.AllowMergeOnSkippedPipeline != nil {
+			entry["allowMergeOnSkippedPipeline"] = *c.AllowMergeOnSkippedPipeline
+		}
+		if c.ResolveOutdatedDiffDiscussions != nil {
+			entry["resolveOutdatedDiffDiscussions"] = *c.ResolveOutdatedDiffDiscussions
+		}
+		if c.PrintingMergeRequestLinkEnabled != nil {
+			entry["printingMergeRequestLinkEnabled"] = *c.PrintingMergeRequestLinkEnabled
+		}
+		if c.RemoveSourceBranchAfterMerge != nil {
+			entry["removeSourceBranchAfterMerge"] = *c.RemoveSourceBranchAfterMerge
+		}
+		cfg["mergeRequestSettingsMustBeCompliant"] = entry
 	}
 
 	if c := controls.IncludesMustNotUseForbiddenVersions; c != nil {
@@ -346,22 +681,41 @@ func RunAnalysis(conf *configuration.Configuration) (*AnalysisResult, error) {
 	// Fetch Project Info from GitLab
 	///////////////////////
 	reportProgress(conf, 1, analysisStepCount, "Fetching project information")
-	l.Info("Fetching project information from GitLab")
-	project, err := gitlab.FetchProjectDetails(conf.ProjectPath, conf.GitlabToken, conf.GitlabURL, conf)
-	if err != nil {
-		// A network/timeout failure here is incomplete data, not a bad
-		// project: degrade (exit 3, honest) instead of hard-failing (exit 2).
-		// A definitive answer (404 not-found, auth) still hard-fails (#220).
-		if isNetworkError(err) {
-			l.WithError(err).Warn("Project information fetch failed (network); reporting incomplete data")
-			markDegraded(result, "project information could not be fetched (network or timeout)")
-			result.CiValid = false
-			return result, nil
+	var project *gitlab.Project
+	identityFromEnvironment := false
+	// In platform mode the project's identity comes from the environment
+	// GitLab already put it in. That is not only two requests cheaper: this
+	// lookup is the FIRST call a run makes, a 401 here is not a network
+	// error, and so a token that cannot read the project aborts the whole
+	// analysis before a single control is evaluated. Sourcing it from the
+	// job removes the one call that turns a missing token into no report at
+	// all.
+	if conf.PlatformRun.Engaged() {
+		if fromEnv, ok := gitlab.ProjectFromCIEnvironment(conf.ProjectPath, conf.PlatformRun.SnapshotCIConfigPath()); ok {
+			project = fromEnv
+			identityFromEnvironment = true
+			l.Info("Project information taken from the CI environment (no API call)")
 		}
-		l.WithError(err).Error("Failed to fetch project from GitLab")
-		result.CiValid = false
-		result.CiMissing = true
-		return result, err
+	}
+	if project == nil {
+		l.Info("Fetching project information from GitLab")
+		fetched, err := gitlab.FetchProjectDetails(conf.ProjectPath, conf.GitlabToken, conf.GitlabURL, conf)
+		if err != nil {
+			// A network/timeout failure here is incomplete data, not a bad
+			// project: degrade (exit 3, honest) instead of hard-failing (exit 2).
+			// A definitive answer (404 not-found, auth) still hard-fails (#220).
+			if isNetworkError(err) {
+				l.WithError(err).Warn("Project information fetch failed (network); reporting incomplete data")
+				markDegraded(result, "project information could not be fetched (network or timeout)")
+				result.CiValid = false
+				return result, nil
+			}
+			l.WithError(err).Error("Failed to fetch project from GitLab")
+			result.CiValid = false
+			result.CiMissing = true
+			return result, err
+		}
+		project = fetched
 	}
 
 	// Update result with project info
@@ -389,6 +743,17 @@ func RunAnalysis(conf *configuration.Configuration) (*AnalysisResult, error) {
 	// Convert to ProjectInfo for collectors
 	projectInfo := project.ToProjectInfo()
 
+	// ToProjectInfo defaults AnalyzeBranch to the project's DEFAULT branch,
+	// which is right for a run that named no branch and had to ask the API
+	// what it was looking at. A CI job knows: it analyses the ref it checked
+	// out. Leaving the default in place would read the branch's own CI file
+	// off disk and then label every source link with the default branch.
+	if identityFromEnvironment && conf.Branch == "" {
+		if ref := gitlab.CIAnalyzedRef(); ref != "" {
+			projectInfo.AnalyzeBranch = ref
+		}
+	}
+
 	// The --branch flag specifies which branch's CI config to analyze,
 	// NOT the project's default branch. Keep them separate.
 	// projectInfo.DefaultBranch = actual default branch from GitLab API (e.g., "main")
@@ -399,7 +764,21 @@ func RunAnalysis(conf *configuration.Configuration) (*AnalysisResult, error) {
 		// When analyzing a non-default branch, fetch the correct SHA so that
 		// GitLab's ciConfig GraphQL query resolves include:local files from
 		// the target branch's file tree, not the default branch's.
-		if conf.Branch != projectInfo.DefaultBranch {
+		//
+		// This correction exists because the API hands back the DEFAULT
+		// branch's head. An identity taken from the environment already
+		// carries $CI_COMMIT_SHA, so there is usually nothing to correct.
+		//
+		// "Usually" is the whole point: $CI_COMMIT_SHA is the head of the ref
+		// this JOB is building, which is the analyzed ref only when the two
+		// are the same. Analysing release/2.0 from a job building main would
+		// otherwise read release/2.0's CI file while resolving its
+		// include:local entries against main's tree - a configuration that
+		// parses cleanly either way and is silently the wrong one. When they
+		// differ the run genuinely needs a sha it does not have, and the
+		// extra request is the correct price.
+		envShaIsAnalyzedRef := identityFromEnvironment && gitlab.CheckoutIsAtRef(conf.Branch)
+		if conf.Branch != projectInfo.DefaultBranch && !envShaIsAnalyzedRef {
 			branchSha, err := gitlab.FetchLatestCommitSha(
 				conf.GitlabToken, conf.GitlabURL, conf.ProjectPath, conf.Branch, conf,
 			)
@@ -424,19 +803,42 @@ func RunAnalysis(conf *configuration.Configuration) (*AnalysisResult, error) {
 	// 2. If in a git repo, the local repo IS the analyzed project, and the CI config
 	//    file exists locally: use local file (+ resolve include:local from filesystem)
 	// 3. Otherwise: use remote file (current default behavior)
-	if conf.Branch == "" && conf.IsLocalProject {
-		localCIPath := filepath.Join(conf.GitRepoRoot, project.CiConfPath)
-		if content, err := os.ReadFile(localCIPath); err == nil {
+	//
+	// Platform mode adds a fourth case that overrides rule 1. A CI job names
+	// its own branch on every run, so rule 1 would send every run to the API
+	// for a file the job already has on disk - and that read is the last
+	// thing standing between a tokenless run and a complete one. It is only
+	// taken when the checkout genuinely holds the analyzed ref
+	// (CheckoutIsAtRef): a working tree at a different branch parses just as
+	// cleanly and would be silently wrong.
+	useCheckoutInPlatformMode := conf.PlatformRun.Engaged() &&
+		conf.CheckoutIsAnalyzedProject &&
+		gitlab.CheckoutIsAtRef(conf.Branch)
+	if useCheckoutInPlatformMode || (conf.Branch == "" && conf.IsLocalProject) {
+		localCIPath, cErr := gitlab.ResolveWithinRepo(conf.GitRepoRoot, project.CiConfPath)
+		if cErr != nil {
+			l.WithFields(logrus.Fields{
+				"ciConfPath": project.CiConfPath,
+				"error":      cErr,
+			}).Warn("Local CI config path escapes the repository; using remote")
+		} else if content, err := utils.ReadFileLimit(localCIPath, maxLocalCIConfigBytes); err == nil {
 			conf.LocalCIConfigContent = content
 			conf.UsingLocalCIConfig = true
-			clearProgressLine(conf)
-			fmt.Fprintf(os.Stderr, "Using local CI configuration (specify --branch to force upstream CI config fetch): %s\n", localCIPath)
-			l.WithField("localCIPath", localCIPath).Info("Using local CI configuration file")
+			// The run header reports "CI config: local file"; the path and the
+			// --branch hint stay in the verbose log to keep normal output clean.
+			l.WithField("localCIPath", localCIPath).Info("Using local CI configuration file (pass --branch to fetch the CI config from GitLab instead)")
+		} else if os.IsNotExist(err) {
+			l.WithField("localCIPath", localCIPath).Debug("Local CI config file not found, will use remote")
 		} else {
+			// The file is present but could not be read (e.g. it exceeds the
+			// size limit). Surface it instead of silently scoring against the
+			// remote CI as though no local file existed.
+			clearProgressLine(conf)
+			fmt.Fprintf(os.Stderr, "Local CI configuration at %s could not be read (%v); using remote CI configuration instead\n", localCIPath, err)
 			l.WithFields(logrus.Fields{
 				"localCIPath": localCIPath,
 				"error":       err,
-			}).Debug("Local CI config file not found, will use remote")
+			}).Warn("Local CI config file present but unreadable; using remote")
 		}
 	} else if conf.Branch != "" {
 		clearProgressLine(conf)
@@ -479,7 +881,21 @@ func RunAnalysis(conf *configuration.Configuration) (*AnalysisResult, error) {
 	// pipeline, so the analysis ran on a partial config. Flag degraded (the
 	// run still evaluates what it has, like a GitHub partial) so the score is
 	// withheld rather than scored against an incomplete pipeline (#220).
-	if n := len(pipelineOriginData.IncludesFailed); n > 0 {
+	//
+	// That reasoning holds only when THIS run built the merged pipeline. In
+	// platform mode it did not: the pipeline comes from the platform and
+	// already contains every job, and the per-include merge is run purely to
+	// learn which include contributed which job. A failed include there
+	// costs attribution, not jobs - so degrading the run would withhold the
+	// score over a loss that did not happen, and, because degraded maps to
+	// exit 3, would fail the CI job that was working correctly.
+	//
+	// The attribution loss is not swallowed: markPlatformLaneGaps reports
+	// every control that depended on it as not_evaluable and drops their
+	// findings, which is the proportionate signal for what actually went
+	// missing.
+	_, mergedFromPlatform := conf.PlatformRun.MergedYAML()
+	if n := len(pipelineOriginData.IncludesFailed); n > 0 && !mergedFromPlatform {
 		markDegraded(result, fmt.Sprintf("%d include(s) could not be resolved; their jobs were not analysed", n))
 	}
 
@@ -553,35 +969,128 @@ func RunAnalysis(conf *configuration.Configuration) (*AnalysisResult, error) {
 	result.PipelineImageData = pipelineImageData
 	result.PipelineOriginData = pipelineOriginData
 
-	// Fetch branch-protection metadata when the user configured the
-	// corresponding control — the Rego policy needs the protection
-	// settings to check every branch against the declared bar.
+	// Branch protection and MR approvals: from the platform's snapshot when
+	// it has taken the lane over, from GitLab otherwise.
+	//
+	// This is issue #368's lane split at its clearest. Listing protected
+	// branches and reading approval rules both need rights a CI job token
+	// does not have, and both are the SAME data for every run of the same
+	// project, so a project scanned once per .plumber.yaml would pay for
+	// them once per config file. The platform collects them on its own
+	// schedule and the runner reads the result.
 	var protectionData *gitlab.GitlabProtectionAnalysisData
-	if shouldRunControl(controlBranchMustBeProtected, conf) {
-		if cfg := conf.PlumberConfig.GetBranchMustBeProtectedConfig(); cfg != nil && cfg.IsEnabled() {
-			reportProgress(conf, 9, analysisStepCount, "Checking branch protection")
+	if protectionDataNeeded(conf) {
+		reportProgress(conf, 9, analysisStepCount, "Checking branch protection")
+		if fromSnapshot, served := gitlab.ProtectionFromSnapshot(conf.PlatformRun); served {
+			protectionData = fromSnapshot
+		} else {
 			protectionDC := &gitlab.GitlabProtectionDataCollection{}
 			pData, _, pErr := protectionDC.Run(projectInfo, conf.GitlabToken, conf)
 			if pErr != nil {
 				// A network failure here leaves branchMustBeProtected with zero
 				// branches → a vacuous 100% green. Flag degraded so that control's
 				// pass is not trusted (mirrors the GitHub branch path, #220). A
-				// non-network failure stays a soft warn as before.
+				// non-network failure stays a soft warn as before. The approval-rule
+				// controls need no degraded flag here: a nil protectionData makes
+				// them report not-evaluable via StatusFor.
 				if isNetworkError(pErr) {
-					markDegraded(result, "branch protection could not be fetched (network or timeout)")
+					markDegraded(result, degradedReasonBranchProtectionPrefix+" (network or timeout)")
 				}
-				l.WithError(pErr).Warn("Protection data collection failed; branch policies will see no branches")
+				l.WithError(pErr).Warn("Protection data collection failed; branch and approval-rule policies will see no data")
 			} else {
 				protectionData = pData
 			}
 		}
 	}
 
+	// Settings CI/CD variables: same split. The Rego policies need the
+	// protected/masked flags, never the values, which is exactly what the
+	// platform serves — and is why this lane can move without the snapshot
+	// ever holding a secret.
+	var variablesData *gitlab.GitlabVariablesAnalysisData
+	if cicdVariableControlEnabled(conf) {
+		reportProgress(conf, 10, analysisStepCount, "Checking CI/CD variables")
+		if fromSnapshot, served := gitlab.VariablesFromSnapshot(conf.PlatformRun); served {
+			variablesData = fromSnapshot
+		} else {
+			var vErr error
+			variablesData, vErr = gitlab.CollectGitlabVariables(conf.ProjectPath, conf.GitlabToken, conf)
+			if vErr != nil && isNetworkError(vErr) {
+				// A transient network failure fetching variables degrades the run
+				// (exit 3), matching the branch/image collectors (#220). A
+				// permission failure (401/403 or a null project) is NOT network, so
+				// it stays a plain not-evaluable — variablesData.Known is false and
+				// StatusFor reports it without failing an otherwise-complete run.
+				markDegraded(result, degradedReasonVariablesPrefix+" (network or timeout)")
+			}
+		}
+	}
+
+	// The security-policy linkage is read on its own, NOT inside the protection
+	// collection. It is a GraphQL surface, unrelated to the REST protection
+	// endpoints, and nesting it there made ISSUE-601 hostage to them: a token
+	// that cannot list branches aborts that collection before the read is ever
+	// reached, leaving the control not-evaluable on a linkage it could have read.
+	//
+	// In platform mode it is not read at all. The snapshot contract carries
+	// no lane for it and a CI job token cannot reach GraphQL, so the call
+	// could only ever fail; control/lanes.go already reports the control
+	// lane_not_served, and making the request anyway would spend a
+	// privileged credential on an answer the run has already decided it
+	// cannot use.
+	var securityPolicyData *gitlab.SecurityPolicyData
+	if securityPolicyControlEnabled(conf) && !conf.PlatformRun.Engaged() {
+		var spErr error
+		securityPolicyData, spErr = gitlab.CollectSecurityPolicy(conf.ProjectPath, conf.GitlabToken, conf.GitlabURL, conf)
+		if spErr != nil && isNetworkError(spErr) {
+			// A transient network failure must not read as a clean pass: degrade
+			// the run (exit 3) the way the variables and branch collectors do. A
+			// permission failure is NOT network, so it stays a plain
+			// not-evaluable via Known=false without failing a complete run.
+			markDegraded(result, degradedReasonSecurityPolicyPrefix+" (network or timeout)")
+		}
+	}
+
 	// Rego/OPA rule engine evaluation — the single authoritative
 	// compliance path (the legacy Go controls were retired in
 	// docs/REFACTOR_MULTI_PROVIDER.md §8 Phase A).
-	result.Findings, result.GitleaksAbstainReason = runRegoEngine(l, conf, project, pipelineOriginData, pipelineImageData, protectionData)
+	result.Findings = runRegoEngine(l, conf, project, pipelineOriginData, pipelineImageData, protectionData, variablesData, securityPolicyData, result)
 	result.ProtectionData = protectionData
+	// An approval-rule control that ran but saw zero rules is the ambiguous
+	// GitLab-Free-vs-premium-with-no-rules case (the approvals API 200-empties
+	// on Free). Flag it so the renderers can surface a Premium/Ultimate caveat.
+	result.ApprovalRulesTierCaveat = approvalRulesTierCaveatApplies(conf, protectionData)
+	result.VariablesData = variablesData
+	// The approval-settings API gives no tier signal at all (Free 200-defaults
+	// every protection off), so "no protection in effect" is the only heuristic;
+	// surface the same Premium/Ultimate caveat next to ISSUE-503.
+	result.MRApprovalSettingsTierCaveat = mrApprovalSettingsTierCaveatApplies(conf, protectionData)
+	// ISSUE-506 can require Premium/Ultimate MR settings (merge trains, merged-
+	// results pipelines) the project cannot turn on without a paid tier; flag
+	// those so the renderers advise disabling the specific expectation rather
+	// than presenting an unfixable failure.
+	result.MRSettingsPremiumCaveatFields = mrSettingsPremiumFieldsNeedingUpgrade(conf, protectionData)
+	// ISSUE-601 is not-evaluable when the linkage could not be read (auth error /
+	// field unavailable): the collector leaves SecurityPolicyKnown false, so
+	// StatusFor reports error rather than a false pass. When it WAS read but
+	// nothing is linked, surface the conditional Ultimate tier caveat.
+	result.SecurityPolicyEvaluable = securityPolicyData != nil && securityPolicyData.Known
+	result.SecurityPolicyTierCaveat = securityPolicyTierCaveatApplies(conf, securityPolicyData)
+
+	// Platform mode reads the merged configuration from the platform rather
+	// than resolving it through an API the runner has no rights to. Record
+	// which controls that lane could not feed, so their empty findings
+	// lists report not_evaluable instead of passing.
+	// A collection this run makes itself and could not complete, in either
+	// mode. Runs before the platform lane marking so the more specific
+	// reason wins where both apply (MarkNotEvaluable is first-reason-wins).
+	result.MarkFailedCollections(GitLabControls(conf.PlumberConfig))
+
+	// Likewise unconditional: these are checks this run makes itself, and a
+	// standalone run that could not complete one was reporting a pass on it.
+	MarkOwnCollectionGaps(result, GitLabControls(conf.PlumberConfig))
+
+	markPlatformLaneGaps(result, conf)
 
 	reportProgress(conf, analysisStepCount, analysisStepCount, "Analysis complete")
 

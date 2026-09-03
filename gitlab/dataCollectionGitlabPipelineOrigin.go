@@ -3,6 +3,7 @@ package gitlab
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -66,15 +67,47 @@ type GitlabPipelineOriginMetrics struct {
 type GitlabPipelineOriginData struct {
 
 	// Gitlab CI configuration
-	Conf            *GitlabCIConf
-	ConfString      string
-	MergedConf      *GitlabCIConf
-	MergedResponse  *MergedCIConfResponse
-	CiValid         bool
-	CiMissing       bool
-	CiErrors        []string // Specific CI config errors for output
-	IncludesFailed  []string // include locations whose fetch failed (jobs dropped from analysis, #220)
-	LimitedAnalysis bool
+	Conf           *GitlabCIConf
+	ConfString     string
+	MergedConf     *GitlabCIConf
+	MergedResponse *MergedCIConfResponse
+	CiValid        bool
+	CiMissing      bool
+	CiErrors       []string // Specific CI config errors for output
+	IncludesFailed []string // include locations whose fetch failed (jobs dropped from analysis, #220)
+	// RefProbesFailed names the includes whose tag-vs-branch ambiguity probe
+	// could not be completed.
+	//
+	// The probe is fail-safe by design: only a CONFIRMED tag-and-branch
+	// double hit sets RefIsAmbiguous, so a probe that errors leaves the flag
+	// false. That is the right default for the flag and the wrong answer for
+	// the report, because false reads as "this ref is unambiguous" - a pass
+	// the run has no evidence for. Recording the failures lets the caller
+	// mark the control not_evaluable instead of certifying a ref it never
+	// managed to look up.
+	RefProbesFailed []string
+	// VersionLookupsFailed names the includes whose LATEST upstream version
+	// could not be looked up - the component catalogue query, or the tag
+	// listing on a versioned project include.
+	//
+	// Same shape of hazard as RefProbesFailed and the same reason for
+	// recording it. A failed lookup leaves Current empty, and the
+	// up-to-date rule requires a non-empty Current, so the include is
+	// silently skipped and the control reports a clean pass over includes it
+	// never compared against anything. These queries hit the include's
+	// SOURCE project, so they are among the first to fail for a token scoped
+	// to the analyzed project.
+	VersionLookupsFailed []string
+	// RawConfigUnavailable records that the project's own UNMERGED CI file
+	// could not be read, while the merged pipeline was obtained anyway.
+	//
+	// Two controls read the pre-merge document by design, and both fail
+	// SILENTLY without it: the hardcoded-job map comes up empty, so every
+	// job reads as contributed by an include, and the local-variable
+	// comparison has nothing to compare. Neither produces a finding, so
+	// both would report a clean pass over a document nobody read.
+	RawConfigUnavailable bool
+	LimitedAnalysis      bool
 
 	// Origins and jobs data
 	Origins []GitlabPipelineOriginDataFull
@@ -104,10 +137,9 @@ type GitlabPipelineOriginDataGeneric struct {
 
 // GitlabPipelineJobPlumberOrigin represents a Plumber template origin
 type GitlabPipelineJobPlumberOrigin struct {
-	ID                uint   `json:"id"`
-	Path              string `json:"path"`
-	LatestVersion     string `json:"latestVersion"`
-	RepoDefaultBranch string `json:"repoDefaultBranch"`
+	ID            uint   `json:"id"`
+	Path          string `json:"path"`
+	LatestVersion string `json:"latestVersion"`
 }
 
 type GitlabPipelineOriginDataProjectSpecific struct {
@@ -185,12 +217,63 @@ func ParseGitlabComponentPath(path string, instanceURL string) (string, string, 
 	return instance, cleanPath, version
 }
 
-// splitComponentPath splits a GitLab component cleanPath
-// ("group/.../project/component") into the project full path and the component
-// name (the last segment). GitLab component includes are always
-// <project-full-path>/<component-name>, so the project is everything before the
-// final "/". Used to resolve the project's catalog resource / git tags (#156).
-func splitComponentPath(cleanPath string) (project string, component string) {
+// Predefined GitLab project-path variables we can resolve from the scanned
+// project's full path. Each pattern ends on a word boundary (\b) so a longer
+// variable that merely shares a prefix is left untouched instead of being
+// corrupted: without the boundary, replacing $CI_PROJECT_PATH inside
+// $CI_PROJECT_PATH_SLUG would yield "<path>_SLUG", and $CI_PROJECT_NAMESPACE
+// inside $CI_PROJECT_NAMESPACE_ID would yield "<namespace>_ID". Because each
+// pattern is anchored on the full variable name plus a boundary, ordering no
+// longer matters for correctness.
+var (
+	reCIProjectRootNamespace = regexp.MustCompile(`\$CI_PROJECT_ROOT_NAMESPACE\b`)
+	reCIProjectNamespace     = regexp.MustCompile(`\$CI_PROJECT_NAMESPACE\b`)
+	reCIProjectPath          = regexp.MustCompile(`\$CI_PROJECT_PATH\b`)
+	reCIProjectName          = regexp.MustCompile(`\$CI_PROJECT_NAME\b`)
+)
+
+// resolvePredefinedProjectVars substitutes the predefined GitLab CI project
+// variables that can appear in a component/include path with their values for
+// the scanned project. GitLab resolves these server-side before fetching the
+// component, so the main-loop origin hash is built from the resolved path; we
+// must resolve them the same way here or the include's inputs-map hash will not
+// match, the inputs are dropped, and an overridden component job is misreported
+// as hardcoded (ISSUE-401, #286).
+func resolvePredefinedProjectVars(path, projectPath string) string {
+	if projectPath == "" || !strings.Contains(path, "$CI_PROJECT_") {
+		return path
+	}
+
+	namespace, name := projectPath, projectPath
+	if i := strings.LastIndex(projectPath, "/"); i >= 0 {
+		namespace = projectPath[:i] // group path, e.g. "swepy/cicd-templates"
+		name = projectPath[i+1:]    // project slug, e.g. "ci-trigger"
+	}
+	rootNamespace, _, _ := strings.Cut(projectPath, "/") // top-level group, e.g. "swepy"
+
+	// ReplaceAllLiteralString avoids interpreting "$" in the replacement value
+	// as a capture-group reference (GitLab paths never contain "$", but this is
+	// defensive and free).
+	path = reCIProjectRootNamespace.ReplaceAllLiteralString(path, rootNamespace)
+	path = reCIProjectNamespace.ReplaceAllLiteralString(path, namespace)
+	path = reCIProjectPath.ReplaceAllLiteralString(path, projectPath)
+	path = reCIProjectName.ReplaceAllLiteralString(path, name)
+	return path
+}
+
+// SplitComponentPath splits a component's clean path (no instance, no version)
+// into the project full path and the component name. GitLab component includes
+// are always <project-full-path>/<component-name>, so the project is
+// everything before the final "/": "vendor/components/build" gives
+// "vendor/components" and "build". Used to resolve the project's catalog
+// resource / git tags (#156).
+//
+// Pair it with ParseGitlabComponentPath, which strips the instance and the
+// version first. Exported because an embedding host otherwise hand-rolls the
+// same split, and a component name taken from the wrong segment silently
+// mismatches the catalogue lookup - the component is then reported as having
+// no published version rather than as up to date.
+func SplitComponentPath(cleanPath string) (project string, component string) {
 	i := strings.LastIndex(cleanPath, "/")
 	if i < 0 {
 		return "", cleanPath
@@ -268,7 +351,7 @@ func latestCatalogVersion(resource *CICatalogResource, component string) string 
 // extractInputsFromInclude extracts inputs from a single include entry and generates its hash
 // includeEntry can be a string (simple include) or a map (include with properties)
 // Returns: hash (uint64), inputs (map), error
-func extractInputsFromInclude(includeEntry interface{}, instanceURL string) (uint64, map[string]interface{}, error) {
+func extractInputsFromInclude(includeEntry interface{}, instanceURL, projectPath string) (uint64, map[string]interface{}, error) {
 	// If it's a string, create a simple include origin
 	if includeStr, ok := includeEntry.(string); ok {
 		// Simple string includes are typically templates or remote URLs
@@ -334,6 +417,13 @@ func extractInputsFromInclude(includeEntry interface{}, instanceURL string) (uin
 				instance = actualInstance
 			}
 
+			// GitLab also resolves predefined project variables ($CI_PROJECT_NAMESPACE,
+			// ...) in the component path before fetching it, so the main-loop hash is
+			// built from the resolved path. Substitute them here too, otherwise the
+			// hash mismatches, the include's inputs are dropped, and an overridden
+			// component job is misreported as hardcoded (ISSUE-401, #286).
+			cleanPath = resolvePredefinedProjectVars(cleanPath, projectPath)
+
 			includeOrigin.Location = instance + "/" + cleanPath
 		}
 
@@ -358,7 +448,7 @@ func generateIncludeHash(includeOrigin IncludeOriginWithoutRef) (uint64, error) 
 // buildIncludeInputsMap builds a map of include hash to inputs from the GitLab CI configuration
 // The map is used to pass the correct inputs when fetching includes
 // Uses the same hash mechanism as the main origin detection loop for consistency
-func buildIncludeInputsMap(gitlabConf *GitlabCIConf, instanceURL string) map[uint64]map[string]interface{} {
+func buildIncludeInputsMap(gitlabConf *GitlabCIConf, instanceURL, projectPath string) map[uint64]map[string]interface{} {
 	includeInputsMap := make(map[uint64]map[string]interface{})
 
 	if gitlabConf == nil || gitlabConf.Include == nil {
@@ -367,7 +457,7 @@ func buildIncludeInputsMap(gitlabConf *GitlabCIConf, instanceURL string) map[uin
 
 	// Process each include entry
 	for _, includeEntry := range gitlabConf.Include {
-		hash, inputs, err := extractInputsFromInclude(includeEntry, instanceURL)
+		hash, inputs, err := extractInputsFromInclude(includeEntry, instanceURL, projectPath)
 		if err != nil || hash == 0 {
 			continue
 		}
@@ -421,6 +511,18 @@ func (dc *GitlabPipelineOriginDataCollection) Run(project *ProjectInfo, token st
 	// Get all infos about the CI configuration
 	// Use project.AnalyzeBranch as ref (set via --branch CLI flag, defaults to DefaultBranch)
 	data.Conf, data.MergedConf, data.MergedResponse, data.ConfString, _, err = GetFullGitlabCI(project, project.AnalyzeBranch, token, conf.GitlabURL, conf)
+
+	// An EMPTY root file beside a merged pipeline that has jobs is not a
+	// configuration anyone writes: an empty root declares no includes, so
+	// the merge would be empty too. The pair therefore means the root was
+	// not read - the tolerated failure in GetFullGitlabCI, or a
+	// ci_config_path pointing into another project. Inferring it here keeps
+	// GetFullGitlabCI's signature, which the platform also calls.
+	if conf.PlatformRun.Engaged() && strings.TrimSpace(data.ConfString) == "" &&
+		data.MergedConf != nil && len(data.MergedConf.GitlabJobs) > 0 {
+		data.RawConfigUnavailable = true
+		l.Warn("The project's own CI file was not read; the controls that compare against it will report not_evaluable")
+	}
 	if err != nil {
 		data.LimitedAnalysis = true
 		data.CiValid = false
@@ -488,12 +590,33 @@ func (dc *GitlabPipelineOriginDataCollection) Run(project *ProjectInfo, token st
 	// query.
 	catalogCache := map[string]*CICatalogResource{}
 	catalogTried := map[string]bool{}
-	resolveComponentLatest := func(project, component string) (latest, webPath, repoName string) {
+	resolveComponentLatest := func(inc MergedCIConfResponseInclude, project, component string) (latest, webPath, repoName string) {
 		webPath = "/" + project
 		repoName = component
+		// A host-supplied catalogue answers without a request. It is cached
+		// under the project exactly like a fetched one, so a later include
+		// of the same project reuses it rather than reaching for the
+		// network, and so VersionLookupsFailed stays untouched: nothing
+		// failed, because nothing was attempted.
+		//
+		// What arrives is the raw listing, not a "latest version".
+		// latestCatalogVersion below applies the rule that only versions
+		// still carrying THIS component count - the rule a host that
+		// reduced the listing first would have to reimplement, and get
+		// subtly wrong for a component dropped in a later version.
+		if !catalogTried[project] && inc.SourceCatalog != nil {
+			catalogCache[project] = inc.SourceCatalog
+			catalogTried[project] = true
+		}
 		if !catalogTried[project] {
 			r, qerr := GetGitlabCIComponentResource(project, token, conf.GitlabURL, conf)
 			if qerr != nil {
+				// Recorded, not just logged: with no catalogue answer the
+				// component has no known latest version, and the up-to-date
+				// rule skips an include with no latest version rather than
+				// reporting it out of date. Silence here reads as "every
+				// component is current".
+				data.VersionLookupsFailed = append(data.VersionLookupsFailed, project)
 				l.WithError(qerr).WithField("project", project).Debug("catalog resource lookup failed")
 			}
 			catalogCache[project] = r
@@ -518,8 +641,33 @@ func (dc *GitlabPipelineOriginDataCollection) Run(project *ProjectInfo, token st
 	// This map will help us pass the correct inputs when fetching includes
 	// Key: include hash (same hash used for origin tracking)
 	// Value: map of input name to input value
-	includeInputsMap := buildIncludeInputsMap(data.Conf, conf.GitlabURL)
-	l.WithField("includeInputsMap", includeInputsMap).Debug("Built include inputs map from original configuration")
+	// Job attribution for every include, derived once through the same
+	// exported entry point an embedding host calls.
+	//
+	// This loop used to resolve each include inline, which made
+	// DeriveIncludeJobs a SECOND implementation of the same rules - the
+	// nested test, the inputs-hash lookup, the resolve-or-degrade decision.
+	// Two copies of a judgement agree only by coincidence, which is the
+	// whole argument this package makes to the platform; it would be a poor
+	// one to break here.
+	//
+	// The error is not fatal: a request that could not be started at all
+	// leaves every entry Known false, and the loop degrades each include
+	// exactly as it would have on an individual failure.
+	includeJobs, deriveErr := DeriveIncludeJobs(IncludeJobsRequest{
+		RawConfig:   data.Conf,
+		Includes:    data.MergedResponse.CiConfig.Includes,
+		Stages:      data.MergedConf.Stages,
+		ProjectPath: project.Path,
+		Token:       token,
+		APIURL:      conf.GitlabURL,
+		SHA:         project.LatestHeadCommitSha,
+		Conf:        conf,
+	})
+	if deriveErr != nil {
+		l.WithError(deriveErr).Warn("Include attribution could not be derived; every include will report unresolved")
+		includeJobs = make([]IncludeJobs, len(data.MergedResponse.CiConfig.Includes))
+	}
 
 	//////////////////
 	// Extract data //
@@ -598,7 +746,7 @@ func (dc *GitlabPipelineOriginDataCollection) Run(project *ProjectInfo, token st
 	/////////////////////////////////////////////////////////////////////////
 
 	if data.MergedResponse != nil {
-		for _, include := range data.MergedResponse.CiConfig.Includes {
+		for i, include := range data.MergedResponse.CiConfig.Includes {
 
 			// Add logging info
 			lInclude := l.WithField("include", include)
@@ -613,7 +761,7 @@ func (dc *GitlabPipelineOriginDataCollection) Run(project *ProjectInfo, token st
 			// To detect if the origin is not first level (so, nested), we just check if
 			// contextProject is different that the current project
 			isNested := false
-			if include.ContextProject != project.Path {
+			if includeJobs[i].Nested {
 				lInclude.Debug("Nested include found")
 				isNested = true
 				// NOTE: there is a case of nested include we don't detect yet:
@@ -681,12 +829,12 @@ func (dc *GitlabPipelineOriginDataCollection) Run(project *ProjectInfo, token st
 
 				// Resolve the component's latest published version via a targeted
 				// catalog lookup (cached), falling back to the project's git tags (#156).
-				project, componentName := splitComponentPath(cleanPath)
+				project, componentName := SplitComponentPath(cleanPath)
 				if componentName == "" {
 					lInclude.Warning("Component name is empty. It should not happen.")
 					continue
 				}
-				latestVersion, webPath, repoName := resolveComponentLatest(project, componentName)
+				latestVersion, webPath, repoName := resolveComponentLatest(include, project, componentName)
 				if latestVersion != "" {
 					originData.FromGitlabCatalog = true
 					originData.GitlabComponent = GitlabPipelineJobGitlabComponent{
@@ -711,9 +859,16 @@ func (dc *GitlabPipelineOriginDataCollection) Run(project *ProjectInfo, token st
 				// ref-confusion (ISSUE-402): a component pinned to a name that
 				// resolves upstream as BOTH a tag and a branch is ambiguous.
 				// Fail-safe — only a confirmed tag+branch double-hit sets the
-				// flag; a SHA / ~latest / failed probe leaves it false.
+				// flag; a SHA or ~latest leaves it false. A probe that could
+				// not be COMPLETED also leaves it false, which is right for
+				// the flag and wrong for the report, so it is recorded
+				// separately and the caller withholds the control's verdict.
 				if shouldProbeRefAmbiguity(version) {
-					if tagExists, branchExists, errAmb := RefResolvesAsTagAndBranch(project, version, token, conf.GitlabURL, conf); errAmb == nil && tagExists && branchExists {
+					tagExists, branchExists, known := refExistence(include, project, version, token, conf, lInclude)
+					switch {
+					case !known:
+						data.RefProbesFailed = append(data.RefProbesFailed, project+"@"+version)
+					case tagExists && branchExists:
 						originData.RefIsAmbiguous = true
 						lInclude.WithFields(logrus.Fields{"project": project, "ref": version}).Debug("Component ref resolves as both a tag and a branch (ref-confusion)")
 					}
@@ -729,9 +884,15 @@ func (dc *GitlabPipelineOriginDataCollection) Run(project *ProjectInfo, token st
 
 				// ref-confusion (ISSUE-402): a project include whose ref
 				// resolves as BOTH a tag and a branch in the source project is
-				// ambiguous. Fail-safe — confirmed tag+branch double-hit only.
+				// ambiguous. Fail-safe — confirmed tag+branch double-hit only,
+				// with a probe that could not be completed recorded rather
+				// than folded into "unambiguous" (see the component case).
 				if include.Extra.Project != "" && shouldProbeRefAmbiguity(include.Extra.Ref) {
-					if tagExists, branchExists, errAmb := RefResolvesAsTagAndBranch(include.Extra.Project, include.Extra.Ref, token, conf.GitlabURL, conf); errAmb == nil && tagExists && branchExists {
+					tagExists, branchExists, known := refExistence(include, include.Extra.Project, include.Extra.Ref, token, conf, lInclude)
+					switch {
+					case !known:
+						data.RefProbesFailed = append(data.RefProbesFailed, include.Extra.Project+"@"+include.Extra.Ref)
+					case tagExists && branchExists:
 						originData.RefIsAmbiguous = true
 						lInclude.WithFields(logrus.Fields{"project": include.Extra.Project, "ref": include.Extra.Ref}).Debug("Project include ref resolves as both a tag and a branch (ref-confusion)")
 					}
@@ -756,14 +917,13 @@ func (dc *GitlabPipelineOriginDataCollection) Run(project *ProjectInfo, token st
 								"currentVersion": currentVersion,
 							}).Debug("Fetching tags to check for outdated version")
 
-							// Fetch source project info to get default branch (for forbidden version check)
-							sourceProject, errProject := FetchProjectDetails(include.Extra.Project, token, conf.GitlabURL, conf)
-							if errProject == nil && sourceProject != nil {
-								originData.PlumberOrigin.RepoDefaultBranch = sourceProject.DefaultBranch
-							}
-
 							tags, errPlatform, err := SearchTags(include.Extra.Project, token, conf.GitlabURL, conf)
 							if err != nil || errPlatform != nil {
+								// Same reasoning as the catalogue lookup above:
+								// no tag listing means no latest version, and
+								// no latest version means the include is
+								// skipped rather than judged.
+								data.VersionLookupsFailed = append(data.VersionLookupsFailed, include.Extra.Project)
 								lInclude.WithFields(logrus.Fields{
 									"err":         err,
 									"errPlatform": errPlatform,
@@ -851,20 +1011,15 @@ func (dc *GitlabPipelineOriginDataCollection) Run(project *ProjectInfo, token st
 			// project files from other repos, remote URLs).
 			isLocalInclude := include.Type == glOriginLocal
 
-			// Get inputs for this include from the map using the origin hash
-			// The hash was already calculated
-			includeInputs := includeInputsMap[originData.OriginHash]
-			lInclude.WithFields(logrus.Fields{
-				"originHash": originData.OriginHash,
-				"inputs":     includeInputs,
-			}).Debug("Fetching include with inputs")
-
-			// Fetch the include with inputs and stages from the merged configuration
-			// Stages are needed because components may reference custom stages defined at the root level
-			var jobsFromInclude []string
-			jobsFromInclude, err = FetchGitlabInclude(include, project.Path, token, conf.GitlabURL, project.LatestHeadCommitSha, conf, includeInputs, data.MergedConf.Stages)
-			if err != nil {
-				lInclude.WithError(err).Error("Unable to fetch include from GitLab")
+			// The attribution derived above. Known false means the include
+			// could not be resolved, which is NOT an include that
+			// contributed nothing: its jobs are still in the merged
+			// pipeline with nothing attributing them upstream, so they read
+			// as project-authored and the rules keyed on that distinction
+			// fire on them.
+			jobsFromInclude := includeJobs[i].Jobs
+			if !includeJobs[i].Known {
+				lInclude.Error("Unable to resolve include; its attribution is unknown")
 				// Record the dropped include so the caller can flag the run
 				// degraded: its jobs are missing from the analysis (#220).
 				loc := include.Location

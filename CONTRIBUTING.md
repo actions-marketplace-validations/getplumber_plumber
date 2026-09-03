@@ -21,6 +21,7 @@ Thank you for your interest in contributing to Plumber! This guide will help you
 - [Adding a New Provider](#adding-a-new-provider)
 - [Coding Conventions](#coding-conventions)
 - [Commit Conventions](#commit-conventions)
+- [Releasing: version references](#releasing-version-references)
 - [Review Process](#review-process)
 
 ## AI Usage Policy
@@ -101,34 +102,37 @@ Before opening an issue, please:
 
 ### Prerequisites
 
-- Go 1.25 or later
+- Go 1.25 or later (`go.mod` requests toolchain `go1.26.5`; run with `GOTOOLCHAIN=auto` so it is honoured)
 - Make
 - Git
-- A GitLab token with `read_api` + `read_repository` scopes (for testing against a real project)
+- For testing against a real GitLab project: a GitLab token with `read_api` + `read_repository` scopes. Required even for a local checkout — GitLab "local mode" only resolves `include:local` from disk, and the config merge, per-include job harvest, variable scopes and branch protections all still go through the API.
+- For testing against GitHub: `gh auth login` (preferred) or `GH_TOKEN`. A local GitHub scan runs token-free but only for workflow-content controls; repo-level and action-metadata controls need a token.
 
 ### Building
-
-Always use `make build` instead of `go build` directly. The Makefile embeds the default `.plumber.yaml` configuration into the binary (required for `plumber config generate` to work):
 
 ```bash
 make build
 ```
 
-This runs two steps:
-1. Copies `.plumber.yaml` into `internal/defaultconfig/default.yaml` (with a build header)
-2. Compiles the Go binary
+`go build .` works too. The shipped default config (`defaultConfig/.plumber.yaml`) is embedded in place by `defaultConfig/embed.go`, so there is no generation step to run first.
+
+Two independent config artifacts, do not confuse them ([#352](https://github.com/getplumber/plumber/pull/352)):
+- **`.plumber.yaml`** (repo root) — Plumber's *own* self-scan config. It carries project-specific trust (own images, `anthropics/claude-code-action`, org registries) and is what the Plumber workflow analyzes this repo with. Maintainers edit it freely.
+- **`defaultConfig/.plumber.yaml`** — the conservative universal baseline embedded in the binary and used by every zero-config user, and what all "default config" links point to. Changes here are deliberate, reviewed policy decisions, not a side effect of tweaking the self-scan config.
+
+They must declare the same *set* of control blocks (values may differ); `configuration.TestSelfScanConfigControlsMatchDefault` enforces it.
 
 ### Make Targets
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Embed config + build binary |
+| `make build` | Build binary |
 | `make build-all` | Cross-compile for Linux, macOS, and Windows |
-| `make test` | Embed config + run all tests |
-| `make lint` | Embed config + lint code |
-| `make run` | Embed config + `go run .` (quick dev iteration) |
+| `make test` | Run all tests |
+| `make lint` | Lint code |
+| `make run` | `go run .` (quick dev iteration) |
 | `make install` | Build + install to `/usr/local/bin/` |
-| `make clean` | Remove binary and generated `default.yaml` |
+| `make clean` | Remove binary |
 
 ### Running Locally
 
@@ -145,7 +149,7 @@ This runs two steps:
 ./plumber config generate --output test-config.yaml
 ```
 
-**Run analysis** (requires a GitLab token):
+**Run analysis** — GitLab (requires a token even for a local checkout):
 
 ```bash
 export GITLAB_TOKEN=glpat-xxxx
@@ -159,12 +163,30 @@ export GITLAB_TOKEN=glpat-xxxx
 # With debug output
 ./plumber analyze --verbose
 
-# Lower threshold for testing
-./plumber analyze --threshold 50
+# Lower the score gate for testing (--threshold is deprecated and
+# cannot be combined with --min-points / --min-score)
+./plumber analyze --min-points 50
 
 # Save JSON output
 ./plumber analyze --output results.json
 ```
+
+**Run analysis** — GitHub:
+
+```bash
+gh auth login          # preferred; or export GH_TOKEN=ghp_xxxx
+
+# Local checkout, auto-detected from the git remote
+./plumber analyze
+
+# A repo you have not cloned (remote mode; a token is mandatory here)
+./plumber analyze --provider github --project owner/repo
+```
+
+Remote mode does not read on-disk repo artefacts, so absence-based controls
+(`repositoriesMustConfigureDependencyUpdates`, `repositoriesMustPublishSecurityPolicy`)
+behave differently there than on a local checkout. Compare like with like when
+testing a rule.
 
 ### Running Tests
 
@@ -203,14 +225,20 @@ If a fuzz test finds a crash, Go saves the failing input in `testdata/fuzz/` ins
 plumber/
 ├── main.go                    # Entry point
 ├── Makefile                   # Build, test, install targets
-├── .plumber.yaml              # Source-of-truth default configuration
+├── .plumber.yaml              # Plumber's own self-scan config (this repo)
+├── defaultConfig/
+│   ├── .plumber.yaml          # Shipped default, embedded in the binary
+│   └── embed.go               # go:embed directive for the file above
 │
 ├── cmd/                       # CLI commands (Cobra)
 │   ├── root.go                # Root command + global flags
 │   ├── analyze_shared.go      # Provider-agnostic analyze core
 │   ├── analyze_gitlab.go      # plumber analyze (GitLab entrypoint)
 │   ├── analyze_github.go      # plumber analyze (GitHub entrypoint)
-│   ├── config.go              # plumber config view / generate
+│   ├── config.go              # plumber config view / generate / init / validate / diff
+│   ├── config_resolve.go      # plumber config resolve (print the effective config)
+│   ├── config_migrate.go      # plumber config migrate (v1 -> v2 schema)
+│   ├── config_slim.go         # plumber config slim (full config -> overlay)
 │   └── version.go             # plumber version
 │
 ├── configuration/             # Config loading, types, and validation
@@ -224,7 +252,7 @@ plumber/
 │   └── rules_test.go          # In-process OPA evaluation against hand-built or fixture pipelines
 │
 ├── internal/ir/               # The provider-agnostic IR every rego rule reads from
-│   └── pipeline.go            # NormalizedPipeline, Job, Action, GitleaksHit, ... types
+│   └── pipeline.go            # NormalizedPipeline, Job, Action, Dockerfile, ... types
 │
 ├── control/                   # Bookkeeping (NOT detection — that lives in policies/)
 │   ├── types.go               # AnalysisResult + result/metric types
@@ -267,11 +295,8 @@ plumber/
 │
 ├── internal/
 │   ├── ir/                    # Provider-agnostic IR (already listed above)
-│   ├── engine/opa/            # OPA/Rego rule engine wrapper
-│   │   └── engine.go          # Loads policies, evaluates them, returns []Finding
-│   └── defaultconfig/         # Embedded default config (generated by make build)
-│       ├── embed.go           # go:embed directive
-│       └── default.yaml       # Auto-generated — do not edit directly
+│   └── engine/opa/            # OPA/Rego rule engine wrapper
+│       └── engine.go          # Loads policies, evaluates them, returns []Finding
 │
 └── templates/
     └── plumber.yml            # GitLab CI component template
@@ -304,13 +329,14 @@ For a typical "new GitHub-side control with simple `enabled` config, no new IR f
 |---|---|
 | **Rule** | `policies/<rule>.rego`, `policies/rules_test.go`, `policies/testdata/ISSUE-XXX/{github,gitlab}/*.yml` |
 | **Codes** | `control/codes.go` |
+| **Identity** | `finding/identity/declarations.go` (declare the finding's identity fields; the parity test fails the build without one) |
 | **Config schema** | `configuration/plumberconfig.go`, `configuration/plumberconfig_test.go` |
 | **Provider registry** | `configuration/registry.go` (controlsMeta, optional benchedControls) |
 | **Catalog** | `control/catalog.go` (GitLabControls / GitHubControls, DisabledControlNames) |
 | **Stats** (GitHub only) | `control/types.go`, `control/github_stats.go` |
 | **Terminal** | `cmd/render_details.go` |
 | **JSON** | `cmd/legacy_json.go` (GitLab) or `cmd/legacy_json_github.go` (GitHub) |
-| **Default config** | `.plumber.yaml` (then `make embed`) |
+| **Default config** | `defaultConfig/.plumber.yaml` + `.plumber.yaml` (self-scan) |
 | **Init wizard** | `cmd/init.go`, `cmd/init_test.go` |
 | **Docs in-repo** | `README.md`, `docs/GITHUB_ISSUES.md` (GitHub side), `docs/PBOM.md` (if applicable), `docs/scoring.md` (if severity changes) |
 | **Website** | `getplumber.io/src/data/issues.ts` (per-provider sub-blocks), the relevant `cli/<provider>/index.mdx` if the control needs a tutorial section |
@@ -321,7 +347,7 @@ For a control with **new IR data** also touch: `internal/ir/pipeline.go` plus th
 
 Skip if your rule only reads fields the IR already exposes (jobs, scripts, triggers, permissions, action `uses`, image refs, …).
 
-- [ ] **IR field** — `internal/ir/pipeline.go`. Add the field to the right struct (`NormalizedPipeline`, `Job`, `Action`, `GitleaksHit`, …) with a JSON tag and a comment explaining what populates it. Every Rego rule reads from `input.pipeline.*`, so this is the contract.
+- [ ] **IR field** — `internal/ir/pipeline.go`. Add the field to the right struct (`NormalizedPipeline`, `Job`, `Action`, `Dockerfile`, …) with a JSON tag and a comment explaining what populates it. Every Rego rule reads from `input.pipeline.*`, so this is the contract.
   ```go
   // Job is the provider-agnostic view of a single CI/CD job.
   type Job struct {
@@ -336,8 +362,9 @@ Skip if your rule only reads fields the IR already exposes (jobs, scripts, trigg
   - **GitLab API** → extend `gitlab/dataCollectionGitlab*.go` or write a new collector file in `gitlab/`. All REST/GraphQL calls live in `gitlab/`; collectors USE that, never call the API directly.
   - **GitHub workflow YAML parsing** → extend `github/github_workflows.go`.
   - **GitHub repo metadata / Advisory DB / archived flag etc.** → extend `github/github_metadata.go` (REST via `go-gh`) — reference: `advisoriesForRepo`, `resolveCommitToTag`.
-  - **External binary** (gitleaks-style) → write a `<tool>_scan.go` collector in `gitlab/` or `github/`. **Redact any sensitive payload BEFORE it reaches the IR** — the raw secret value must never leave the collector.
   - **Repo-artifact scan** (Dockerfile bases, dependabot config) → extend `github/github_repo_artifacts.go`.
+
+  Plumber deliberately executes **no external binaries** during analysis (see #310) — collectors are API calls, YAML parsing, and on-disk file reads only.
 - [ ] **Wiring** — call the collector from `control/task.go`'s `RunAnalysis` (GitLab) or `control/task_github.go`'s `RunGitHubAnalysis` (GitHub), after the pipeline is built and before the rego engine runs.
 
 ### 2. Rule layer (Rego)
@@ -365,9 +392,10 @@ Skip if your rule only reads fields the IR already exposes (jobs, scripts, trigg
   }
   ```
   **Reference rules** by complexity:
-  - simplest (no parameters, single pattern): `policies/leaked_secrets.rego`
+  - simplest (no parameters, single pattern): `policies/artipacked.rego`
   - parametrized (reads from `input.config.<controlName>.*`): `policies/excessive_permissions.rego`, `policies/dangerous_triggers.rego`
   - with helpers + FP guards (regex, quote-stripping, exemptions): `policies/unverified_scripts.rego`, `policies/template_injection.rego`
+- [ ] **Single-provider rule reading generic IR fields? Add a provider guard.** If your control applies to only one provider (`controlsMeta` lists just `gitlab` or just `github`) but the rego reads fields the OTHER provider also populates (`job.scripts`, `job.variables`, image refs), make `input.pipeline.provider == "<provider>"` the first expression of the `deny` block. Without it the rule fires on the other provider's pipelines too. This bit us in [#349](https://github.com/getplumber/plumber/issues/349): the GitHub-only `workflowMustPinPackageInstalls` matched a bare `pip install` in a GitLab `script:` and inflated the GitLab score. The catalog applicability gate (`control.FilterFindingsByEnabledControls` → `configuration.IsControlApplicableTo`) now drops such cross-provider findings before any output, so the guard is defense-in-depth, but guard at the source anyway: it makes intent explicit and skips wasted evaluation. Reference: `policies/unpinned_package_install.rego`, `policies/workflow_obfuscation.rego`. Rules that read only provider-specific fields (`job.uses`, GitLab includes/components, the `CI_DEBUG_TRACE` variable) don't need the guard — they can't match on the other provider.
 - [ ] **Engine input shape** — the OPA engine receives `{"pipeline": <NormalizedPipeline>, "config": <controlsCfg>}`. The `config` block is built by `control/task.go` / `control/task_github.go` from the user's `.plumber.yaml` — see the `cfg["<controlName>"] = map[string]any{...}` blocks. If your control needs parameters in Rego, add them to the corresponding `cfg[...]` builder.
 
 ### 3. Test fixtures + rego tests
@@ -431,6 +459,19 @@ Skip if your rule only reads fields the IR already exposes (jobs, scripts, trigg
       ControlName: "<controlName>", // MUST match .plumber.yaml key + registry.go entry
   },
   ```
+- [ ] **Identity declaration** — `finding/identity/declarations.go`. Add one entry mapping your ISSUE code to the ordered list of fields that identify a finding of that code across runs; its fingerprint is the hash of exactly these fields (recipe v4, see `docs/FINGERPRINT.md`). **The parity test (`finding/identity/parity_test.go`) fails the build if a registered code has no declaration**, so this is not optional, benched or not. Choose the fields by what the finding is *about* and what stays stable:
+  ```go
+  var declarations = map[string][]string{
+      // ...
+      // <what the finding is>: keyed on <why these fields>.
+      "ISSUE-XXX": {"file", "job", "uses", "step"},
+  }
+  ```
+  - Reserved names `file`, `job`, `message` read the canonical finding fields; every other name (`uses`, `branchName`, `variableName`, `image`, `includePath`, `step`, …) reads that key out of the rule's emitted `data`.
+  - **Declare the structured subject your rule emits, not the prose `message`** — that is what makes identity survive a message rewording. When the finding has no sub-finding subject because it is inherently one per job, one per file, or one per repository, declare the canonical coordinates alone: `{"file", "job"}`, `{"file"}`, or the `{}` per-repository singleton. Do **not** declare `message`: no shipped code does, and prose identity re-keys on any copy-edit. `message` is reserved only as the backstop for an *undeclared* code (see `docs/FINGERPRINT.md`).
+  - **No volatile fields** in the declaration: line numbers, renameable job names, order-sensitive indices. They move for reasons unrelated to the finding and would make an unchanged finding look new.
+  - The identity harness (`policies/identity_harness_test.go`) also requires that your §3 fixtures actually **emit** every declared key (the "witness" + "containment" checks). A declared key no fixture produces fails the harness. So the fixtures and the declaration have to agree.
+  - Changing a declaration later re-keys every finding of that code — a deliberate `RecipeVersion` bump, coordinated with anything that stores fingerprints (the platform). Get it right the first time.
 
 ### 5. Config plumbing (`.plumber.yaml` schema + Go types)
 
@@ -469,6 +510,7 @@ Skip if your rule only reads fields the IR already exposes (jobs, scripts, trigg
       "yourControlName": {Providers: []string{ProviderGitLab, ProviderGitHub}}, // or one of them
   }
   ```
+  > **This list is load-bearing, not just for validation.** `control.FilterFindingsByEnabledControls` drops any finding whose control is not applicable to the run's provider ([#349](https://github.com/getplumber/plumber/issues/349)). Get the `Providers` wrong and the gate either leaks the finding (too broad) or hides it from every surface (too narrow). `control/provider_applicability_test.go::TestEveryCatalogControlIsApplicableToItsProvider` fails if a control in `GitLabControls`/`GitHubControls` is not marked applicable to that provider here.
 - [ ] **`GitLabControls` and/or `GitHubControls` entry** — `control/catalog.go`. Each provider has its own catalog function returning `[]ControlEntry`:
   ```go
   // In GitHubControls:
@@ -496,7 +538,9 @@ Skip if your rule only reads fields the IR already exposes (jobs, scripts, trigg
       },
   }
   ```
+- [ ] **A benched control still needs an identity declaration** (§4) — the parity test does not exempt benched codes. If the rule's emitted data is not final yet, declare the best fields you can from what it emits today (fall back to the canonical coordinates `{"file", "job"}` when it has no structured subject yet, never the prose `message`) and tag the entry `(benched, not yet live: declaration provisional, revisit on unbench)` so the choice is revisited when the control ships.
 - [ ] **Promotion criteria for unbenching:** substantive rule + ≥3 fixtures (positive, negative, edge case) + docs in-repo + website docs + parity with the other provider if cross-provider. Remove the bench entry, ship as default-on or default-off as `.plumber.yaml` specifies.
+- [ ] **On unbench, revisit the identity declaration** — a benched control's declaration in `finding/identity/declarations.go` is provisional: it was chosen before the rule's emitted data settled (often the canonical coordinates `{"file", "job"}`). Before it ships to users, confirm it declares the finding's real structured subject; changing it is a deliberate `RecipeVersion` bump (a re-key), so decide it now rather than after findings are in the wild.
 
 ### 8. Stats aggregation (GitHub side only)
 
@@ -567,9 +611,9 @@ Skip unless your control marks per-action or per-image attributes (`archived`, `
 - [ ] **CycloneDX property** — `pbom/cyclonedx.go`. Add a `plumber:<your-field>` property entry on the relevant component.
 - [ ] **Document the new fields** — `docs/PBOM.md`. Both the JSON field on `Include` and the CycloneDX property; readers consume the PBOM as a contract, so the doc IS the spec.
 
-### 12. Default config (`.plumber.yaml`) + embed
+### 12. Default config (`defaultConfig/.plumber.yaml`)
 
-- [ ] **`.plumber.yaml`** — add a `<controlName>:` block under the right provider section (`gitlab.controls.*` or `github.controls.*`):
+- [ ] **`defaultConfig/.plumber.yaml`** — add a `<controlName>:` block under the right provider section (`gitlab.controls.*` or `github.controls.*`). This is the shipped default embedded in the binary:
   ```yaml
   # ===========================================
   # Your control display name
@@ -585,7 +629,7 @@ Skip unless your control marks per-action or per-image attributes (`archived`, `
     yourParam: []
   ```
   Use the banner-comment style other blocks use (`# ===` header lines). Keep config keys and the explanation in sync with the rego rule's actual behaviour.
-- [ ] **`make embed`** regenerates `internal/defaultconfig/default.yaml` from the source `.plumber.yaml`. **Don't edit the generated file directly** — it's overwritten on every build.
+- [ ] **`.plumber.yaml`** (repo root) — add the same `<controlName>:` block here too. This is Plumber's own self-scan config, independent of the shipped default ([#352](https://github.com/getplumber/plumber/pull/352)). The two files' *values* may diverge freely (trust lists, `enabled` flags — e.g. disable a noisy control on our own repo), but they must declare the same *set* of control blocks: `configuration.TestSelfScanConfigControlsMatchDefault` fails if a control is present in one file and missing from the other.
 
 ### 13. Source links (location linker — automatic)
 
@@ -595,13 +639,14 @@ If your rule emits a finding without `File` and `Line` (e.g. project-level contr
 
 ### 14. Init wizard (`plumber config init`)
 
-The wizard is a **separate code path** from `.plumber.yaml`. It generates a curated minimal config based on user answers; it does NOT read `.plumber.yaml`. So every new control needs a parallel update here, or `config init` silently produces a config missing your control.
+The wizard is a **separate code path** from `.plumber.yaml`: it builds a curated minimal config from the user's answers rather than dumping the template. Its *menu coverage* is hand-maintained, so a new control is not offered by `config init` until you add it here. Its *values* are not: since the wizard was reworked, every prompt default reads the shipped default through `embeddedDefault()`, so they cannot drift.
 
 - [ ] **`cmd/init.go`** — add the relevant lines for your control:
   - If it belongs to a composition / category menu item (e.g. "Security scanning", "Variables"), update `compositionOptionsForProviders` to include your control in that group, and the corresponding emit block in `toPlumberConfig`.
-  - If it has provider-specific defaults that differ from `.plumber.yaml`, add a dedicated field to `initWizardState`, a prompt with the right `Default:`, and the emit branch.
-  - The starter config emitted on "minimal" answer is built by `starterPlumberConfig` — make sure it gets your default values for the provider(s) this control applies to.
-- [ ] **`cmd/init_test.go`** — parity guards. `TestStarterGitHubControlsMatchEmbeddedDefault` and `TestDefaultTrustedURLsMatchEmbeddedDefault` are the existing ones; extend them or add a new one if your control has a default the test framework cannot infer.
+  - If it has provider-specific defaults, add a dedicated field to `initWizardState`, a prompt, and the emit branch. GitLab and GitHub defaults that differ cannot share one state field.
+  - **Do not hand-write the default value.** Add a `defaultXxx()` helper that reads `embeddedDefault()` (`cmd/init.go`, a `sync.OnceValue` parse of `defaultconfig.Get()`) and use it as the prompt's `Default:`. This is what keeps the wizard and the shipped default in sync. There is no `starterPlumberConfig` function; the hand-maintained starter lives in the test file below.
+- [ ] **`cmd/init_test.go`** — update `starterWizardConfig()`, the fixture mirroring what a user gets by pressing Enter at every prompt. It is hand-maintained against the prompt `Default:` literals, so changing a prompt default without updating it leaves the guards passing against a stale value.
+- [ ] Parity guards to extend: `TestWizardDefaultsSourcedFromEmbeddedDefault`, `TestStarterGitHubControlsMatchEmbeddedDefault` (there is no GitLab equivalent yet — a new GitLab control can land in the shipped default and be silently missing from the wizard), `TestStarterPlumberConfigGitHubMatchesCuratedDefaults`, `TestStarterPlumberConfigGitLabMatchesCuratedDefaults`.
 
 ### 15. CLI filter flags (`--controls` / `--skip-controls`)
 
@@ -626,7 +671,7 @@ The wizard is a **separate code path** from `.plumber.yaml`. It generates a cura
 
 ### 18. Tests + lint
 
-- [ ] **`make embed && make test && make lint`** — every gate must pass before commit.
+- [ ] **`make test && make lint`**: every gate must pass before commit.
 - [ ] Rego tests in `policies/rules_test.go` (§3).
 - [ ] Collector tests in `gitlab/*_test.go` / `github/*_test.go` (§1) if you added enrichment.
 - [ ] Init wizard tests in `cmd/init_test.go` (§14).
@@ -641,7 +686,7 @@ The wizard is a **separate code path** from `.plumber.yaml`. It generates a cura
 
 ### 19. Documentation
 
-- [ ] **`README.md`** — update the count in the "Available Controls" intro (`X GitLab controls` / `Y GitHub controls`), add a `<details>` block describing the control with bad / good YAML examples, add a row in the "Valid control names" table at the bottom.
+- [ ] **`README.md`** — usually nothing to do. The README no longer carries a control count, per-control `<details>` blocks, or a "Valid control names" table; its `## Controls` section is a short prose summary that links to the website catalog. Touch it only if your control introduces a category that summary does not already cover.
 - [ ] **`docs/GITHUB_ISSUES.md`** (GitHub controls only) — add a TOC row under the right severity-category section (1xx/2xx/3xx/4xx/5xx/6xx), then a detailed `## ISSUE-XXX — <rule-name>` section with: severity + control name banner, threat model paragraph, bad/good YAML examples, FP guards if any, config snippet. Reference: the ISSUE-411 section we added during the Megalodon work.
 - [ ] **`docs/PBOM.md`** — only if you added PBOM enrichment (§11). Document both the JSON field and the CycloneDX property.
 - [ ] **`docs/scoring.md`** — only if your control's severity or contribution changes the score formula. Adding a new control at an existing severity does not require an update.
@@ -779,9 +824,8 @@ When adding new fields to `.plumber.yaml`:
 
 1. Add the Go struct field in `configuration/plumberconfig.go`
 2. Add the field with YAML comments in `.plumber.yaml`
-3. Run `make build` to regenerate `internal/defaultconfig/default.yaml`
-4. Update `cmd/config.go` if the field needs special display handling in `config view`
-5. Update the README control documentation
+3. Update `cmd/config.go` if the field needs special display handling in `config view`
+4. Update the README control documentation
 
 ## Commit Conventions
 
@@ -846,6 +890,47 @@ chore(deps): update go-gitlab to v0.100.0
 - Keep the commit message under 72 characters
 - Scope is encouraged but optional
 - Reference issues in the PR description (not in commit messages)
+
+## Releasing: version references
+
+Releases are automated by semantic-release. A handful of version / image-digest references live outside the CLI build; some are bumped by release scripts, the rest are **manual and easy to forget** (they drift a release or two behind if nobody updates them). Check all of these when cutting a release.
+
+### Bumped automatically — do not hand-edit
+
+semantic-release runs two scripts in this repo:
+
+- `scripts/release-bump-version.sh` (in the tagged commit) — `action.yml`: the `version` input default and its "(e.g. vX)" hint.
+- `scripts/release-pin-refs.sh` (post-build, committed with `[skip ci]`) — the `templates/plumber.yml` component **image digest** line (`getplumber/plumber@sha256:… #vX`).
+
+  > The same script also contains a `README.md` rewrite for the GitHub Action `uses: getplumber/plumber@<sha> # vX` pin. **It is currently dead.** Its sed requires a 40-hex SHA followed by a `# vX.Y.Z` comment, and the README now reads `uses: getplumber/plumber@<version>`, which can never match. The script still exits 0 and `pin-refs` still `git add README.md`, so the breakage is silent. Either restore a real SHA-pinned example in the README or drop the sed; do not assume the README pin is being maintained.
+
+Also automated: the Homebrew formula (the `release.yml` Homebrew job) and `CHANGELOG.md` (semantic-release).
+
+### Propagated automatically by marker — do not hand-edit
+
+The GitLab component repo and the website used to be a manual checklist. They are not any more. `release.yml` ends with a `propagate` job (`.github/workflows/propagate.yml`) that pushes each release outward: it syncs `templates/plumber.yml`, rewrites pins and `RELEASE_NOTES.md` in the GitLab component repo and tags `v${VERSION}` there (which makes the GitLab tag pipeline publish the Catalog release), then opens a pin-bump PR against `getplumber.io`.
+
+Rewrites are **marker-driven** (`scripts/release-propagate-pins.sh`): only lines carrying the phrase `pinned plumber version` in a comment are touched (case-insensitive, any comment syntax). If the marker line itself holds a rewritable reference it is the target, otherwise the line directly below it is.
+
+- To make a new version reference auto-update, add that phrase in a comment near it. Never mark a historical version mention.
+- **The rewrite replaces every `X.Y.Z` token on a marked line.** Only mark lines whose sole version is Plumber's; a marked line that also names a Go version or an action version will have it clobbered.
+- A marker with no rewritable target is "dangling" and fails the script with exit 3.
+- Re-run for the latest release with `gh workflow run propagate.yml -f version=X.Y.Z`.
+
+The component repo receives **two** commits per release, and it is the second that carries the `v${VERSION}` tag, so its README self-pins point one commit behind the tag by design.
+
+### Manual — update on every release
+
+Only the references no marker covers:
+
+**This repo (`plumber-cli`):**
+- [ ] `templates/plumber.yml` — the `@vX.Y.Z` **usage-comment examples** in the header block. The image-digest line above them is auto-pinned; these comment lines are NOT.
+
+Demo/example repositories that pin the component or action by SHA (`# vX.Y.Z`) are bumped by hand when the examples are refreshed.
+
+### Dynamic — never needs bumping
+
+Prefer these for any new "latest version" mention so it can't go stale: the website's `<ReleaseVersions />` component and any `[data-plumber-cli-version]` element fetch the latest release tag at runtime (`src/js/plumberCliVersion.ts`), and `src/docs/data/docs/en/cli/github/index.mdx` uses a `@COMMIT_SHA` placeholder that users copy from the README's SHA-pinned line.
 
 ## Review Process
 

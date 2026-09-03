@@ -55,6 +55,25 @@ type AnalysisResult struct {
 	PipelineImageData  *gitlab.GitlabPipelineImageData      `json:"-"`
 	PipelineOriginData *gitlab.GitlabPipelineOriginData     `json:"-"`
 	ProtectionData     *gitlab.GitlabProtectionAnalysisData `json:"-"`
+	// VariablesData records the settings-variable collection for the
+	// cicdVariablesMustBe* controls. Set only after the collection ran;
+	// nil (never ran) or Known=false (401/403) makes those controls
+	// report not-evaluable rather than a false pass (see StatusFor).
+	VariablesData *gitlab.GitlabVariablesAnalysisData `json:"-"`
+
+	// SecurityPolicyEvaluable is true when the security policy project linkage
+	// was read authoritatively (a successful GraphQL read). False when it could
+	// not be read (auth error, or the field is unavailable on the instance), so
+	// StatusFor reports projectMustHaveSecurityPolicySource (ISSUE-601) as
+	// not-evaluable rather than a false pass.
+	SecurityPolicyEvaluable bool `json:"-"`
+
+	// SecurityPolicyTierCaveat is set when the security-policy control ran, the
+	// linkage was read, and NO policy project is linked — the tier-ambiguous
+	// case (Ultimate-only feature; a non-Ultimate project cannot link one, an
+	// Ultimate project may have left it unset). Renderers surface a conditional
+	// caveat next to ISSUE-601.
+	SecurityPolicyTierCaveat bool `json:"-"`
 
 	// GitHubStats holds per-control denominators computed from the
 	// GitHub IR after a GitHub analysis. Used by the GitHub renderer
@@ -64,21 +83,20 @@ type AnalysisResult struct {
 	// GitLab path.
 	GitHubStats *GitHubAnalysisStats `json:"-"`
 
+	// Pipeline is the normalized IR this run evaluated (GitLab path). It is
+	// retained so a per-policy evaluation can re-run the rules over the same
+	// collected data under different parameters: the platform serves each
+	// policy its OWN control config, and a policy's verdict must come from
+	// its own config rather than from whichever one happened to run first.
+	// Nil on the GitHub path, which has GitHubPipeline below.
+	Pipeline *ir.NormalizedPipeline `json:"-"`
+
 	// GitHubPipeline is the normalized IR produced by the GitHub
 	// collector, retained on the result so legacy JSON / PBOM /
 	// CycloneDX builders can read images, action references, and
 	// per-branch protection details without re-running the gitlab.
 	// Nil on the GitLab path.
 	GitHubPipeline *ir.NormalizedPipeline `json:"-"`
-
-	// GitleaksAbstainReason mirrors the field of the same name on the
-	// normalized pipeline IR — populated on either provider path when
-	// pipelineMustNotLeakSecretsInConfig was enabled but the gitleaks
-	// scan could not run (binary unresolvable, scan failure, missing
-	// workflows dir, …). Read by the analyze renderer to route the
-	// control through the SKIPPED lane with this reason, instead of
-	// the misleading "100% green" the empty-hits default produced.
-	GitleaksAbstainReason string `json:"-"`
 
 	// Warnings holds non-fatal "could not verify" messages from the run,
 	// e.g. a known-CVE check skipped because an action's pinned commit
@@ -87,6 +105,34 @@ type AnalysisResult struct {
 	// JSON, SARIF and GLSAST output, and gated by --fail-warnings (exit
 	// 3) so a degraded check is visible instead of silently passing.
 	Warnings []string `json:"warnings,omitempty"`
+
+	// ApprovalRulesTierCaveat is set when an MR approval-rule control ran but
+	// the GitLab approvals API returned zero rules — the ambiguous case where
+	// the project is either on GitLab Free (feature unavailable, API returns an
+	// empty list) or on Premium/Ultimate with no rules configured. The API
+	// gives no tier signal to tell them apart, so renderers surface a
+	// Premium/Ultimate caveat next to ISSUE-502/504 rather than presenting the
+	// result as authoritative.
+	ApprovalRulesTierCaveat bool `json:"-"`
+
+	// MRApprovalSettingsTierCaveat is set when the MR approval-settings control
+	// ran and the project has no approval protection in effect — the GitLab-Free
+	// signature (the feature does not exist there and the API 200-defaults every
+	// protection off, which the operator cannot change). The settings API gives
+	// no other tier signal, so renderers surface a Premium/Ultimate caveat next
+	// to ISSUE-503 advising the operator to disable the control if they are on
+	// Free. Any single protection being active proves a paid tier and clears it.
+	MRApprovalSettingsTierCaveat bool `json:"-"`
+
+	// MRSettingsPremiumCaveatFields lists the Premium/Ultimate MR-setting
+	// expectations (mergePipelinesEnabled, mergeTrainsEnabled) that read as OFF
+	// while the config expects them ON. These features require a paid tier, and
+	// the project payload gives no tier signal, so an OFF read is ambiguous: a
+	// Free project that cannot enable them, or a paid project that left them off
+	// (a real misconfiguration). Non-empty => renderers surface a CONDITIONAL
+	// caveat next to ISSUE-506 (disable the expectation if on Free; enable the
+	// feature if on a paid tier) rather than asserting the tier either way.
+	MRSettingsPremiumCaveatFields []string `json:"-"`
 
 	// DataCollectionDegraded is set when a collection or enrichment step
 	// failed mid-run, so the analysis ran on incomplete data: a GitLab
@@ -104,6 +150,21 @@ type AnalysisResult struct {
 	// could not be fetched", "branch protection could not be fetched").
 	// Surfaced as a caveat in the terminal. Empty when not degraded.
 	DegradedReasons []string `json:"degradedReasons,omitempty"`
+
+	// NotEvaluable maps a control name to the machine-readable reason its
+	// verdict could not be established this run, for controls whose data
+	// lane supplied nothing while the rest of the run evaluated normally.
+	//
+	// It exists because DegradedReasons above is all-or-nothing: any entry
+	// turns EVERY control into an error. A lane split — where one source is
+	// unavailable and the others are fine — has to say so per control, or
+	// the unavailable lane either hides (a silent pass over data nobody
+	// collected) or wrongly discredits every other control's verdict.
+	//
+	// A control listed here reports not_evaluable instead of passing. Real
+	// findings still win: a control that DID fire is failed, because a
+	// violation found on partial data is still a violation.
+	NotEvaluable map[string]string `json:"notEvaluable,omitempty"`
 }
 
 // GitHubAnalysisStats holds per-control aggregations computed by
@@ -126,6 +187,11 @@ type GitHubAnalysisStats struct {
 	ActionRefsArchived   int
 	ActionRefsVulnerable int
 	ActionRefsAmbiguous  int
+	// ActionRefsAbsentUpstream (ISSUE-707) counts SHA-pinned refs the
+	// upstream repo confirmed do not exist. Guarded on isShaPinned so it
+	// stays aligned with the impostor-commit rego, which only fires on a
+	// 40-char SHA.
+	ActionRefsAbsentUpstream int
 
 	// Container images (ISSUE-102 / ISSUE-103).
 	ImagesTotal          int

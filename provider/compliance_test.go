@@ -70,6 +70,20 @@ func TestGitLabProvider_ComputeCompliance(t *testing.T) {
 		}
 	})
 
+	// --no-controls wins over the config: the controls enabled in
+	// .plumber.yaml are ignored, so the count is zero even though this
+	// config enables two. Zero is what makes the gate a no-op, and it is
+	// also what keeps a 100%% "all controls pass" reading from being
+	// reported for controls that never ran.
+	t.Run("no-controls ignores the enabled controls", func(t *testing.T) {
+		result := &control.AnalysisResult{CiValid: true}
+		conf := &configuration.Configuration{PlumberConfig: gitLabPC(t), NoControls: true}
+		pct, n := p.ComputeCompliance(result, conf)
+		if pct != 0.0 || n != 0 {
+			t.Fatalf("NoControls: got (%v, %d), want (0, 0)", pct, n)
+		}
+	})
+
 	t.Run("one of two controls fails", func(t *testing.T) {
 		result := &control.AnalysisResult{
 			CiValid: true,
@@ -125,6 +139,16 @@ func TestGitHubProvider_ComputeCompliance(t *testing.T) {
 		}
 	})
 
+	// Same override as the GitLab path: --no-controls beats the config.
+	t.Run("no-controls ignores the enabled controls", func(t *testing.T) {
+		result := &control.AnalysisResult{}
+		conf := &configuration.Configuration{PlumberConfig: gitHubPC(t), NoControls: true}
+		pct, n := p.ComputeCompliance(result, conf)
+		if pct != 0.0 || n != 0 {
+			t.Fatalf("NoControls: got (%v, %d), want (0, 0)", pct, n)
+		}
+	})
+
 	t.Run("one of two controls fails", func(t *testing.T) {
 		result := &control.AnalysisResult{
 			Findings: []opaengine.Finding{
@@ -159,4 +183,36 @@ func TestGitHubProvider_ComputeCompliance(t *testing.T) {
 			t.Fatalf("CiMissing ignored: got (%v, %d), want (100, 2)", pct, n)
 		}
 	})
+}
+
+// A control marked not_evaluable leaves the compliance ratio entirely: it
+// is neither a pass (its empty findings list proves nothing) nor a fail.
+// Counting it as passed would report 100% on a run that evaluated nothing,
+// the exact false green the status exists to prevent (re-raised #431
+// review thread; the exclusion keys on result.NotEvaluable, not StatusFor,
+// so run-wide degradation signals keep their standalone semantics).
+func TestGitLabProvider_ComputeCompliance_NotEvaluableLeavesTheRatio(t *testing.T) {
+	p := &GitLabProvider{}
+	conf := &configuration.Configuration{PlumberConfig: gitLabPC(t)} // enables 2 controls
+
+	result := &control.AnalysisResult{CiValid: true}
+	result.MarkNotEvaluable("containerImageMustNotUseForbiddenTags", "resolution_unavailable")
+
+	pct, n := p.ComputeCompliance(result, conf)
+	if n != 1 {
+		t.Fatalf("denominator = %d, want 1: the not_evaluable control must leave the ratio", n)
+	}
+	if pct != 100.0 {
+		t.Fatalf("pct = %v, want 100 from the one control that really evaluated", pct)
+	}
+
+	// Both controls unevaluable: nothing evaluated, and the honest answer
+	// is 0 of 0, never 100 of 0.
+	both := &control.AnalysisResult{CiValid: true}
+	both.MarkNotEvaluable("containerImageMustNotUseForbiddenTags", "resolution_unavailable")
+	both.MarkNotEvaluable("branchMustBeProtected", "resolution_unavailable")
+	pct, n = p.ComputeCompliance(both, conf)
+	if pct != 0.0 || n != 0 {
+		t.Fatalf("all not_evaluable: got (%v, %d), want (0, 0)", pct, n)
+	}
 }

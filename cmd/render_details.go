@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/getplumber/plumber/configuration"
 	"github.com/getplumber/plumber/control"
@@ -15,13 +16,17 @@ import (
 )
 
 const (
-	statTotalImages        = "Total Images"
-	statJobsChecked        = "Jobs Checked"
-	statScriptLinesChecked = "Script Lines Checked"
-	statRequirementGroups  = "Requirement Groups"
-	statSatisfiedGroups    = "Satisfied Groups"
-	statActionRefsChecked  = "Action Refs Checked"
-	statVariablesChecked   = "Variables Checked"
+	statTotalImages = "Total Images"
+	// statUnresolvedImageRefs names the images the run could not render to a
+	// literal reference, so a reader can tell an abstention from a clean
+	// result rather than inferring it from numbers that do not add up.
+	statUnresolvedImageRefs = "Unresolved References"
+	statJobsChecked         = "Jobs Checked"
+	statScriptLinesChecked  = "Script Lines Checked"
+	statRequirementGroups   = "Requirement Groups"
+	statSatisfiedGroups     = "Satisfied Groups"
+	statActionRefsChecked   = "Action Refs Checked"
+	statVariablesChecked    = "Variables Checked"
 )
 
 // statLine is an alias for control.StatLine used within the cmd package.
@@ -43,18 +48,25 @@ type detailedFinding struct {
 }
 
 // findingGroup collects everything needed to render one per-rule
-// section: its title, compliance, optional stats block, and the list
-// of findings.
+// section: its title, optional stats block, and the list of findings.
 type findingGroup struct {
-	Title      string
-	Compliance float64
-	Skipped    bool
+	Title   string
+	Skipped bool
 	// SkipReason overrides the default "disabled in configuration"
 	// string printed under a skipped header. Empty → renderer uses
 	// the default; non-empty → the renderer prints "(<reason>)".
 	SkipReason string
-	Stats      []statLine
-	Findings   []detailedFinding
+	// NotEvaluable marks a control whose data lane supplied nothing, so its
+	// empty findings list means "could not check", not "compliant". It gets
+	// its own bucket: rendering it under Passed would be the exact
+	// false-green this status exists to prevent, and rendering it under
+	// Skipped would claim the operator disabled it.
+	NotEvaluable bool
+	// NotEvaluableReason is the machine-readable cause, when the run
+	// recorded one (e.g. include_attribution_unavailable).
+	NotEvaluableReason string
+	Stats              []statLine
+	Findings           []detailedFinding
 }
 
 // renderWarnings prints the run's non-fatal "could not verify" messages,
@@ -69,12 +81,55 @@ func renderWarnings(warnings []string) {
 	fmt.Println()
 	fmt.Printf("  %s⚠ Could not verify %d item(s):%s\n", colorYellow, len(warnings), colorReset)
 	for _, w := range warnings {
-		fmt.Printf("    %s•%s %s\n", colorYellow, colorReset, w)
+		fmt.Printf("    %s•%s %s\n", colorYellow, colorReset, sanitizeTerminal(w))
 	}
 	// When a version stays unresolved (the authenticated read was blocked and
 	// the anonymous fallback did not succeed), a user-supplied token resolves
 	// it. Point there rather than leaving the user with a dead end (ISSUE-228).
-	fmt.Printf("    %s↳ if an action above is in an org with an IP allow list, set PLUMBER_METADATA_TOKEN (a token with public-repo read) to resolve its version; see the README \"GitHub Action\" section.%s\n", colorYellow, colorReset)
+	fmt.Printf("    %s↳ set PLUMBER_METADATA_TOKEN (a token with public-repo read) to resolve blocked action versions — see the README.%s\n", colorYellow, colorReset)
+}
+
+// renderApprovalRulesTierCaveat prints a caveat when an MR approval-rule
+// control ran against a project that returned zero approval rules: the feature
+// requires GitLab Premium/Ultimate, and on Free the API returns an empty list,
+// so the result may not reflect a real misconfiguration (see
+// AnalysisResult.ApprovalRulesTierCaveat). No-op otherwise.
+func renderApprovalRulesTierCaveat(result *control.AnalysisResult) {
+	if result == nil || !result.ApprovalRulesTierCaveat {
+		return
+	}
+	fmt.Println()
+	fmt.Printf("  %s⚠ MR approval rules are a GitLab Premium/Ultimate feature.%s\n", colorYellow, colorReset)
+	fmt.Printf("    %s•%s Disable these controls if you don't have GitLab Premium or Ultimate.\n", colorYellow, colorReset)
+}
+
+// renderMRApprovalSettingsTierCaveat prints a caveat when the MR
+// approval-settings control ran against a project with no approval protection in
+// effect: the feature requires GitLab Premium/Ultimate, and on Free the API
+// 200-defaults every protection off, so the operator cannot lock any of them
+// down (see AnalysisResult.MRApprovalSettingsTierCaveat). No-op otherwise.
+func renderMRApprovalSettingsTierCaveat(result *control.AnalysisResult) {
+	if result == nil || !result.MRApprovalSettingsTierCaveat {
+		return
+	}
+	fmt.Println()
+	fmt.Printf("  %s⚠ MR approval settings are a GitLab Premium/Ultimate feature.%s\n", colorYellow, colorReset)
+	fmt.Printf("    %s•%s No approval protections are in effect — if you're not on GitLab Premium or Ultimate you can't set them, so disable this control.\n", colorYellow, colorReset)
+}
+
+// renderMRSettingsPremiumCaveat prints a caveat when ISSUE-506 requires
+// Premium/Ultimate MR settings the project cannot turn on (merge trains,
+// merged-results pipelines). It names the specific expectations so the operator
+// can set them false or remove them instead of hitting an unfixable failure
+// (see AnalysisResult.MRSettingsPremiumCaveatFields). No-op otherwise.
+func renderMRSettingsPremiumCaveat(result *control.AnalysisResult) {
+	if result == nil || len(result.MRSettingsPremiumCaveatFields) == 0 {
+		return
+	}
+	fields := strings.Join(result.MRSettingsPremiumCaveatFields, ", ")
+	fmt.Println()
+	fmt.Printf("  %s⚠ These expected MR settings are GitLab Premium/Ultimate features and read as off: %s%s\n", colorYellow, fields, colorReset)
+	fmt.Printf("    %s•%s If this project isn't on GitLab Premium/Ultimate it can't enable them, so set those expectations to false (or remove them) in mergeRequestSettingsMustBeCompliant. If it is, turn the feature on to satisfy the check.\n", colorYellow, colorReset)
 }
 
 // renderDegradedCaveat prints an up-front warning that the run scored
@@ -87,7 +142,7 @@ func renderDegradedCaveat(reasons []string) {
 	}
 	fmt.Printf("  %s⚠ Data collection was incomplete — results may be partial:%s\n", colorYellow, colorReset)
 	for _, r := range reasons {
-		fmt.Printf("    %s•%s %s\n", colorYellow, colorReset, r)
+		fmt.Printf("    %s•%s %s\n", colorYellow, colorReset, sanitizeTerminal(r))
 	}
 	fmt.Printf("    %s↳ controls with un-collected data are marked \"not evaluated\"; the letter score is withheld until the run completes cleanly.%s\n\n", colorDim, colorReset)
 }
@@ -112,50 +167,308 @@ func filterGroupsForDegraded(groups []findingGroup, degraded bool) []findingGrou
 	return kept
 }
 
-// renderFindingGroups prints each group in the canonical Plumber
-// format used across providers: horizontal separator header with the
-// rule title and compliance (or "skipped"), the stat lines, and an
-// "Issues Found" listing with severity tag, code, message and doc URL.
-// Groups with no stats, no findings and not marked skipped are not
-// rendered (they would just be empty noise).
+// renderFindingGroups prints the run's per-control sections, split into
+// three buckets to keep the terminal focused on what needs attention
+// (ISSUE: the old layout printed a full stat block per passing control,
+// forcing the user to scroll past dozens of green sections to reach the
+// failures):
+//
+//  1. Passing controls collapse into a single "N controls passed" block
+//     that lists just the names — no stats, no separators per control.
+//     A control that passed but carries a caveat stat line (something it
+//     could not fully verify) keeps that ⚠ line beneath its name so the
+//     warning is not silently dropped (see renderPassedControlsSummary).
+//  2. Skipped controls collapse the same way, each with its skip reason.
+//  3. Failing controls keep the full detail (stats + "Issues Found"),
+//     rendered least-critical first so the control with the most
+//     critical issues prints LAST — i.e. closest to the terminal prompt,
+//     the first thing the user sees without scrolling up.
+//
+// Groups with no findings, no stats and not marked skipped are dropped
+// (they would just be empty noise).
 func renderFindingGroups(groups []findingGroup) {
+	var passed, skipped, notEvaluated, failed []findingGroup
 	for _, g := range groups {
-		if !g.Skipped && len(g.Stats) == 0 && len(g.Findings) == 0 {
-			continue
+		switch {
+		case g.Skipped:
+			skipped = append(skipped, g)
+		// Checked before the findings count: a control whose lane could not
+		// feed it has no trustworthy verdict in either direction, and its
+		// findings are dropped upstream (control.DropNotEvaluableFindings).
+		case g.NotEvaluable:
+			notEvaluated = append(notEvaluated, g)
+		case len(g.Findings) > 0:
+			failed = append(failed, g)
+		case len(g.Stats) > 0:
+			passed = append(passed, g)
+			// else: no findings, no stats, not skipped — nothing to show.
 		}
-		printControlHeader(g.Title, g.Compliance, g.Skipped)
-		if g.Skipped {
-			reason := g.SkipReason
-			if reason == "" {
-				reason = "disabled in configuration"
-			}
-			fmt.Printf("  %sStatus: SKIPPED (%s)%s\n\n", colorDim, reason, colorReset)
-			continue
-		}
-		for _, s := range g.Stats {
-			fmt.Printf("  %s: %s\n", s.Label, s.Value)
-		}
-		if len(g.Findings) > 0 {
-			fmt.Printf("\n  %sIssues Found:%s\n", colorYellow, colorReset)
-			for _, f := range g.Findings {
-				tag := severityTag(f.Code)
-				fmt.Printf("     %s [%s] %s\n", tag, f.Code, f.Message)
-				for _, line := range f.DetailLines {
-					fmt.Printf("      └─ %s\n", line)
-				}
-				if f.Location != "" {
-					// The bare path is emitted last so VS Code, iTerm
-					// and similar tools detect it as a clickable
-					// file:line reference and jump straight to the job.
-					fmt.Printf("      %s↳ at %s%s\n", colorDim, f.Location, colorReset)
-				}
-				if f.DocURL != "" {
-					fmt.Printf("      %s↳ docs: %s%s\n", colorDim, f.DocURL, colorReset)
-				}
-			}
-		}
-		fmt.Println()
 	}
+
+	sortFindingGroupsWorstLast(failed)
+
+	renderPassedControlsSummary(passed)
+	renderSkippedControlsSummary(skipped)
+	renderNotEvaluatedControlsSummary(notEvaluated)
+	renderFailedControlsSection(failed)
+}
+
+// renderNotEvaluatedControlsSummary prints the "Not Evaluated" section: the
+// controls whose data lane supplied nothing this run.
+//
+// It exists because the alternative is a lie. These controls have no
+// findings, so before this bucket they fell through to "✓ Passed" and the
+// terminal claimed the run had verified something it never looked at. A
+// platform-mode run without include attribution puts seven controls in that
+// state at once.
+//
+// Rendered in yellow rather than green or dim: this is neither a pass nor a
+// deliberate skip, it is missing information the reader has to weigh.
+func renderNotEvaluatedControlsSummary(groups []findingGroup) {
+	if len(groups) == 0 {
+		return
+	}
+	printStatusSectionHeader(fmt.Sprintf("Not Evaluated (%d)", len(groups)), "?", colorYellow)
+	fmt.Println()
+	for _, g := range groups {
+		reason := g.NotEvaluableReason
+		if reason == "" {
+			reason = "required data was not available"
+		}
+		fmt.Printf("  %s?%s %s %s(%s)%s\n", colorYellow, colorReset, g.Title, colorDim, reason, colorReset)
+	}
+	fmt.Println()
+}
+
+// renderPassedControlsSummary prints the "Passed Controls" section: a
+// top-level section header (same visual level as Skipped / Failed /
+// Summary) followed by the passing controls by name only.
+//
+// A control that passed only because part of its data could not be read
+// carries a caveat stat line (⚠-prefixed, e.g. branchMustBeProtected when
+// the token lacks Administration:Read so ISSUE-505 abstained). Collapsing
+// that to a bare ✓ would silently hide "we never actually verified this" —
+// the success-on-incomplete-data footgun the stats builders guard against
+// — so those ⚠ lines are printed beneath the control name.
+func renderPassedControlsSummary(groups []findingGroup) {
+	if len(groups) == 0 {
+		return
+	}
+	printStatusSectionHeader(fmt.Sprintf("Passed Controls (%d)", len(groups)), "✓", colorGreen)
+	fmt.Println()
+	for _, g := range groups {
+		fmt.Printf("  %s✓%s %s\n", colorGreen, colorReset, g.Title)
+		for _, s := range caveatStatLines(g) {
+			fmt.Printf("      %s%s: %s%s\n", colorYellow, s.Label, s.Value, colorReset)
+		}
+	}
+	fmt.Println()
+}
+
+// statCaveatPrefix marks a stat line reporting a partial / could-not-verify
+// condition. It is the same ⚠ convention used by the caveat banners above
+// (renderWarnings / renderDegradedCaveat).
+const statCaveatPrefix = "⚠"
+
+// caveatStatLines returns the group's stat lines flagged as caveats.
+func caveatStatLines(g findingGroup) []statLine {
+	var out []statLine
+	for _, s := range g.Stats {
+		if strings.HasPrefix(s.Label, statCaveatPrefix) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// approvalRulesUnreadableCaveat returns a single ⚠ caveat stat line when the
+// approval-rules listing could not be read authoritatively (nil ProtectionData,
+// or MRApprovalRulesKnown false from a 401/403). Both approval-rule stat
+// builders use it so an unreadable listing shows the caveat instead of a bare
+// green "passed" — the JSON status is already error via StatusFor, this closes
+// the terminal gap. Returns nil when the listing was read (the zero-rules-on-
+// Free case is handled separately by renderApprovalRulesTierCaveat).
+func approvalRulesUnreadableCaveat(result *control.AnalysisResult) []statLine {
+	if result != nil && result.ProtectionData != nil && result.ProtectionData.MRApprovalRulesKnown {
+		return nil
+	}
+	return []statLine{{
+		Label: statCaveatPrefix + " Approval rules not evaluated",
+		Value: "the approvals API could not be read — token lacks permission, or it requires GitLab Premium/Ultimate",
+	}}
+}
+
+// variablesUnreadableCaveat returns a single ⚠ caveat stat line when the
+// settings-variable listing could not be read (nil VariablesData, or Known
+// false from a 401/403/null-project). Both variable-control stat builders use
+// it so an unreadable listing shows the caveat instead of a bare green "passed"
+// — the JSON status is already error via StatusFor, this closes the terminal
+// gap. Returns nil when the listing was read authoritatively.
+func variablesUnreadableCaveat(result *control.AnalysisResult) []statLine {
+	if result != nil && result.VariablesData != nil && result.VariablesData.Known {
+		return nil
+	}
+	return []statLine{{
+		Label: statCaveatPrefix + " Variables not evaluated",
+		Value: "CI/CD variables could not be read — token lacks permission or the API returned no data",
+	}}
+}
+
+// approvalSettingsUnreadableCaveat and mrSettingsUnreadableCaveat are the same
+// closing-the-terminal-gap helpers for the two settings-level controls: when
+// the payload the control reads was never fetched, StatusFor already reports
+// error in JSON, but the terminal would otherwise print a bare green check and
+// count it toward the score. The nil checks mirror StatusFor's guards exactly,
+// so the two surfaces cannot disagree.
+func approvalSettingsUnreadableCaveat(result *control.AnalysisResult) []statLine {
+	if result != nil && result.ProtectionData != nil && result.ProtectionData.MRApprovalSettings != nil {
+		return nil
+	}
+	return []statLine{{
+		Label: statCaveatPrefix + " Approval settings not evaluated",
+		Value: "the approval-settings API could not be read — token lacks permission, or the protection collection did not run",
+	}}
+}
+
+func mrSettingsUnreadableCaveat(result *control.AnalysisResult) []statLine {
+	if result != nil && result.ProtectionData != nil && result.ProtectionData.MRSettings != nil {
+		return nil
+	}
+	return []statLine{{
+		Label: statCaveatPrefix + " MR settings not evaluated",
+		Value: "the project settings could not be read — token lacks permission, or the protection collection did not run",
+	}}
+}
+
+// renderSkippedControlsSummary prints the "Skipped Controls" section: a
+// top-level section header followed by each skipped control with its
+// skip reason.
+func renderSkippedControlsSummary(groups []findingGroup) {
+	if len(groups) == 0 {
+		return
+	}
+	printStatusSectionHeader(fmt.Sprintf("Skipped Controls (%d)", len(groups)), "•", colorDim)
+	fmt.Println()
+	for _, g := range groups {
+		reason := g.SkipReason
+		if reason == "" {
+			reason = "disabled in configuration"
+		}
+		fmt.Printf("  %s•%s %s %s(%s)%s\n", colorDim, colorReset, g.Title, colorDim, reason, colorReset)
+	}
+	fmt.Println()
+}
+
+// renderFailedControlsSection prints the "Failed Controls" section: a
+// top-level section header followed by each failing control in full,
+// ordered least-critical first so the worst prints last.
+func renderFailedControlsSection(groups []findingGroup) {
+	if len(groups) == 0 {
+		return
+	}
+	printStatusSectionHeader(fmt.Sprintf("Failed Controls (%d)", len(groups)), "✗", colorRed)
+	fmt.Println()
+	for _, g := range groups {
+		renderFailedControl(g)
+	}
+}
+
+// renderFailedControl prints one failing control in full: a compact,
+// indented sub-header (no rule lines — those are reserved for the
+// top-level section headers so the hierarchy reads section > control),
+// the stat block, and the "Issues Found" listing with severity tag,
+// code, message and doc URL. All content is indented one level under the
+// control title.
+func renderFailedControl(g findingGroup) {
+	n := len(g.Findings)
+	count := fmt.Sprintf("%d issues", n)
+	if n == 1 {
+		count = "1 issue"
+	}
+	fmt.Printf("  %s✗%s %s%s%s %s(%s)%s\n", colorRed, colorReset, colorBold, g.Title, colorReset, colorRed, count, colorReset)
+	for _, s := range g.Stats {
+		fmt.Printf("      %s: %s\n", s.Label, s.Value)
+	}
+	fmt.Printf("\n      %sIssues Found:%s\n", colorYellow, colorReset)
+	for _, f := range g.Findings {
+		tag := severityTag(f.Code)
+		fmt.Printf("        %s [%s] %s\n", tag, f.Code, sanitizeTerminal(f.Message))
+		for _, line := range f.DetailLines {
+			fmt.Printf("         └─ %s\n", sanitizeTerminal(line))
+		}
+		if f.Location != "" {
+			// The bare path is emitted last so VS Code, iTerm
+			// and similar tools detect it as a clickable
+			// file:line reference and jump straight to the job.
+			fmt.Printf("         %s↳ at %s%s\n", colorDim, sanitizeTerminal(f.Location), colorReset)
+		}
+		if f.DocURL != "" {
+			fmt.Printf("         %s↳ docs: %s%s\n", colorDim, f.DocURL, colorReset)
+		}
+	}
+	fmt.Println()
+}
+
+// findingGroupSeverity tallies the severities of a group's findings from
+// their issue codes, the same source of truth the summary table uses.
+func findingGroupSeverity(g findingGroup) control.SeverityCounts {
+	codes := make([]control.ErrorCode, 0, len(g.Findings))
+	for _, f := range g.Findings {
+		codes = append(codes, f.Code)
+	}
+	return control.SeverityCountsFromIssueCodes(codes)
+}
+
+// sortFindingGroupsWorstLast orders failing controls least-critical first
+// so the control carrying the most critical issues prints last — landing
+// next to the terminal prompt where it is seen without scrolling. This is
+// the mirror image of the summary table's worst-first ordering, reusing
+// the same severity comparison (compareSeverityWorstFirst).
+//
+// compareSeverityWorstFirst already accounts for issue counts within each
+// tier (more criticals is worse, then more highs, …), and every code maps
+// to exactly one tier, so a zero result means identical per-tier tallies
+// AND identical totals — no separate issue-count tie-break is reachable.
+// Equal-severity ties therefore fall through to the title for a stable,
+// deterministic order.
+func sortFindingGroupsWorstLast(groups []findingGroup) {
+	if len(groups) < 2 {
+		return
+	}
+	slices.SortStableFunc(groups, func(a, b findingGroup) int {
+		if c := compareSeverityWorstFirst(findingGroupSeverity(a), findingGroupSeverity(b)); c != 0 {
+			// compareSeverityWorstFirst returns negative when a is worse;
+			// invert so the worse group sorts later (prints last).
+			return -c
+		}
+		return cmp.Compare(a.Title, b.Title)
+	})
+}
+
+// sanitizeTerminal strips control characters from repo-controlled text before
+// it is printed to a terminal. Finding messages, detail lines and locations
+// embed data taken from the scanned repository (job names, image refs, script
+// lines, file paths); a crafted value could otherwise carry ANSI/OSC escape
+// sequences that rewrite the operator's terminal. Tabs become spaces; every
+// other control rune (including ESC) is dropped. Ordinary printable text — the
+// whole legitimate case — is returned unchanged.
+func sanitizeTerminal(s string) string {
+	if !strings.ContainsFunc(s, func(r rune) bool { return r == '\t' || unicode.IsControl(r) }) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\t':
+			b.WriteByte(' ')
+		case unicode.IsControl(r):
+			// drop C0/C1 control runes (incl. ESC) — neutralizes ANSI/OSC injection
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // formatFindingLocation returns the link the terminal should print
@@ -353,10 +666,23 @@ func buildGitHubControlStats(controlName string, stats *control.GitHubAnalysisSt
 			{Label: "Workflows Scanned", Value: fmt.Sprintf("%d", stats.WorkflowsTotal)},
 			{Label: statScriptLinesChecked, Value: fmt.Sprintf("%d", stats.ScriptLinesTotal)},
 		}
+	case "workflowMustNotWriteUntrustedContentToGitHubEnv":
+		return []statLine{
+			{Label: "Workflows Scanned", Value: fmt.Sprintf("%d", stats.WorkflowsTotal)},
+			{Label: statScriptLinesChecked, Value: fmt.Sprintf("%d", stats.ScriptLinesTotal)},
+		}
+	case "workflowMustNotExportEntireSecretsContext":
+		return []statLine{
+			{Label: "Workflows Scanned", Value: fmt.Sprintf("%d", stats.WorkflowsTotal)},
+		}
 	case "workflowMustNotUseDangerousTriggers":
 		return []statLine{
 			{Label: "Workflows Scanned", Value: fmt.Sprintf("%d", stats.WorkflowsTotal)},
 			{Label: "Using Dangerous Triggers", Value: fmt.Sprintf("%d", stats.WorkflowsWithDangerousTrigger)},
+		}
+	case "checkoutMustNotPersistCredentials":
+		return []statLine{
+			{Label: "Workflows Scanned", Value: fmt.Sprintf("%d", stats.WorkflowsTotal)},
 		}
 	case "workflowsMustDeclarePermissions":
 		withPerms := stats.WorkflowsTotal - stats.WorkflowsMissingPermissions
@@ -383,33 +709,29 @@ func buildGitHubControlStats(controlName string, stats *control.GitHubAnalysisSt
 			{Label: statActionRefsChecked, Value: fmt.Sprintf("%d", stats.ActionRefsTotal+stats.ActionRefsExempt)},
 			{Label: "Archived Refs Found", Value: fmt.Sprintf("%d", stats.ActionRefsArchived)},
 		}
+	case "actionRefsMustExistUpstream":
+		return []statLine{
+			{Label: statActionRefsChecked, Value: fmt.Sprintf("%d", stats.ActionRefsTotal+stats.ActionRefsExempt)},
+			{Label: "Impostor Refs Found", Value: fmt.Sprintf("%d", stats.ActionRefsAbsentUpstream)},
+		}
 	case "actionsMustNotCarryKnownCVEs":
 		return []statLine{
 			{Label: statActionRefsChecked, Value: fmt.Sprintf("%d", stats.ActionRefsTotal+stats.ActionRefsExempt)},
 			{Label: "Refs With Advisories", Value: fmt.Sprintf("%d", stats.ActionRefsVulnerable)},
 		}
+	case "actionsMustNotExecuteMutableRemoteCode":
+		return []statLine{
+			{Label: statActionRefsChecked, Value: fmt.Sprintf("%d", stats.ActionRefsTotal)},
+			{Label: "Mutable Remote Exec Found", Value: fmt.Sprintf("%d", len(findings))},
+		}
+	case "releaseWorkflowsMustNotRestoreUntrustedCache":
+		return []statLine{
+			{Label: "Workflows Scanned", Value: fmt.Sprintf("%d", stats.WorkflowsTotal)},
+		}
 	case "pipelineMustNotEnableDebugTrace":
 		return []statLine{
 			{Label: statVariablesChecked, Value: fmt.Sprintf("%d", stats.VariableBindingsTotal)},
 			{Label: "Forbidden Found", Value: fmt.Sprintf("%d", stats.DebugTraceFound)},
-		}
-	case "pipelineMustNotLeakSecretsInConfig":
-		// Mirrors the GitLab side: count hits and distinct gitleaks
-		// rules from findings. GitHubAnalysisStats doesn't carry these
-		// counters (the rule reads pipeline.gitleaksHits directly), so
-		// the per-control findings list is the only source. Returning
-		// stats here also ensures the section renders even with zero
-		// hits — otherwise an enabled-but-clean run produced no body
-		// block, which read as "the control didn't run".
-		uniqueRules := map[string]struct{}{}
-		for _, f := range findings {
-			if v, ok := f.Data["ruleId"].(string); ok && v != "" {
-				uniqueRules[v] = struct{}{}
-			}
-		}
-		return []statLine{
-			{Label: "Hits Found", Value: fmt.Sprintf("%d", len(findings))},
-			{Label: "Distinct Rules Matched", Value: fmt.Sprintf("%d", len(uniqueRules))},
 		}
 	case "branchMustBeProtected":
 		unprotectedMatched := stats.BranchesMatched - stats.BranchesProtected
@@ -453,17 +775,30 @@ func buildGitLabControlStats(controlName string, result *control.AnalysisResult,
 		// tags, OR require a digest pin. The pin-by-digest variant
 		// counts how many images carry an OCI digest reference (any
 		// algorithm — sha256, sha512, …).
+		// These counts are computed in Go, independently of the findings, so
+		// they have to make the SAME abstention the rules make. An image
+		// whose reference never resolved to a literal is not pinned and not
+		// unpinned - the digest, like the registry and the tag, was parsed
+		// out of placeholder text. Counting it under "Not Pinned By Digest"
+		// while the rule emits no finding for it makes the table and the
+		// findings contradict each other, and counting it as pinned is a
+		// false green.
 		total := 0
 		pinned := 0
+		unresolved := 0
 		if result.PipelineImageData != nil {
 			total = len(result.PipelineImageData.Images)
 			for _, img := range result.PipelineImageData.Images {
+				if img.Unresolved {
+					unresolved++
+					continue
+				}
 				if utils.HasDigestPin(img.Link) {
 					pinned++
 				}
 			}
 		}
-		notPinned := total - pinned
+		notPinned := total - pinned - unresolved
 		if notPinned < 0 {
 			notPinned = 0
 		}
@@ -483,22 +818,42 @@ func buildGitLabControlStats(controlName string, result *control.AnalysisResult,
 			)
 		}
 		lines = append(lines, statLine{Label: "Using Forbidden Tags", Value: fmt.Sprintf("%d", usingForbidden)})
+		if unresolved > 0 {
+			lines = append(lines, statLine{Label: statUnresolvedImageRefs, Value: fmt.Sprintf("%d", unresolved)})
+		}
 		return lines
 	case "containerImageMustComeFromAuthorizedSources":
+		// authorized is derived by subtraction, so anything the rule
+		// abstained on lands in it by default. An image whose reference
+		// never resolved would therefore be reported as coming from an
+		// authorized source - the exact false green the abstention exists to
+		// avoid - unless it is subtracted out here too.
 		total := 0
+		unresolved := 0
 		if result.PipelineImageMetrics != nil {
 			total = int(result.PipelineImageMetrics.Total)
 		}
+		if result.PipelineImageData != nil {
+			for _, img := range result.PipelineImageData.Images {
+				if img.Unresolved {
+					unresolved++
+				}
+			}
+		}
 		unauthorized := findingsCount
-		authorized := total - unauthorized
+		authorized := total - unauthorized - unresolved
 		if authorized < 0 {
 			authorized = 0
 		}
-		return []statLine{
+		lines := []statLine{
 			{Label: statTotalImages, Value: fmt.Sprintf("%d", total)},
 			{Label: "Authorized", Value: fmt.Sprintf("%d", authorized)},
 			{Label: "Unauthorized", Value: fmt.Sprintf("%d", unauthorized)},
 		}
+		if unresolved > 0 {
+			lines = append(lines, statLine{Label: statUnresolvedImageRefs, Value: fmt.Sprintf("%d", unresolved)})
+		}
+		return lines
 	case "pipelineMustNotIncludeHardcodedJobs":
 		total := uint(0)
 		hardcoded := uint(0)
@@ -590,22 +945,6 @@ func buildGitLabControlStats(controlName string, result *control.AnalysisResult,
 			{Label: statScriptLinesChecked, Value: fmt.Sprintf("%d", _countScriptLines(result))},
 			{Label: "Unverified Scripts", Value: fmt.Sprintf("%d", findingsCount)},
 		}
-	case "pipelineMustNotLeakSecretsInConfig":
-		// One scanned input (the merged GitLab pipeline). Hits are
-		// already enumerated below as findings — adding a denominator
-		// here would just be "Hits Found: N" duplicated above the
-		// finding list. Return a single stat that's not redundant: the
-		// count of unique secret patterns matched.
-		uniqueRules := map[string]struct{}{}
-		for _, f := range findings {
-			if v, ok := f.Data["ruleId"].(string); ok && v != "" {
-				uniqueRules[v] = struct{}{}
-			}
-		}
-		return []statLine{
-			{Label: "Hits Found", Value: fmt.Sprintf("%d", findingsCount)},
-			{Label: "Distinct Rules Matched", Value: fmt.Sprintf("%d", len(uniqueRules))},
-		}
 	case "securityJobsMustNotBeWeakened":
 		// Stable's "Security Jobs Found" counts how many of the merged
 		// jobs match a configured security pattern — a context-rich
@@ -671,6 +1010,15 @@ func buildGitLabControlStats(controlName string, result *control.AnalysisResult,
 			{Label: statActionRefsChecked, Value: fmt.Sprintf("%d", actionRefs)},
 			{Label: "Archived Refs Found", Value: fmt.Sprintf("%d", findingsCount)},
 		}
+	case "actionRefsMustExistUpstream":
+		actionRefs := 0
+		if result.GitHubStats != nil {
+			actionRefs = result.GitHubStats.ActionRefsTotal
+		}
+		return []statLine{
+			{Label: statActionRefsChecked, Value: fmt.Sprintf("%d", actionRefs)},
+			{Label: "Impostor Refs Found", Value: fmt.Sprintf("%d", findingsCount)},
+		}
 	case "actionsMustNotCarryKnownCVEs":
 		actionRefs := 0
 		if result.GitHubStats != nil {
@@ -679,6 +1027,59 @@ func buildGitLabControlStats(controlName string, result *control.AnalysisResult,
 		return []statLine{
 			{Label: statActionRefsChecked, Value: fmt.Sprintf("%d", actionRefs)},
 			{Label: "Refs With Advisories", Value: fmt.Sprintf("%d", findingsCount)},
+		}
+	case "actionsMustNotExecuteMutableRemoteCode":
+		actionRefs := 0
+		if result.GitHubStats != nil {
+			actionRefs = result.GitHubStats.ActionRefsTotal
+		}
+		return []statLine{
+			{Label: statActionRefsChecked, Value: fmt.Sprintf("%d", actionRefs)},
+			{Label: "Mutable Remote Exec Found", Value: fmt.Sprintf("%d", findingsCount)},
+		}
+	case "mergeRequestApprovalRulesMustRequireMinimumApprovals":
+		if lines := approvalRulesUnreadableCaveat(result); lines != nil {
+			return lines
+		}
+		return []statLine{
+			{Label: "Rules Below Minimum", Value: fmt.Sprintf("%d", findingsCount)},
+		}
+	case "mergeRequestApprovalRulesMustCoverAllProtectedBranches":
+		if lines := approvalRulesUnreadableCaveat(result); lines != nil {
+			return lines
+		}
+		return []statLine{
+			{Label: "All-Branches Rule Missing", Value: fmt.Sprintf("%d", findingsCount)},
+		}
+	case "cicdVariablesMustBeProtected":
+		if lines := variablesUnreadableCaveat(result); lines != nil {
+			return lines
+		}
+		return []statLine{
+			{Label: "Variables Checked", Value: fmt.Sprintf("%d", len(result.VariablesData.Variables))},
+			{Label: "Unprotected Variables", Value: fmt.Sprintf("%d", findingsCount)},
+		}
+	case "cicdVariablesMustBeMasked":
+		if lines := variablesUnreadableCaveat(result); lines != nil {
+			return lines
+		}
+		return []statLine{
+			{Label: "Variables Checked", Value: fmt.Sprintf("%d", len(result.VariablesData.Variables))},
+			{Label: "Unmasked Variables", Value: fmt.Sprintf("%d", findingsCount)},
+		}
+	case "mergeRequestApprovalSettingsMustBeCompliant":
+		if lines := approvalSettingsUnreadableCaveat(result); lines != nil {
+			return lines
+		}
+		return []statLine{
+			{Label: "Non-Compliant Approval Settings", Value: fmt.Sprintf("%d", findingsCount)},
+		}
+	case "mergeRequestSettingsMustBeCompliant":
+		if lines := mrSettingsUnreadableCaveat(result); lines != nil {
+			return lines
+		}
+		return []statLine{
+			{Label: "Non-Compliant MR Settings", Value: fmt.Sprintf("%d", findingsCount)},
 		}
 	case "branchMustBeProtected":
 		total, toProtect, protected, unprotected := _branchProtectionCounts(result, pc)
@@ -695,8 +1096,26 @@ func buildGitLabControlStats(controlName string, result *control.AnalysisResult,
 			{Label: "Unprotected", Value: fmt.Sprintf("%d", unprotected)},
 			{Label: "Non-Compliant", Value: fmt.Sprintf("%d", nonCompliant)},
 		}
+	case "projectMustHaveSecurityPolicySource":
+		return []statLine{
+			{Label: "Security Policy Not Linked", Value: fmt.Sprintf("%d", findingsCount)},
+		}
 	}
 	return nil
+}
+
+// renderSecurityPolicyTierCaveat prints a caveat when the security-policy
+// control flagged a project with no policy project linked: the feature requires
+// GitLab Ultimate, and a non-Ultimate project cannot link one, so the failure
+// may be a tier limitation rather than a real misconfiguration (see
+// AnalysisResult.SecurityPolicyTierCaveat). No-op otherwise.
+func renderSecurityPolicyTierCaveat(result *control.AnalysisResult) {
+	if result == nil || !result.SecurityPolicyTierCaveat {
+		return
+	}
+	fmt.Println()
+	fmt.Printf("  %s⚠ Security policies are a GitLab Ultimate feature, and no policy project is linked.%s\n", colorYellow, colorReset)
+	fmt.Printf("    %s•%s If this project isn't on GitLab Ultimate it can't link one, so disable this control. If it is, link the expected security policy project to satisfy the check.\n", colorYellow, colorReset)
 }
 
 // _countScriptLines walks the merged GitLab CI conf and totals every

@@ -1,3 +1,1191 @@
+## [0.4.51](https://github.com/getplumber/plumber/compare/v0.4.50...v0.4.51) (2026-09-01)
+
+
+### ✨ Features
+
+* **catalog:** export human-readable control names and categories ([#440](https://github.com/getplumber/plumber/issues/440)) ([c50e9c7](https://github.com/getplumber/plumber/commit/c50e9c7d22cbe69b20cc9116a63436e422d68bca))
+
+
+### ✅ Tests
+
+* **platform:** assert display metadata on the decoded push body for all three finding branches ([2dbf0c5](https://github.com/getplumber/plumber/commit/2dbf0c51f59bd67b247ea6d5fc3c50fcd7a309ad))
+* **platform:** pin the review-flagged guards from the platform-mode audit ([8261477](https://github.com/getplumber/plumber/commit/8261477b5517446daae54bff6f879dce69b8d086)), closes [#431](https://github.com/getplumber/plumber/issues/431)
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.50 refs [skip ci] ([39b2b67](https://github.com/getplumber/plumber/commit/39b2b67cf1cc5ee5dff464b5e0d7682514cb5b1b))
+
+## [0.4.50](https://github.com/getplumber/plumber/compare/v0.4.49...v0.4.50) (2026-08-31)
+
+
+### ✨ Features
+
+* **platform:** export include job attribution and consume includes[].jobs ([619949c](https://github.com/getplumber/plumber/commit/619949c6763f1eb4f7eae43f838f63133016b1a6))
+* **platform:** fetch policies and collected data from the platform ([9e3fb7e](https://github.com/getplumber/plumber/commit/9e3fb7ed66d47d937a2adc14ee3d0bcf9dbacf27))
+* **platform:** fire the resolve request at setup and collect it at first use ([97656cb](https://github.com/getplumber/plumber/commit/97656cb5a5ad2805c469b7ed88acda666071de46))
+
+
+### 🐛 Bug Fixes
+
+* **cmd:** compare the checkout remote to --gitlab-url ignoring the scheme ([bdc398e](https://github.com/getplumber/plumber/commit/bdc398ebe985d0d3824fc9387b961fd34958e45d))
+* **gitlab:** a platform cache miss is not an authoritative empty variables listing ([4c6f96e](https://github.com/getplumber/plumber/commit/4c6f96e12ec485db6a32868d700a9cd38fadf4af))
+* **gitlab:** normalise the nested-include comparison and export SplitComponentPath ([81322b0](https://github.com/getplumber/plumber/commit/81322b0122c5fd534fce0b344aa5e5d560416bee))
+* **platform:** drop the sync ResolveRunConfig wrapper the deadcode gate rejects ([9f2bb87](https://github.com/getplumber/plumber/commit/9f2bb87210ceac50c83cd0b99b21ca2a4679dba6))
+* **platform:** push effective_config as the flat per-provider controls map ([fd04954](https://github.com/getplumber/plumber/commit/fd049544f313c51da7b8b0ca5ddba4e93f54c004))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.49 refs [skip ci] ([0c96d72](https://github.com/getplumber/plumber/commit/0c96d722cda12c0049f05979c7e19dfa4f1df1ad))
+
+## [0.4.49](https://github.com/getplumber/plumber/compare/v0.4.48...v0.4.49) (2026-08-31)
+
+
+### 🐛 Bug Fixes
+
+* **ci:** treat a review that completes without structured output as zero findings ([fb00f18](https://github.com/getplumber/plumber/commit/fb00f18348f7e149a1daa03a159f710e2358a637))
+
+
+### ✅ Tests
+
+* **cli:** pin that --no-controls keeps collected include versions ([a6ab96d](https://github.com/getplumber/plumber/commit/a6ab96df5fa33698438a3d208d60b298e97cf3e2)), closes [#435](https://github.com/getplumber/plumber/issues/435)
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.48 refs [skip ci] ([c5bb99e](https://github.com/getplumber/plumber/commit/c5bb99e31f9581bd75925686c9bfc9bb599915c3))
+
+## [0.4.48](https://github.com/getplumber/plumber/compare/v0.4.47...v0.4.48) (2026-08-28)
+
+
+### ✨ Features
+
+* **cli:** add --no-controls to produce artifacts without a verdict ([0768e95](https://github.com/getplumber/plumber/commit/0768e95a38a64bdbdfac0e6d57ff7e90a6b0f767))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.47 refs [skip ci] ([515390b](https://github.com/getplumber/plumber/commit/515390bd199eab3dab6c4fb948c15e2dd8ec7c54))
+
+## [0.4.47](https://github.com/getplumber/plumber/compare/v0.4.46...v0.4.47) (2026-08-28)
+
+
+### ✨ Features
+
+* **controls:** grade artipacked by exploitability (ISSUE-307 low + ISSUE-310 high) ([d76162c](https://github.com/getplumber/plumber/commit/d76162c14918caba91b67f5e13294e5976835504))
+* **controls:** ship checkoutMustNotPersistCredentials (ISSUE-307) ([4ff3a9d](https://github.com/getplumber/plumber/commit/4ff3a9d7f5fb1986c0dd313eae1f908e9827784a))
+
+
+### 🐛 Bug Fixes
+
+* **controls:** finish the ISSUE-310 wiring ([210aad6](https://github.com/getplumber/plumber/commit/210aad6af7ab6641a59bacce29666b3013214878))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.46 refs [skip ci] ([fa2385f](https://github.com/getplumber/plumber/commit/fa2385fc109164e9d59088dbaecdf0ae1e3c2d91))
+
+## [0.4.46](https://github.com/getplumber/plumber/compare/v0.4.45...v0.4.46) (2026-08-28)
+
+
+### ✨ Features
+
+* **controls:** extend ISSUE-215 to github.event.inputs (gated) ([3bce177](https://github.com/getplumber/plumber/commit/3bce177e389df5efd9049bc57c41b0a01725dfd3))
+
+
+### 🐛 Bug Fixes
+
+* **policies:** drop the trigger gate on github.event.inputs ([98fe157](https://github.com/getplumber/plumber/commit/98fe1573ac70fb21dd1001d0f13d20ac41609fc9))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.45 refs [skip ci] ([7c463a9](https://github.com/getplumber/plumber/commit/7c463a9871d0d413640b2f64d2eadbdd6bec5031))
+
+## [0.4.45](https://github.com/getplumber/plumber/compare/v0.4.44...v0.4.45) (2026-08-28)
+
+
+### 🐛 Bug Fixes
+
+* **policies:** one finding per dangerous variable in unsafe-variable-expansion ([1f78450](https://github.com/getplumber/plumber/commit/1f78450f26cd7593d231e878d2ca288f525db1d8))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.44 refs [skip ci] ([c0cf184](https://github.com/getplumber/plumber/commit/c0cf184c0534104cd3fbd7f828056c2910f83cad))
+
+## [0.4.44](https://github.com/getplumber/plumber/compare/v0.4.43...v0.4.44) (2026-08-26)
+
+
+### ✨ Features
+
+* **controls:** add projectMustHaveSecurityPolicySource (ISSUE-601, GitLab Ultimate) and renumber workflowsMustHaveExplicitName to ISSUE-422 for site parity ([9d62204](https://github.com/getplumber/plumber/commit/9d6220491a232849a331b6963a23248792345905))
+
+
+### 🐛 Bug Fixes
+
+* **controls:** address review on the security policy source control ([0217d76](https://github.com/getplumber/plumber/commit/0217d76eae448a0fef640b3cbe0c9b518b3c1d9a))
+
+
+### 📚 Documentation
+
+* **controls:** update controls doc to make it more precise ([1eaca39](https://github.com/getplumber/plumber/commit/1eaca399400a00c598f3482991ecee6385c6fc80))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.43 refs [skip ci] ([cfb0484](https://github.com/getplumber/plumber/commit/cfb0484442e90b18d15a741dc9ad660057906e52))
+
+## [0.4.43](https://github.com/getplumber/plumber/compare/v0.4.42...v0.4.43) (2026-08-26)
+
+
+### ✨ Features
+
+* **controls:** add mergeRequestSettingsMustBeCompliant (ISSUE-506) with a conditional Premium/Ultimate caveat for merge-train and merged-pipeline expectations ([6345dc4](https://github.com/getplumber/plumber/commit/6345dc4fafa5f820c88adb0c819f2d6d70436608))
+* **controls:** make ISSUE-503 approval-settings findings read as current-vs-expected and add a Premium/Ultimate tier caveat when no protections are in effect ([deacbfb](https://github.com/getplumber/plumber/commit/deacbfb61edd900d1921c97b61739926ae7b9cfe))
+
+
+### 🐛 Bug Fixes
+
+* **controls:** address review on the MR approval/settings controls ([a70ef57](https://github.com/getplumber/plumber/commit/a70ef57aacd44906a8bfbf5e0f93a666427e2986))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.42 refs [skip ci] ([4d247c2](https://github.com/getplumber/plumber/commit/4d247c293183c21f81c6c5539da52980b4a8fcb3))
+
+## [0.4.42](https://github.com/getplumber/plumber/compare/v0.4.41...v0.4.42) (2026-08-25)
+
+
+### ✨ Features
+
+* **controls:** Add MR approval rules controls ([a2dfb69](https://github.com/getplumber/plumber/commit/a2dfb6961365ed99684a54780ed0cc1bca4842b7)), closes [#412](https://github.com/getplumber/plumber/issues/412)
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.41 refs [skip ci] ([0baded9](https://github.com/getplumber/plumber/commit/0baded912f54e9f112455a5b33892bfcbf909054))
+
+## [0.4.41](https://github.com/getplumber/plumber/compare/v0.4.40...v0.4.41) (2026-08-24)
+
+
+### ✨ Features
+
+* **controls:** Import variables protected and masked controls ([8e9cdf0](https://github.com/getplumber/plumber/commit/8e9cdf0d1becfe06b556551acdc11ed731e60d03))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.40 refs [skip ci] ([91cd7c2](https://github.com/getplumber/plumber/commit/91cd7c2f4bbf9cca2ee90ebb3d25c2e58cc7e53a))
+
+## [0.4.40](https://github.com/getplumber/plumber/compare/v0.4.39...v0.4.40) (2026-08-21)
+
+
+### 🐛 Bug Fixes
+
+* **docker:** stamp version metadata into the published image ([f88e404](https://github.com/getplumber/plumber/commit/f88e404a1e60aaa17b4d4b302278cf18713cc93c)), closes [#425](https://github.com/getplumber/plumber/issues/425)
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.39 refs [skip ci] ([e93967c](https://github.com/getplumber/plumber/commit/e93967c99ed5d579ecc514d805b6367405d1ffc1))
+
+## [0.4.39](https://github.com/getplumber/plumber/compare/v0.4.38...v0.4.39) (2026-08-17)
+
+
+### ✨ Features
+
+* **ci:** Add findings control library ([8864b2d](https://github.com/getplumber/plumber/commit/8864b2d14d7c1b43c0565afbfe26cfb97be34e98))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.38 refs [skip ci] ([a5fccb7](https://github.com/getplumber/plumber/commit/a5fccb72f5f47c68d97880f39448f5d64a6ca826))
+
+## [0.4.38](https://github.com/getplumber/plumber/compare/v0.4.37...v0.4.38) (2026-08-17)
+
+
+### ✨ Features
+
+* **ci:** restore the contract platform push, key results by policy_id, act on the gate block ([43dd0f8](https://github.com/getplumber/plumber/commit/43dd0f8ad165627350af8d4669fadb01e78c1ffc)), closes [#410](https://github.com/getplumber/plumber/issues/410)
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.37 refs [skip ci] ([c1a149f](https://github.com/getplumber/plumber/commit/c1a149fc13a719e337d9a310ed4cca807996c03b))
+
+## [0.4.37](https://github.com/getplumber/plumber/compare/v0.4.36...v0.4.37) (2026-08-16)
+
+
+### ✨ Features
+
+* **ci:** Add --platform feature to integrate pushing of results per policy ([d6c5d84](https://github.com/getplumber/plumber/commit/d6c5d8480737b3297721631a0c4c6e3f4dae39c4))
+
+
+### 🐛 Bug Fixes
+
+* **ci:** bump Go toolchain to 1.26.6 for stdlib security fixes ([73f5ebe](https://github.com/getplumber/plumber/commit/73f5ebe36ba21a3620b451aa9bb0d0ba0c731915))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.36 refs [skip ci] ([77eb302](https://github.com/getplumber/plumber/commit/77eb302508a01932990e16b31463b3f7cc5014d9))
+
+## [0.4.36](https://github.com/getplumber/plumber/compare/v0.4.35...v0.4.36) (2026-08-10)
+
+
+### 🔧 Chores
+
+* **deps:** bump github.com/open-policy-agent/opa ([f04befa](https://github.com/getplumber/plumber/commit/f04befad7511df8ad8700b2866953a692fbd034d))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.35 refs [skip ci] ([3b308ff](https://github.com/getplumber/plumber/commit/3b308ffa808f70522aee42bdca07ebba40a65418))
+
+## [0.4.35](https://github.com/getplumber/plumber/compare/v0.4.34...v0.4.35) (2026-08-08)
+
+
+### 🐛 Bug Fixes
+
+* **config:** embed the shipped default in place ([a27b4a5](https://github.com/getplumber/plumber/commit/a27b4a5c465f19603000f02d08f7abedfcfe30a9)), closes [#405](https://github.com/getplumber/plumber/issues/405)
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.34 refs [skip ci] ([d4bf27b](https://github.com/getplumber/plumber/commit/d4bf27b3709de1b20d675309b7b02e085eba548a))
+
+## [0.4.34](https://github.com/getplumber/plumber/compare/v0.4.33...v0.4.34) (2026-08-07)
+
+
+### ✨ Features
+
+* **identity:** expose the finding-identity recipe and make job mean a job ([e7af327](https://github.com/getplumber/plumber/commit/e7af3273786dd9f332c0474697b4fd0393fb8fe4)), closes [#403](https://github.com/getplumber/plumber/issues/403)
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.33 refs [skip ci] ([4a0c59d](https://github.com/getplumber/plumber/commit/4a0c59d189a408924c01cdde8b87b2e0c0e64aa7))
+
+## [0.4.33](https://github.com/getplumber/plumber/compare/v0.4.32...v0.4.33) (2026-08-07)
+
+
+### 🐛 Bug Fixes
+
+* **github:** normalize SHA case and peel nested tag objects ([fbfacde](https://github.com/getplumber/plumber/commit/fbfacdedfde62fefad673085727c7cde74f32e84))
+* **github:** resolve action pins that name an annotated tag object ([4016170](https://github.com/getplumber/plumber/commit/4016170c336cc4921a83a36862a615f58e9d37a1)), closes [#401](https://github.com/getplumber/plumber/issues/401)
+
+
+### ⚡ Performance
+
+* **github:** skip the tag object probe for refs that cannot be one ([eb9c669](https://github.com/getplumber/plumber/commit/eb9c669db0123a790c81f11aedf5e1ab085c591e))
+
+
+### 🔧 Chores
+
+* drop a stray worktree entry committed by mistake ([82c947f](https://github.com/getplumber/plumber/commit/82c947f3d3ee8c81f8148f928cac548fe3cf5036))
+
+
+### 📚 Documentation
+
+* **github:** record that the fork blind spot now covers tag objects ([4eeee96](https://github.com/getplumber/plumber/commit/4eeee967332e87e3ebda2da71a30fad3983ad4e3))
+
+
+### ✅ Tests
+
+* **github:** lock the collector-to-IR metadata handoff ([ccfc59b](https://github.com/getplumber/plumber/commit/ccfc59b39ef4cffd4d866b1620b2b9d61c754c9c))
+* **github:** lock the zero-cost happy path for the tag object fallback ([fae517e](https://github.com/getplumber/plumber/commit/fae517e590f5c295852b9c5977b58dec5b5a2b6a))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.32 refs [skip ci] ([e84e2c0](https://github.com/getplumber/plumber/commit/e84e2c078d9e34a0b995098180746d3e4d191ccc))
+
+## [0.4.32](https://github.com/getplumber/plumber/compare/v0.4.31...v0.4.32) (2026-08-06)
+
+
+### ✨ Features
+
+* **sarif:** surface the issue code, doc link and stable alert identity in GHAS ([74691c6](https://github.com/getplumber/plumber/commit/74691c621040606428f6e074f013498df68b01fc)), closes [#372](https://github.com/getplumber/plumber/issues/372)
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.31 refs [skip ci] ([c75127f](https://github.com/getplumber/plumber/commit/c75127f9cd1b768dad098271331e7851f517040c))
+
+## [0.4.31](https://github.com/getplumber/plumber/compare/v0.4.30...v0.4.31) (2026-08-06)
+
+
+### 🔧 Chores
+
+* **ci:** bump the github-actions group across 1 directory with 5 updates ([c67b731](https://github.com/getplumber/plumber/commit/c67b7313b65dea89a7d108ac6a5575f3b3f7e8f5))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.30 refs [skip ci] ([75037fd](https://github.com/getplumber/plumber/commit/75037fd51c29c09c5f59172d0b1eb74754df7018))
+
+## [0.4.30](https://github.com/getplumber/plumber/compare/v0.4.29...v0.4.30) (2026-08-05)
+
+
+### 🐛 Bug Fixes
+
+* **misc:** Update various stale documentation and fix incorrect array size in catalog ([98b399a](https://github.com/getplumber/plumber/commit/98b399a98485a4c4b7c2ea8dcc4e59997502507d))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.29 refs [skip ci] ([72d4610](https://github.com/getplumber/plumber/commit/72d461056e592082b2747a72196ea5a1266e7ac5))
+
+## [0.4.29](https://github.com/getplumber/plumber/compare/v0.4.28...v0.4.29) (2026-08-05)
+
+
+### ✨ Features
+
+* **artifacts:** Add controlName in the outputs + add status for json output  + add csv format ([c9a08b4](https://github.com/getplumber/plumber/commit/c9a08b4c106d18790c09cdc0cc63619c755333ca))
+* **artifacts:** stable per-finding fingerprint in JSON, CSV, SARIF, GLSAST ([faf7040](https://github.com/getplumber/plumber/commit/faf70406bd8b56a4063c8d0fea5ad330d7dc71f0))
+* **cli:** add OCSF Compliance Finding export (--ocsf) ([9a7ef68](https://github.com/getplumber/plumber/commit/9a7ef68547acef19fd4c31a473c31ae843b690f4))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.28 refs [skip ci] ([0637800](https://github.com/getplumber/plumber/commit/0637800ee26dafb61ef2763d787b31210c69b645))
+
+## [0.4.28](https://github.com/getplumber/plumber/compare/v0.4.27...v0.4.28) (2026-08-03)
+
+
+### 🐛 Bug Fixes
+
+* **github:** resolve default branch even when branchMustBeProtected is off ([3fed560](https://github.com/getplumber/plumber/commit/3fed560c051fc32706c5b7365874841883430dc7))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.27 refs [skip ci] ([7b8933d](https://github.com/getplumber/plumber/commit/7b8933da38fabe2dca6d2dfc5e940da2d86fdd72))
+
+## [0.4.27](https://github.com/getplumber/plumber/compare/v0.4.26...v0.4.27) (2026-08-03)
+
+
+### 🐛 Bug Fixes
+
+* **lint:** report all issues instead of golangci-lint's truncated default ([cb5739a](https://github.com/getplumber/plumber/commit/cb5739adcaf0ff3ad69901febd1f238d1aa8ee5a))
+
+
+### ♻️ Refactoring
+
+* remove 50 dead functions unreachable from main ([a28393c](https://github.com/getplumber/plumber/commit/a28393ca6bc1e6ba9c4620a3daeaade415ff8122))
+
+
+### ✅ Tests
+
+* **config:** cover GitLab trustedUrls narrowing with includePlumberDefaults to false ([46f09ed](https://github.com/getplumber/plumber/commit/46f09ed7d79a75e7f46577fb5132ea85d37f1e82)), closes [#365](https://github.com/getplumber/plumber/issues/365)
+
+
+### 👷 CI/CD
+
+* **lint:** gate on whole-program dead code detection ([0aac54c](https://github.com/getplumber/plumber/commit/0aac54c5fe9cbf6f5f52372f81c45c78ef7becbb))
+* **release:** pin v0.4.26 refs [skip ci] ([e461736](https://github.com/getplumber/plumber/commit/e461736d107dcf87c104cf776bb8e517924cd89b))
+
+## [0.4.26](https://github.com/getplumber/plumber/compare/v0.4.25...v0.4.26) (2026-07-31)
+
+
+### 🐛 Bug Fixes
+
+* **config:** trust getplumber/* actions in the shipped default config ([771ec58](https://github.com/getplumber/plumber/commit/771ec58e9f9b6a32a4eced9e2f66eef5166a52a0))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.25 refs [skip ci] ([65c0c08](https://github.com/getplumber/plumber/commit/65c0c08e88246f0ebdae9f4b654f359ddedb67d6))
+
+## [0.4.25](https://github.com/getplumber/plumber/compare/v0.4.24...v0.4.25) (2026-07-31)
+
+
+### ✨ Features
+
+* **config:** layered .plumber.yaml configuration ([17d3fdb](https://github.com/getplumber/plumber/commit/17d3fdb55db4e305ad5de900a614a598c4a27193)), closes [#375](https://github.com/getplumber/plumber/issues/375)
+* **defaultconfig:** curate the shipped default and source `config init` from it ([aebf2d1](https://github.com/getplumber/plumber/commit/aebf2d1d5d1160e2ea58eabf42419261e127a26c)), closes [#1](https://github.com/getplumber/plumber/issues/1)
+
+
+### 🐛 Bug Fixes
+
+* **control:** avoid allocation-size-overflow pattern flagged by CodeQL ([c6bca30](https://github.com/getplumber/plumber/commit/c6bca306a6938f9c4bbea4a06dfa76197afba838))
+
+
+### 🔧 Chores
+
+* **defaultconfig:** simplify the embedded-default build pipeline ([f55c7de](https://github.com/getplumber/plumber/commit/f55c7debec78b391a4d7f830d786e4ebe0077f1e))
+
+
+### ✅ Tests
+
+* adapt self-scan parity/gating tests to the GitHub-only self-scan config ([9c53bc2](https://github.com/getplumber/plumber/commit/9c53bc2a25971c4b581205664291be8b4956b47a))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.24 refs [skip ci] ([c90df59](https://github.com/getplumber/plumber/commit/c90df592871aa02473b288381e20ee59bdf002f3))
+
+## [0.4.24](https://github.com/getplumber/plumber/compare/v0.4.23...v0.4.24) (2026-07-31)
+
+
+### 🔧 Chores
+
+* **readme:** smooth token-free scan wording ([8bc4c80](https://github.com/getplumber/plumber/commit/8bc4c807d1ed418599a1c466a32c0ae2d210b00a))
+
+
+### 📚 Documentation
+
+* **readme:** tidy config comment and auth wording ([b1e4ff7](https://github.com/getplumber/plumber/commit/b1e4ff7dc9245513a91dba8a1a20bba114902d09))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.23 refs [skip ci] ([cf6b908](https://github.com/getplumber/plumber/commit/cf6b908389f5a6b2719866a4dbedcd2b864644a8))
+
+## [0.4.23](https://github.com/getplumber/plumber/compare/v0.4.22...v0.4.23) (2026-07-30)
+
+
+### ✨ Features
+
+* **gitlab:** allow an embedding host to inject a shared HTTP client ([2579221](https://github.com/getplumber/plumber/commit/2579221ef7f4ea771aaa8d1968d92d82b179688f))
+
+
+### ✅ Tests
+
+* **gitlab:** integration — a real Fetch collects through the injected client ([84e18ee](https://github.com/getplumber/plumber/commit/84e18eed4fdbd913554b1294f2ded84f10450329))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.22 refs [skip ci] ([3851e87](https://github.com/getplumber/plumber/commit/3851e87e25f45997c8cb646895e821958c56e57e))
+
+## [0.4.22](https://github.com/getplumber/plumber/compare/v0.4.21...v0.4.22) (2026-07-29)
+
+
+### 🔧 Chores
+
+* **ci:** bump the github-actions group with 9 updates ([2b22f47](https://github.com/getplumber/plumber/commit/2b22f4784c17d02215b7ed31c7ae586241a03755))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.21 refs [skip ci] ([21941df](https://github.com/getplumber/plumber/commit/21941df6be4ddeb5eb6f6e156ded3e8faebf272e))
+
+## [0.4.21](https://github.com/getplumber/plumber/compare/v0.4.20...v0.4.21) (2026-07-29)
+
+
+### 🐛 Bug Fixes
+
+* **ci:** Merge dependabot same type ([2d42c8c](https://github.com/getplumber/plumber/commit/2d42c8c114ca20860e55128a7816d4c9689256f4))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.20 refs [skip ci] ([0fe1eef](https://github.com/getplumber/plumber/commit/0fe1eef31011169b4086487a74b8134ad020cba4))
+
+## [0.4.20](https://github.com/getplumber/plumber/compare/v0.4.19...v0.4.20) (2026-07-29)
+
+
+### 🐛 Bug Fixes
+
+* **ci:** Component version not getting autoamtically bumped. Remove extra text from PR. change default pr names ([5b8e3ef](https://github.com/getplumber/plumber/commit/5b8e3efaf75a2090007c035f25e2a67100db984d))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.19 refs [skip ci] ([9da670e](https://github.com/getplumber/plumber/commit/9da670ee9fe9a3ac2be203cd7d8d4fc101f26c11))
+
+## [0.4.19](https://github.com/getplumber/plumber/compare/v0.4.18...v0.4.19) (2026-07-29)
+
+
+### 🐛 Bug Fixes
+
+* **ci:** PR body when writing to website ([5ee0d15](https://github.com/getplumber/plumber/commit/5ee0d15b4d299a746961a5d4b1f51c6cf920b89d))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.18 refs [skip ci] ([e91e449](https://github.com/getplumber/plumber/commit/e91e4492b1386e1030dff831ddfbc861e63687ad))
+
+## [0.4.18](https://github.com/getplumber/plumber/compare/v0.4.17...v0.4.18) (2026-07-29)
+
+
+### ✨ Features
+
+* **ci:** Automate component and documentation upgrade ([a0fea4a](https://github.com/getplumber/plumber/commit/a0fea4a57389236bcd14b4a7bce2f4fe2eee3708))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.17 refs [skip ci] ([6371abc](https://github.com/getplumber/plumber/commit/6371abc35796f8809bce3188309e7c896217d1e0))
+
+## [0.4.17](https://github.com/getplumber/plumber/compare/v0.4.16...v0.4.17) (2026-07-29)
+
+
+### 🐛 Bug Fixes
+
+* **conf:** restore gitlab controls in self-scan .plumber.yaml ([34a4cbf](https://github.com/getplumber/plumber/commit/34a4cbf8dd84a49b1282b7e2dbb3f56f2c53ad27))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.16 refs [skip ci] ([cbb9172](https://github.com/getplumber/plumber/commit/cbb9172b5d8ad6de6002c1e8dfee749c9f90e970))
+
+## [0.4.16](https://github.com/getplumber/plumber/compare/v0.4.15...v0.4.16) (2026-07-24)
+
+
+### ✨ Features
+
+* **output:** restructure control output into clear Passed/Skipped/Failed sections ([78b576f](https://github.com/getplumber/plumber/commit/78b576f8451f2af02381f4f1c7efbdca559682fb))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.15 refs [skip ci] ([5ad6b54](https://github.com/getplumber/plumber/commit/5ad6b5472460107be9975c155930f86bbc2adbd3))
+
+## [0.4.15](https://github.com/getplumber/plumber/compare/v0.4.14...v0.4.15) (2026-07-24)
+
+
+### 🐛 Bug Fixes
+
+* **controls:** don't score GitHub-only controls on GitLab runs — gate findings by provider applicability so plumberScore.counts matches the rendered controls ([#349](https://github.com/getplumber/plumber/issues/349)) ([6cc38ec](https://github.com/getplumber/plumber/commit/6cc38ecc7d179f7d3588dd9aa72d5f53751300a8))
+
+
+### 📚 Documentation
+
+* **template:** Update comment in template and add version reference section in contributing ([5a6ec4e](https://github.com/getplumber/plumber/commit/5a6ec4e9a0de87361a6fdfd7abb243e1e3b23a50))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.14 refs [skip ci] ([f85f762](https://github.com/getplumber/plumber/commit/f85f762b466720b949c5da9d13274ee0e5beb4fe))
+
+## [0.4.14](https://github.com/getplumber/plumber/compare/v0.4.13...v0.4.14) (2026-07-24)
+
+
+### 🐛 Bug Fixes
+
+* **ci:** Fix vuln and update grype ref ([6607bb8](https://github.com/getplumber/plumber/commit/6607bb863630b098daf8feda0c17a030efb5c309))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.13 refs [skip ci] ([8472496](https://github.com/getplumber/plumber/commit/8472496e62395bc130896b5e8a17d302539b0730))
+
+## [0.4.13](https://github.com/getplumber/plumber/compare/v0.4.12...v0.4.13) (2026-07-24)
+
+
+### ✨ Features
+
+* **cli:** fall back to the built-in default config when no .plumber.yaml is found instead of failing, so scans work with zero setup. Remove the redundant config baked into the Docker image and drop the stale 'global config' wording ([#326](https://github.com/getplumber/plumber/issues/326)). ([9a1ea62](https://github.com/getplumber/plumber/commit/9a1ea62a70fc3314e26f0bd40a4b8365125c93e8))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.12 refs [skip ci] ([9da2169](https://github.com/getplumber/plumber/commit/9da2169c9fbc082c36158fe6769d7a9cf2750f2b))
+
+## [0.4.12](https://github.com/getplumber/plumber/compare/v0.4.11...v0.4.12) (2026-07-20)
+
+
+### 🐛 Bug Fixes
+
+* **cli:** clearer, less noisy terminal output for analyze ([f33fe10](https://github.com/getplumber/plumber/commit/f33fe10649fdfac19ace44aa51ce0cbc80c3098f))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.11 refs [skip ci] ([a24f952](https://github.com/getplumber/plumber/commit/a24f9528fc5b0c70573bcfd114d8b55b59282cd0))
+
+## [0.4.11](https://github.com/getplumber/plumber/compare/v0.4.10...v0.4.11) (2026-07-20)
+
+
+### ✨ Features
+
+* **controls:** actionsMustNotExecuteMutableRemoteCode (ISSUE-714/715/716) ([4357428](https://github.com/getplumber/plumber/commit/43574281418d8599a849659a6d5469aff9df904b)), closes [#295](https://github.com/getplumber/plumber/issues/295)
+* **github:** detect mutable exec in Docker-image actions ([18be485](https://github.com/getplumber/plumber/commit/18be485a140dd10b26c1400c6639b154f2d9b7cd))
+
+
+### 🐛 Bug Fixes
+
+* **control:** emit actionsMustNotExecuteMutableRemoteCode findings in JSON output ([ceb92e4](https://github.com/getplumber/plumber/commit/ceb92e4b5b531bdc6e5b9d602ba8339f91ebaeee))
+* **github:** cut false positives in actionsMustNotExecuteMutableRemoteCode and gate its source fetch on the control being enabled ([#299](https://github.com/getplumber/plumber/issues/299)) ([46ed6c5](https://github.com/getplumber/plumber/commit/46ed6c50fb114dd71f077a508a29f4edad0c8c5b))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.10 refs [skip ci] ([a7e5614](https://github.com/getplumber/plumber/commit/a7e5614cf3e22c337d32797d1d9584a6a401cb2a))
+
+## [0.4.10](https://github.com/getplumber/plumber/compare/v0.4.9...v0.4.10) (2026-07-20)
+
+
+### 🐛 Bug Fixes
+
+* **cli:** render the progress bar only on a TTY, clarify --print vs --verbose semantics, drop dead LogLevel ([#309](https://github.com/getplumber/plumber/issues/309)) ([7fbc954](https://github.com/getplumber/plumber/commit/7fbc9541716eba7fa8b4457052ec724c5d94a1e0))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.9 refs [skip ci] ([4352de9](https://github.com/getplumber/plumber/commit/4352de9147ff008b56ae37f601d362be1e255ee8))
+
+## [0.4.9](https://github.com/getplumber/plumber/compare/v0.4.8...v0.4.9) (2026-07-20)
+
+
+### ✨ Features
+
+* **controls:** Rename jobName to job. Add uses and ref to the output, highlighting offending lines better ([70b3c24](https://github.com/getplumber/plumber/commit/70b3c24c2a6a2ff3f7357d371066d77c49e1d8d0))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.8 refs [skip ci] ([cca202e](https://github.com/getplumber/plumber/commit/cca202e5bcaac15f576e77390aa9cfda8b878d27))
+
+## [0.4.8](https://github.com/getplumber/plumber/compare/v0.4.7...v0.4.8) (2026-07-16)
+
+
+### 🔧 Chores
+
+* **ci:** bump actions/setup-node from 6.4.0 to 7.0.0 ([97ddc98](https://github.com/getplumber/plumber/commit/97ddc985aea3d4df10684d102fe420a65ec6c811))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.7 refs [skip ci] ([0d2e256](https://github.com/getplumber/plumber/commit/0d2e2565c73e0ea0ec223eef61b07f371d9bfdf3))
+
+## [0.4.7](https://github.com/getplumber/plumber/compare/v0.4.6...v0.4.7) (2026-07-16)
+
+
+### 🔧 Chores
+
+* **ci:** bump docker/metadata-action from 6.1.0 to 6.2.0 ([dfaef4f](https://github.com/getplumber/plumber/commit/dfaef4f3d6875a84d4f5e42ba6c7f5e62c394f57))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.6 refs [skip ci] ([89d5b1d](https://github.com/getplumber/plumber/commit/89d5b1daab297cd72e370b38e23dcef0bd708754))
+
+## [0.4.6](https://github.com/getplumber/plumber/compare/v0.4.5...v0.4.6) (2026-07-16)
+
+
+### 🔧 Chores
+
+* **ci:** bump github/codeql-action/autobuild from 4.36.2 to 4.37.0 ([ba7655e](https://github.com/getplumber/plumber/commit/ba7655e999c794f77c219a251213a07e6aec3c69))
+* **ci:** bump github/codeql-action/init from 4.36.2 to 4.37.0 and bump github/codeql-action/analyze from 4.36.2 to 4.37.0 ([4c18e43](https://github.com/getplumber/plumber/commit/4c18e43380848976576a6dc4aab075acf2e1fa77))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.5 refs [skip ci] ([4100ab7](https://github.com/getplumber/plumber/commit/4100ab787380b16237b62ac794b5faf357e3b656))
+
+## [0.4.5](https://github.com/getplumber/plumber/compare/v0.4.4...v0.4.5) (2026-07-16)
+
+
+### 🔧 Chores
+
+* **deps:** bump golang.org/x/term from 0.44.0 to 0.45.0 ([81627ba](https://github.com/getplumber/plumber/commit/81627ba4f58b6d8fb8e2145e07f65e377ed74ff8))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.4 refs [skip ci] ([aafbcee](https://github.com/getplumber/plumber/commit/aafbceed9f01d77beabd6e910dadccae7a64ece1))
+
+## [0.4.4](https://github.com/getplumber/plumber/compare/v0.4.3...v0.4.4) (2026-07-16)
+
+
+### 🔧 Chores
+
+* **cleanup:** Remove gitleaks fully ([a2ad6fb](https://github.com/getplumber/plumber/commit/a2ad6fb31a299c7ef102840a721f0dd45b1b36c4))
+
+
+### 📚 Documentation
+
+* **template:** Update commented version in template ([dace2c4](https://github.com/getplumber/plumber/commit/dace2c4e72445925e70764dd53c5632d301f41cb))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.3 refs [skip ci] ([3e7d693](https://github.com/getplumber/plumber/commit/3e7d6933189432f9a2ebcc2f6ba813bef7916179))
+
+## [0.4.3](https://github.com/getplumber/plumber/compare/v0.4.2...v0.4.3) (2026-07-14)
+
+
+### 🔧 Chores
+
+* use issue types instead of labels/title prefixes in bug_report.md ([989ff04](https://github.com/getplumber/plumber/commit/989ff0413d6ca786592fb4d0272dffeaa98a6089))
+* use issue types instead of labels/title prefixes in feature_request.md ([488592f](https://github.com/getplumber/plumber/commit/488592f0625d6b0cbebe30103d7308f338b5ed53))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.2 refs [skip ci] ([2276ce6](https://github.com/getplumber/plumber/commit/2276ce66e45b5abfcca13a22fa971efff518d322))
+
+## [0.4.2](https://github.com/getplumber/plumber/compare/v0.4.1...v0.4.2) (2026-07-10)
+
+
+### 🐛 Bug Fixes
+
+* **gate:** restore the pre-0.4.0 pass for GitHub repositories without (usable) workflows ([f22f5ef](https://github.com/getplumber/plumber/commit/f22f5efbf3115db3af0c17ec00f7329e936fd803))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.1 refs [skip ci] ([b885b8b](https://github.com/getplumber/plumber/commit/b885b8b7848ec3050932b658e06c368b79825287))
+
+## [0.4.1](https://github.com/getplumber/plumber/compare/v0.4.0...v0.4.1) (2026-07-10)
+
+
+### ✨ Features
+
+* **control:** Add control actionRefsMustExistUpstream that emits issue 707 ([b9817e3](https://github.com/getplumber/plumber/commit/b9817e3a9d5a907ae70c089bc75bc74a00afaf3e))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.4.0 refs [skip ci] ([ddcfee6](https://github.com/getplumber/plumber/commit/ddcfee676cb4ed67dc920460259b79ea0e4bd732))
+
+## [0.4.0](https://github.com/getplumber/plumber/compare/v0.3.101...v0.4.0) (2026-07-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* **gate:** the JSON report and the GitHub Action no longer expose
+'compliance'; 'passed' is redefined as 'score gate met'; the default
+artifact name changed to plumber-report. Runs with nothing scoreable
+now fail closed (exit 1): on GitHub, a repository with no workflows
+previously passed the compliance gate and now fails, and a
+configuration that enables zero controls for the scanned provider (or
+a skip-all filter) also fails instead of passing with a perfect
+score. Skip Plumber or use soft-fail on repos that intentionally have
+no CI.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+### ✨ Features
+
+* **gate:** gate runs on the Plumber Score, drop the compliance percentage ([2bd2639](https://github.com/getplumber/plumber/commit/2bd26393123ebe29f2d6c04c4acbc5f54c055413)), closes [#320](https://github.com/getplumber/plumber/issues/320) [#320](https://github.com/getplumber/plumber/issues/320)
+
+
+### 👷 CI/CD
+
+* **claude:** use claude-opus-4-8 for PR review checks ([0c65684](https://github.com/getplumber/plumber/commit/0c65684441d67fcc9fe10ba07b4f4a25c73e9f48))
+* **release:** pin v0.3.101 refs [skip ci] ([e209f31](https://github.com/getplumber/plumber/commit/e209f31449268f99df14022cc39a0e20b5768d6c))
+
+## [0.3.101](https://github.com/getplumber/plumber/compare/v0.3.100...v0.3.101) (2026-07-10)
+
+
+### ✨ Features
+
+* **control:** Add control to check for cache poisoning releaseWorkflowsMustNotRestoreUntrustedCache ([2272c47](https://github.com/getplumber/plumber/commit/2272c47479e1cd53e0c684e2804d4f07cceb0f9d))
+
+
+### 🐛 Bug Fixes
+
+* **control:** close review FP/FN gaps in cache-poisoning control ([6b3a01b](https://github.com/getplumber/plumber/commit/6b3a01b1bce0de1bc26c995b921ec64aa5f495ef))
+* **control:** Fix init to contain more default values ([3b37256](https://github.com/getplumber/plumber/commit/3b37256855fb15fb1c13abaf34f16e1bce4e9c81))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.100 refs [skip ci] ([3baf582](https://github.com/getplumber/plumber/commit/3baf582fea1f3240979cacfc03435410006c847a))
+
+## [0.3.100](https://github.com/getplumber/plumber/compare/v0.3.99...v0.3.100) (2026-07-09)
+
+
+### 🐛 Bug Fixes
+
+* **docker:** build with Go 1.26.5 to clear GO-2026-4970 (Container Scan) ([7d7921d](https://github.com/getplumber/plumber/commit/7d7921d79f195eef8c0eb39360977f0783956850))
+
+
+### 👷 CI/CD
+
+* add advisory Claude PR review automation ([3d2dca6](https://github.com/getplumber/plumber/commit/3d2dca6b45445ec7f9b93806203c3d919f1e9bd4))
+* **claude:** close review-agent secret-exfil surface + dedup/reliability ([e0d4057](https://github.com/getplumber/plumber/commit/e0d40577752eb1e1ddcd59c2f4fe91239021d4de))
+* **claude:** extract poster logic to a unit-tested module ([ad39721](https://github.com/getplumber/plumber/commit/ad39721b8c87cdf4cc945ca6a9d1d05a0bf14e84))
+* **claude:** fix dedup/redaction/sandbox issues from self-review ([26ae307](https://github.com/getplumber/plumber/commit/26ae3074c503261c1370fca8ae4eb496bbd5b537))
+* **claude:** fix fingerprint/sanitize/parse bugs + add a relevance bar ([c370371](https://github.com/getplumber/plumber/commit/c3703715fdfbacaa83917418f177c4bc963b7b4b))
+* **claude:** fix stateful posting bugs from cursor review ([897d3d1](https://github.com/getplumber/plumber/commit/897d3d11357e552702fb64271758bf025578ade2))
+* **claude:** harden dedup fence, unanchored-on-failure, multi-line summary ([7748dd9](https://github.com/getplumber/plumber/commit/7748dd9ae40ee73536cf189a623c245d182c7628))
+* **claude:** post each finding as a resolvable review comment ([5f6c56b](https://github.com/getplumber/plumber/commit/5f6c56b6f8c286e9b2eab0ce2f59e1a84f0652c0))
+* **claude:** prompt for whole-system, cross-run review ([c079b1a](https://github.com/getplumber/plumber/commit/c079b1ada13e2594eedff96e11894c27992d2595))
+* **claude:** semantic dedup of reworded findings via Haiku ([f23ee28](https://github.com/getplumber/plumber/commit/f23ee28a2c14371995b4af479d430f19a35f6e41))
+* **claude:** stop the review from reviewing its own machinery ([ab52069](https://github.com/getplumber/plumber/commit/ab520695521f454e07d6a3dedbaa2db8e2be6598))
+* **claude:** strip planted markers from untrusted finding text ([5a3d334](https://github.com/getplumber/plumber/commit/5a3d334398c855fcfb7044f0649c8bfc392a3614))
+* **claude:** use Sonnet for semantic dedup to cut duplicate comments ([902f900](https://github.com/getplumber/plumber/commit/902f900f1602980f7bfce0a9d9fc3e8d34d235a8))
+* fix scripts-test to pass the test file explicitly ([ffd7b4c](https://github.com/getplumber/plumber/commit/ffd7b4c4ae2794d7f39ab9c6bc58b1ea66718abe))
+* **release:** pin v0.3.99 refs [skip ci] ([8f851d5](https://github.com/getplumber/plumber/commit/8f851d55f1c95afd107da5c521be00d9a63eab52))
+
+## [0.3.99](https://github.com/getplumber/plumber/compare/v0.3.98...v0.3.99) (2026-07-08)
+
+
+### 🐛 Bug Fixes
+
+* **control:** Update control rendered display name for workflowMustNotExportEntireSecretsContext ([253822e](https://github.com/getplumber/plumber/commit/253822e4ce81b91f5ef1715cdca17d3153c009d0))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.98 refs [skip ci] ([adbdb12](https://github.com/getplumber/plumber/commit/adbdb12b03c95cf8faddf3ec44e44cdd2af86765))
+
+## [0.3.98](https://github.com/getplumber/plumber/compare/v0.3.97...v0.3.98) (2026-07-08)
+
+
+### 🐛 Bug Fixes
+
+* **build:** bump Go toolchain to 1.26.5 / 1.25.12 for GO-2026-5856 ([868b45e](https://github.com/getplumber/plumber/commit/868b45ebe51cf48ddf4c1feb9e96d3d030bb9e10))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.97 refs [skip ci] ([3f0c5d9](https://github.com/getplumber/plumber/commit/3f0c5d900738857d02d9adbdebd5a396ffb85fb4))
+
+## [0.3.97](https://github.com/getplumber/plumber/compare/v0.3.96...v0.3.97) (2026-07-08)
+
+
+### 🔧 Chores
+
+* **ci:** bump docker/login-action from 4.2.0 to 4.4.0 ([ae7e389](https://github.com/getplumber/plumber/commit/ae7e38900ec45d6fb6ad43b1ce9732f4d5932839))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.96 refs [skip ci] ([71c411f](https://github.com/getplumber/plumber/commit/71c411f1b351f3e169578faa87e12e90c2a3917a))
+
+## [0.3.96](https://github.com/getplumber/plumber/compare/v0.3.95...v0.3.96) (2026-07-08)
+
+
+### 🔧 Chores
+
+* **ci:** bump docker/setup-buildx-action from 4.1.0 to 4.2.0 ([1a91876](https://github.com/getplumber/plumber/commit/1a918760d64f9780246d4358b39fddc73560dba1))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.94 refs [skip ci] ([b682530](https://github.com/getplumber/plumber/commit/b6825301279e905030af84bb25a6c8b63ff4dcbb))
+* **release:** pin v0.3.95 refs [skip ci] ([f521eaf](https://github.com/getplumber/plumber/commit/f521eaf69aea4657be89031407e45813f7a92c55))
+
+## [0.3.95](https://github.com/getplumber/plumber/compare/v0.3.94...v0.3.95) (2026-07-08)
+
+
+### 🔧 Chores
+
+* **ci:** bump docker/build-push-action from 7.2.0 to 7.3.0 ([b5a767b](https://github.com/getplumber/plumber/commit/b5a767b0eefbfcef41b1cb231195a997480045fa))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.93 refs [skip ci] ([9344075](https://github.com/getplumber/plumber/commit/93440757b463896e276b3c19a930fa9720e5cb8b))
+
+## [0.3.94](https://github.com/getplumber/plumber/compare/v0.3.93...v0.3.94) (2026-07-08)
+
+
+### 🔧 Chores
+
+* **ci:** bump docker/setup-qemu-action from 4.1.0 to 4.2.0 ([c733df7](https://github.com/getplumber/plumber/commit/c733df7096f009bd5b3047ac951e55a222e3b103))
+
+## [0.3.93](https://github.com/getplumber/plumber/compare/v0.3.92...v0.3.93) (2026-07-08)
+
+
+### 🔧 Chores
+
+* **deps:** bump github.com/schollz/progressbar/v3 ([93df998](https://github.com/getplumber/plumber/commit/93df99856ae537e1f802b65f6c903203f322d1ca))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.91 refs [skip ci] ([d562715](https://github.com/getplumber/plumber/commit/d562715497640eaf6332b7d6fb15e91140999b98))
+* **release:** pin v0.3.92 refs [skip ci] ([2c39b14](https://github.com/getplumber/plumber/commit/2c39b140460ee42978dec9dd6f7b79800a6079ca))
+
+## [0.3.92](https://github.com/getplumber/plumber/compare/v0.3.91...v0.3.92) (2026-07-08)
+
+
+### 🔧 Chores
+
+* **ci:** bump github/codeql-action/upload-sarif from 4.36.2 to 4.37.0 ([f2b3e2e](https://github.com/getplumber/plumber/commit/f2b3e2e32fe5d445e2c2fb46ee4c63fe989f109a))
+
+## [0.3.91](https://github.com/getplumber/plumber/compare/v0.3.90...v0.3.91) (2026-07-08)
+
+
+### 🔧 Chores
+
+* **deps:** bump github.com/open-policy-agent/opa from 1.18.1 to 1.18.2 ([edd7d9a](https://github.com/getplumber/plumber/commit/edd7d9a3396fbfefb0230f84c7a44a6bf00aaf4e))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.90 refs [skip ci] ([fd41b0e](https://github.com/getplumber/plumber/commit/fd41b0e67d33d2f6557d09d7d089843b0a894775))
+
+## [0.3.90](https://github.com/getplumber/plumber/compare/v0.3.89...v0.3.90) (2026-07-08)
+
+
+### ✨ Features
+
+* **control:** Ship control 186 workflowMustNotExportEntireSecretsContext ([25881bf](https://github.com/getplumber/plumber/commit/25881bfd844c286244a16cd294ddcd3add85ca6f))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.89 refs [skip ci] ([cd7a8d3](https://github.com/getplumber/plumber/commit/cd7a8d3138e3d15713cdbcb908d97112f93d95fc))
+
+## [0.3.89](https://github.com/getplumber/plumber/compare/v0.3.88...v0.3.89) (2026-07-07)
+
+
+### 🐛 Bug Fixes
+
+* **config:** warn when a present local CI config is unreadable ([a099337](https://github.com/getplumber/plumber/commit/a099337ba6230632b9b8975c7d1980d9accbed5f))
+* **github:** keep scanning repo artifacts when the workflows dir is rejected ([2a0fcb1](https://github.com/getplumber/plumber/commit/2a0fcb18d70c8190e21f6eb1f341b8e818fdbebf))
+
+
+### 🔧 Chores
+
+* **config:** bound configuration and CI-config file reads ([aff1f01](https://github.com/getplumber/plumber/commit/aff1f018c1923e08f62c205add7b05a853aa2578))
+* **github:** harden workflow and dependabot file collection ([7ccfa4c](https://github.com/getplumber/plumber/commit/7ccfa4ce46672ee3fab3e45fcacf8ebda91b321a))
+* **mrcomment:** harden comment text escaping ([52b1985](https://github.com/getplumber/plumber/commit/52b19853c740d635a9c8478c1dbc35280ea91a9b))
+* **render:** harden degraded-reason and CI-error output ([2d785b8](https://github.com/getplumber/plumber/commit/2d785b8450178f659fafa139c7f02ca090e2e519))
+* **render:** harden verification-warning output ([8179ff6](https://github.com/getplumber/plumber/commit/8179ff61cdb09ac5ce3c6aeeb311e15f3debbdc5))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.88 refs [skip ci] ([beb8d19](https://github.com/getplumber/plumber/commit/beb8d19655162ae1336eaa176c55f316b87cd2ce))
+
+## [0.3.88](https://github.com/getplumber/plumber/compare/v0.3.87...v0.3.88) (2026-07-06)
+
+
+### 🐛 Bug Fixes
+
+* **ci:** Fix typo in ci to always rebuild runtime allowing update to layers. Necessary for security updates ([99d9e61](https://github.com/getplumber/plumber/commit/99d9e615fbc91a00bc82f1aeb27f2e3bc73f7e98))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.87 refs [skip ci] ([4dd1ec3](https://github.com/getplumber/plumber/commit/4dd1ec3e1bd8c3218894f9e311f2b371c30d2b80))
+
+## [0.3.87](https://github.com/getplumber/plumber/compare/v0.3.86...v0.3.87) (2026-07-06)
+
+
+### 🐛 Bug Fixes
+
+* **collect:** contain local CI-config reads and skip symlinked Dockerfiles ([ef9c275](https://github.com/getplumber/plumber/commit/ef9c2751f9853831e8b208e6cf9e2df1fc7d076f))
+* **gitlab:** harden local include resolution ([729e259](https://github.com/getplumber/plumber/commit/729e25937f01a417444b7d00f946bfa046c2d6e1))
+
+
+### ♻️ Refactoring
+
+* **render:** sanitize repo-derived text and bound resource use ([17ed05e](https://github.com/getplumber/plumber/commit/17ed05eaaca3efc00c6b7092794d1303b4c527c4))
+* **score:** resolve the score endpoint from CLI/env only ([0a89351](https://github.com/getplumber/plumber/commit/0a89351c4098d2b2dd639281c7bd5d25810447c2))
+
+
+### 👷 CI/CD
+
+* **grype:** install pinned grype by checksum, drop scan-action ([a275cdf](https://github.com/getplumber/plumber/commit/a275cdff60a9abe189b5833dbdafbec7ef19124e)), closes [#294](https://github.com/getplumber/plumber/issues/294)
+* pin runtime tool installs to immutable versions ([a203b7f](https://github.com/getplumber/plumber/commit/a203b7f1fbd3e2ac4aeaf55c4425cd215a138c1a))
+* **release:** pin v0.3.86 refs [skip ci] ([101cd21](https://github.com/getplumber/plumber/commit/101cd2168b4eb5bc5d2944b57f28394f8d536a84))
+* **release:** stop persisting credentials in the pin-refs checkout ([8f0f261](https://github.com/getplumber/plumber/commit/8f0f2619b9d725666209c2b42601d8d7ba871fa7)), closes [#293](https://github.com/getplumber/plumber/issues/293)
+* **scorecard:** document the action's mutable-image gap ([61c8cdd](https://github.com/getplumber/plumber/commit/61c8cdd59edb8919d1d8ada375c6e21c4e598a59))
+
+## [0.3.86](https://github.com/getplumber/plumber/compare/v0.3.85...v0.3.86) (2026-07-02)
+
+
+### 🐛 Bug Fixes
+
+* **gitleaks:** disable secret scanning ([e41475e](https://github.com/getplumber/plumber/commit/e41475ec20b10ff7e48dfc3010d5877d97a3dc3e))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.85 refs [skip ci] ([12df9db](https://github.com/getplumber/plumber/commit/12df9dba94f64e97763943d6583484f0a3a39115))
+
+## [0.3.85](https://github.com/getplumber/plumber/compare/v0.3.84...v0.3.85) (2026-07-02)
+
+
+### ✨ Features
+
+* **control:** [#185](https://github.com/getplumber/plumber/issues/185) Add Control workflowMustNotWriteUntrustedContentToGitHubEnv ISSUE-207 ([8829586](https://github.com/getplumber/plumber/commit/88295861bde0d1efed6686c63806f35875abc558))
+
+
+### 🐛 Bug Fixes
+
+* **control:** Cover more of the attack surface ([bcd1076](https://github.com/getplumber/plumber/commit/bcd10767283156242872b043ff20a697a345e7c5))
+* **readme:** Documentation about issue-209 ([a0e3e65](https://github.com/getplumber/plumber/commit/a0e3e65899f126f5fa982d93dcff06c3baf1c74a))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.84 refs [skip ci] ([0b7107f](https://github.com/getplumber/plumber/commit/0b7107f1c598a92c420748b7bc5b4c5df7baaaae))
+
+## [0.3.84](https://github.com/getplumber/plumber/compare/v0.3.83...v0.3.84) (2026-07-02)
+
+
+### 🐛 Bug Fixes
+
+* **control:** Fix false positive hardcoded job ([15e484c](https://github.com/getplumber/plumber/commit/15e484cbaa3719a3f087082fcd96496ea5743fba))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.83 refs [skip ci] ([9945938](https://github.com/getplumber/plumber/commit/99459381ea8a9c1e0a0fc7fcbe1e0fb3d48d9bfc))
+
+## [0.3.83](https://github.com/getplumber/plumber/compare/v0.3.82...v0.3.83) (2026-07-01)
+
+
+### 🔧 Chores
+
+* **ci:** bump actions/attest-build-provenance from 4.1.0 to 4.1.1 ([8e6b863](https://github.com/getplumber/plumber/commit/8e6b863ba3b9b0c6b9367cbee9452815f719af90))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.82 refs [skip ci] ([4f57fd7](https://github.com/getplumber/plumber/commit/4f57fd70b31a69f065cb5fdcbd099f2412700525))
+
+## [0.3.82](https://github.com/getplumber/plumber/compare/v0.3.81...v0.3.82) (2026-07-01)
+
+
+### 🔧 Chores
+
+* **ci:** bump actions/setup-go from 6.4.0 to 6.5.0 ([e8fe5cf](https://github.com/getplumber/plumber/commit/e8fe5cfeb9713f817bdddf38851bc72400e13617))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.81 refs [skip ci] ([471ca8a](https://github.com/getplumber/plumber/commit/471ca8a1aaf6855203abf92bfb0b27dd7a3e12d2))
+
+## [0.3.81](https://github.com/getplumber/plumber/compare/v0.3.80...v0.3.81) (2026-07-01)
+
+
+### 🔧 Chores
+
+* **deps:** bump github.com/open-policy-agent/opa from 1.17.1 to 1.18.1 ([1784446](https://github.com/getplumber/plumber/commit/17844467720cd8049a826aa031ba533a1a3af58b))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.80 refs [skip ci] ([f73828f](https://github.com/getplumber/plumber/commit/f73828fa3649871af0f14f2cae53aa17c581d702))
+
+## [0.3.80](https://github.com/getplumber/plumber/compare/v0.3.79...v0.3.80) (2026-07-01)
+
+
+### ✨ Features
+
+* **config:** trust getplumber/plumber action in default authorized sources ([f883131](https://github.com/getplumber/plumber/commit/f88313181a0215b3a6bd0630ccf0dc6e5df5d671))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.79 refs [skip ci] ([42ed1c5](https://github.com/getplumber/plumber/commit/42ed1c5bf24a7b2e0859bdf30aeab89a5ab2e91f))
+
+## [0.3.79](https://github.com/getplumber/plumber/compare/v0.3.78...v0.3.79) (2026-06-29)
+
+
+### 🔧 Chores
+
+* **action:** revert GitHub Action name to "Plumber Score" ([7c4ce7e](https://github.com/getplumber/plumber/commit/7c4ce7eba58c5b30203892700247d2f4fb1de9b9))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.78 refs [skip ci] ([ae540c6](https://github.com/getplumber/plumber/commit/ae540c6651b469f8f409c009f1b4ab7cf6939e93))
+
+## [0.3.78](https://github.com/getplumber/plumber/compare/v0.3.77...v0.3.78) (2026-06-29)
+
+
+### 🔧 Chores
+
+* **action:** rename GitHub Action to "Plumber Security" ([044b9c6](https://github.com/getplumber/plumber/commit/044b9c641cdc9512081cfa1644b11fa93314b367))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.77 refs [skip ci] ([60f574c](https://github.com/getplumber/plumber/commit/60f574c11b70dce9670548a8cf0f4ef7b5a6572b))
+
+## [0.3.77](https://github.com/getplumber/plumber/compare/v0.3.76...v0.3.77) (2026-06-29)
+
+
+### 🔧 Chores
+
+* **action:** rename GitHub Action to "Plumber" ([1f315d6](https://github.com/getplumber/plumber/commit/1f315d634be146e0efeaf0496b2533c5cf60ad37))
+
+
+### 📚 Documentation
+
+* **readme:** update doc links for getplumber.io docs restructuring ([bb11d13](https://github.com/getplumber/plumber/commit/bb11d139091551ed113bb14549b71dff8055dbbc)), closes [#199](https://github.com/getplumber/plumber/issues/199)
+
+
+### 👷 CI/CD
+
+* align self-scan workflow/job names to 'Plumber' ([371344e](https://github.com/getplumber/plumber/commit/371344ee63c840f17d6ff35001d273eacc2f2de7))
+* **release:** pin v0.3.76 refs [skip ci] ([9c53473](https://github.com/getplumber/plumber/commit/9c534733f4cdbb78c8070b63567f277628066b90))
+
+## [0.3.76](https://github.com/getplumber/plumber/compare/v0.3.75...v0.3.76) (2026-06-26)
+
+
+### 🔧 Chores
+
+* **score:** show the badge nudge in CI too and simplify its wording ([ac4111a](https://github.com/getplumber/plumber/commit/ac4111aa6c831c73cb30f468438d23b9bd6d809c))
+
+
+### 📚 Documentation
+
+* **readme:** add support contact tech@getplumber.io ([db3aba4](https://github.com/getplumber/plumber/commit/db3aba4327448877340c8228634c880a5bb6a26e))
+* **readme:** security framing, drop 'compliance' wording ([a8b873a](https://github.com/getplumber/plumber/commit/a8b873af460c42823a44e2ccc833c268b66dbe1c))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.75 refs [skip ci] ([d79c2e9](https://github.com/getplumber/plumber/commit/d79c2e9b2a0eceabf87052c4298f0b616de0119d))
+
+## [0.3.75](https://github.com/getplumber/plumber/compare/v0.3.74...v0.3.75) (2026-06-26)
+
+
+### 🐛 Bug Fixes
+
+* **action:** default points breakdown (beta) off ([06d3628](https://github.com/getplumber/plumber/commit/06d3628d1d94481a436aab0d45bd3410cb8a4473))
+* **score:** skip push when the scan targets a foreign repo ([627129d](https://github.com/getplumber/plumber/commit/627129db5f3301a82d37787232421dc6d1b87756))
+
+
+### ✅ Tests
+
+* **score:** assert disabled score-push never publishes ([71d9589](https://github.com/getplumber/plumber/commit/71d9589dbc7452ed1254ec72c0048a9a42fa0d5d))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.74 refs [skip ci] ([b147582](https://github.com/getplumber/plumber/commit/b147582378568fe285ad487810c1f2549558df88))
+
+## [0.3.74](https://github.com/getplumber/plumber/compare/v0.3.73...v0.3.74) (2026-06-26)
+
+
+### ✨ Features
+
+* add opt-in to push results on score.getplumber.io from CI ([175fc8c](https://github.com/getplumber/plumber/commit/175fc8c85146ccf4a87424f4feadb37247a14fd1))
+
+
+### 🐛 Bug Fixes
+
+* **build:** rebuild the runtime layer every release so apk upgrade ships current OS security fixes ([83eff9b](https://github.com/getplumber/plumber/commit/83eff9bf0f77040d645dd3e604ed32ba51e71542))
+
+
+### 🔧 Chores
+
+* **action:** rename Marketplace action to "Plumber Score" ([0fc9e8d](https://github.com/getplumber/plumber/commit/0fc9e8d2a60e8b10f3b1ebae5e6c89219d2a1203))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.73 refs [skip ci] ([1012f9c](https://github.com/getplumber/plumber/commit/1012f9c83589e7b23470eeaa01c79a39aebab2f6))
+
+## [0.3.73](https://github.com/getplumber/plumber/compare/v0.3.72...v0.3.73) (2026-06-25)
+
+
+### 🐛 Bug Fixes
+
+* **ci:** Symlink the binary unto path inside the docker image so that it can run from anywhere ([94728a5](https://github.com/getplumber/plumber/commit/94728a50dac172c021393d66538eafe653be0770))
+
+
+### 👷 CI/CD
+
+* **release:** pin v0.3.72 refs [skip ci] ([8aba973](https://github.com/getplumber/plumber/commit/8aba973ea51820a2001d4171eaabe9cd0e1d1339))
+
 ## [0.3.72](https://github.com/getplumber/plumber/compare/v0.3.71...v0.3.72) (2026-06-25)
 
 

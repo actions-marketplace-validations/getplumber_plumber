@@ -18,8 +18,8 @@ type ControlEntry struct {
 	// SkipReason is the human-friendly explanation rendered next to
 	// the "(skipped)" header and in the Status: SKIPPED (…) line. Left
 	// empty for the default "disabled in configuration" case; callers
-	// that flip Skipped for a different reason (e.g. the gitleaks
-	// scan could not complete) set this so the operator sees why.
+	// that flip Skipped for a different reason (e.g. a required data
+	// source was unavailable) set this so the operator sees why.
 	SkipReason string
 	Compliance float64
 }
@@ -29,7 +29,7 @@ func GitLabControls(pc *configuration.PlumberConfig) []ControlEntry {
 		return nil
 	}
 	c := pc.ControlsFor("gitlab")
-	entries := make([]ControlEntry, 0, 14)
+	entries := make([]ControlEntry, 0, 15)
 
 	// Container images must not use forbidden tags
 	cfgForbiddenTags := c.ContainerImageMustNotUseForbiddenTags
@@ -51,6 +51,41 @@ func GitLabControls(pc *configuration.PlumberConfig) []ControlEntry {
 		DisplayName: "Branch must be protected",
 		ControlName: "branchMustBeProtected",
 		Skipped:     c.BranchMustBeProtected == nil || !c.BranchMustBeProtected.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
+		DisplayName: "MR approval rules must require a minimum number of approvals",
+		ControlName: "mergeRequestApprovalRulesMustRequireMinimumApprovals",
+		Skipped:     c.MergeRequestApprovalRulesMustRequireMinimumApprovals == nil || !c.MergeRequestApprovalRulesMustRequireMinimumApprovals.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
+		DisplayName: "MR approval rules must cover all protected branches",
+		ControlName: "mergeRequestApprovalRulesMustCoverAllProtectedBranches",
+		Skipped:     c.MergeRequestApprovalRulesMustCoverAllProtectedBranches == nil || !c.MergeRequestApprovalRulesMustCoverAllProtectedBranches.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
+		DisplayName: "MR approval settings must be compliant",
+		ControlName: "mergeRequestApprovalSettingsMustBeCompliant",
+		Skipped:     c.MergeRequestApprovalSettingsMustBeCompliant == nil || !c.MergeRequestApprovalSettingsMustBeCompliant.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
+		DisplayName: "MR settings must be compliant",
+		ControlName: "mergeRequestSettingsMustBeCompliant",
+		Skipped:     c.MergeRequestSettingsMustBeCompliant == nil || !c.MergeRequestSettingsMustBeCompliant.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
+		DisplayName: "CI/CD variables must be protected",
+		ControlName: "cicdVariablesMustBeProtected",
+		Skipped:     c.CicdVariablesMustBeProtected == nil || !c.CicdVariablesMustBeProtected.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
+		DisplayName: "CI/CD variables must be masked",
+		ControlName: "cicdVariablesMustBeMasked",
+		Skipped:     c.CicdVariablesMustBeMasked == nil || !c.CicdVariablesMustBeMasked.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
+		DisplayName: "Project must have a security policy source",
+		ControlName: "projectMustHaveSecurityPolicySource",
+		Skipped:     c.ProjectMustHaveSecurityPolicySource == nil || !c.ProjectMustHaveSecurityPolicySource.IsEnabled(),
 	})
 	entries = append(entries, ControlEntry{
 		DisplayName: "Pipeline must not include hardcoded jobs",
@@ -103,11 +138,6 @@ func GitLabControls(pc *configuration.PlumberConfig) []ControlEntry {
 		Skipped:     c.PipelineMustNotExecuteUnverifiedScripts == nil || !c.PipelineMustNotExecuteUnverifiedScripts.IsEnabled(),
 	})
 	entries = append(entries, ControlEntry{
-		DisplayName: "Pipeline must not leak secrets in configuration",
-		ControlName: "pipelineMustNotLeakSecretsInConfig",
-		Skipped:     c.PipelineMustNotLeakSecretsInConfig == nil || !c.PipelineMustNotLeakSecretsInConfig.IsEnabled(),
-	})
-	entries = append(entries, ControlEntry{
 		DisplayName: "Pipeline must not override job variables",
 		ControlName: "pipelineMustNotOverrideJobVariables",
 		Skipped:     c.PipelineMustNotOverrideJobVariables == nil || !c.PipelineMustNotOverrideJobVariables.IsEnabled(),
@@ -132,7 +162,7 @@ func GitHubControls(pc *configuration.PlumberConfig) []ControlEntry {
 		return nil
 	}
 	c := pc.ControlsFor("github")
-	entries := make([]ControlEntry, 0, 9)
+	entries := make([]ControlEntry, 0, 23)
 
 	cfgForbiddenTags := c.ContainerImageMustNotUseForbiddenTags
 	name := "Container images must not use forbidden tags"
@@ -175,19 +205,24 @@ func GitHubControls(pc *configuration.PlumberConfig) []ControlEntry {
 		Skipped:     c.PipelineMustNotExecuteUnverifiedScripts == nil || !c.PipelineMustNotExecuteUnverifiedScripts.IsEnabled(),
 	})
 	entries = append(entries, ControlEntry{
-		DisplayName: "Workflow must not leak secrets in configuration",
-		ControlName: "pipelineMustNotLeakSecretsInConfig",
-		Skipped:     c.PipelineMustNotLeakSecretsInConfig == nil || !c.PipelineMustNotLeakSecretsInConfig.IsEnabled(),
-	})
-	entries = append(entries, ControlEntry{
 		DisplayName: "Reusable workflows must not inherit secrets",
 		ControlName: "reusableWorkflowsMustNotInheritSecrets",
 		Skipped:     c.ReusableWorkflowsMustNotInheritSecrets == nil || !c.ReusableWorkflowsMustNotInheritSecrets.IsEnabled(),
 	})
 	entries = append(entries, ControlEntry{
+		DisplayName: "Workflows must not expose all secrets at once",
+		ControlName: "workflowMustNotExportEntireSecretsContext",
+		Skipped:     c.WorkflowMustNotExportEntireSecretsContext == nil || !c.WorkflowMustNotExportEntireSecretsContext.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
 		DisplayName: "Workflows must not inject user input in scripts",
 		ControlName: "workflowMustNotInjectUserInputInScripts",
 		Skipped:     c.WorkflowMustNotInjectUserInputInScripts == nil || !c.WorkflowMustNotInjectUserInputInScripts.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
+		DisplayName: "Workflows must not write untrusted content to $GITHUB_ENV",
+		ControlName: "workflowMustNotWriteUntrustedContentToGitHubEnv",
+		Skipped:     c.WorkflowMustNotWriteUntrustedContentToGitHubEnv == nil || !c.WorkflowMustNotWriteUntrustedContentToGitHubEnv.IsEnabled(),
 	})
 	entries = append(entries, ControlEntry{
 		DisplayName: "Workflows must not use dangerous triggers",
@@ -198,6 +233,11 @@ func GitHubControls(pc *configuration.PlumberConfig) []ControlEntry {
 		DisplayName: "pull_request_target workflows must not check out the PR head",
 		ControlName: "pullRequestTargetMustNotCheckoutHead",
 		Skipped:     c.PullRequestTargetMustNotCheckoutHead == nil || !c.PullRequestTargetMustNotCheckoutHead.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
+		DisplayName: "Checkout must not persist credentials",
+		ControlName: "checkoutMustNotPersistCredentials",
+		Skipped:     c.CheckoutMustNotPersistCredentials == nil || !c.CheckoutMustNotPersistCredentials.IsEnabled(),
 	})
 	entries = append(entries, ControlEntry{
 		DisplayName: "Workflows must declare permissions",
@@ -225,9 +265,24 @@ func GitHubControls(pc *configuration.PlumberConfig) []ControlEntry {
 		Skipped:     c.ActionsMustNotBeArchived == nil || !c.ActionsMustNotBeArchived.IsEnabled(),
 	})
 	entries = append(entries, ControlEntry{
+		DisplayName: "Actions must pin commits that exist upstream",
+		ControlName: "actionRefsMustExistUpstream",
+		Skipped:     c.ActionRefsMustExistUpstream == nil || !c.ActionRefsMustExistUpstream.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
 		DisplayName: "Actions must not carry known CVEs",
 		ControlName: "actionsMustNotCarryKnownCVEs",
 		Skipped:     c.ActionsMustNotCarryKnownCVEs == nil || !c.ActionsMustNotCarryKnownCVEs.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
+		DisplayName: "Actions must not execute mutable remote code",
+		ControlName: "actionsMustNotExecuteMutableRemoteCode",
+		Skipped:     c.ActionsMustNotExecuteMutableRemoteCode == nil || !c.ActionsMustNotExecuteMutableRemoteCode.IsEnabled(),
+	})
+	entries = append(entries, ControlEntry{
+		DisplayName: "Release workflows must not restore an untrusted cache",
+		ControlName: "releaseWorkflowsMustNotRestoreUntrustedCache",
+		Skipped:     c.ReleaseWorkflowsMustNotRestoreUntrustedCache == nil || !c.ReleaseWorkflowsMustNotRestoreUntrustedCache.IsEnabled(),
 	})
 	entries = append(entries, ControlEntry{
 		DisplayName: "Pipeline must not enable debug trace",
@@ -275,9 +330,17 @@ func isSecurityJobsWeakenedSkipped(cfg *configuration.SecurityJobsWeakenedContro
 // ControlsConfig (use pc.ControlsFor("gitlab") or
 // pc.ControlsFor("github")).
 // DisabledControlNames returns the set of control names that are disabled
-// (nil or enabled:false) in the given ControlsConfig. It derives the list
-// from the same spec tables used by GitLabControls/GitHubControls so the
-// two sources of truth stay in sync automatically.
+// (nil or enabled:false) in the given ControlsConfig.
+//
+// WARNING: this is a HAND-WRITTEN if-chain, not a derivation. It does NOT
+// stay in sync with GitLabControls/GitHubControls automatically, and no
+// test compares them, so adding a control to either catalog without adding
+// a branch here silently breaks its disable path: the control renders as
+// "skipped" in the terminal table and the legacy JSON, while its findings
+// still survive FilterFindingsByEnabledControls into SARIF, GLSAST, PBOM
+// and the score. For a Critical code that means a 30-point malus and an E
+// on a control the user believes is off. Keep the branch count equal to
+// the union of the two catalogs.
 func DisabledControlNames(c *configuration.ControlsConfig) map[string]bool {
 	out := map[string]bool{}
 	if c == nil {
@@ -291,6 +354,27 @@ func DisabledControlNames(c *configuration.ControlsConfig) map[string]bool {
 	}
 	if cfg := c.BranchMustBeProtected; cfg == nil || !cfg.IsEnabled() {
 		out["branchMustBeProtected"] = true
+	}
+	if cfg := c.MergeRequestApprovalRulesMustRequireMinimumApprovals; cfg == nil || !cfg.IsEnabled() {
+		out["mergeRequestApprovalRulesMustRequireMinimumApprovals"] = true
+	}
+	if cfg := c.MergeRequestApprovalRulesMustCoverAllProtectedBranches; cfg == nil || !cfg.IsEnabled() {
+		out["mergeRequestApprovalRulesMustCoverAllProtectedBranches"] = true
+	}
+	if cfg := c.MergeRequestApprovalSettingsMustBeCompliant; cfg == nil || !cfg.IsEnabled() {
+		out["mergeRequestApprovalSettingsMustBeCompliant"] = true
+	}
+	if cfg := c.MergeRequestSettingsMustBeCompliant; cfg == nil || !cfg.IsEnabled() {
+		out["mergeRequestSettingsMustBeCompliant"] = true
+	}
+	if cfg := c.CicdVariablesMustBeProtected; cfg == nil || !cfg.IsEnabled() {
+		out["cicdVariablesMustBeProtected"] = true
+	}
+	if cfg := c.CicdVariablesMustBeMasked; cfg == nil || !cfg.IsEnabled() {
+		out["cicdVariablesMustBeMasked"] = true
+	}
+	if cfg := c.ProjectMustHaveSecurityPolicySource; cfg == nil || !cfg.IsEnabled() {
+		out["projectMustHaveSecurityPolicySource"] = true
 	}
 	if cfg := c.PipelineMustNotIncludeHardcodedJobs; cfg == nil || !cfg.IsEnabled() {
 		out["pipelineMustNotIncludeHardcodedJobs"] = true
@@ -337,11 +421,20 @@ func DisabledControlNames(c *configuration.ControlsConfig) map[string]bool {
 	if cfg := c.WorkflowMustNotInjectUserInputInScripts; cfg == nil || !cfg.IsEnabled() {
 		out["workflowMustNotInjectUserInputInScripts"] = true
 	}
+	if cfg := c.WorkflowMustNotWriteUntrustedContentToGitHubEnv; cfg == nil || !cfg.IsEnabled() {
+		out["workflowMustNotWriteUntrustedContentToGitHubEnv"] = true
+	}
+	if cfg := c.WorkflowMustNotExportEntireSecretsContext; cfg == nil || !cfg.IsEnabled() {
+		out["workflowMustNotExportEntireSecretsContext"] = true
+	}
 	if cfg := c.WorkflowMustNotUseDangerousTriggers; cfg == nil || !cfg.IsEnabled() {
 		out["workflowMustNotUseDangerousTriggers"] = true
 	}
 	if cfg := c.PullRequestTargetMustNotCheckoutHead; cfg == nil || !cfg.IsEnabled() {
 		out["pullRequestTargetMustNotCheckoutHead"] = true
+	}
+	if cfg := c.CheckoutMustNotPersistCredentials; cfg == nil || !cfg.IsEnabled() {
+		out["checkoutMustNotPersistCredentials"] = true
 	}
 	if cfg := c.WorkflowsMustDeclarePermissions; cfg == nil || !cfg.IsEnabled() {
 		out["workflowsMustDeclarePermissions"] = true
@@ -360,6 +453,12 @@ func DisabledControlNames(c *configuration.ControlsConfig) map[string]bool {
 	}
 	if cfg := c.ActionsMustNotCarryKnownCVEs; cfg == nil || !cfg.IsEnabled() {
 		out["actionsMustNotCarryKnownCVEs"] = true
+	}
+	if cfg := c.ActionsMustNotExecuteMutableRemoteCode; cfg == nil || !cfg.IsEnabled() {
+		out["actionsMustNotExecuteMutableRemoteCode"] = true
+	}
+	if cfg := c.ReleaseWorkflowsMustNotRestoreUntrustedCache; cfg == nil || !cfg.IsEnabled() {
+		out["releaseWorkflowsMustNotRestoreUntrustedCache"] = true
 	}
 	return out
 }
@@ -382,6 +481,20 @@ func FilterFindingsByEnabledControls(findings []opaengine.Finding, provider stri
 		info := LookupCode(ErrorCode(f.Code))
 		if info == nil || info.ControlName == "" {
 			out = append(out, f)
+			continue
+		}
+		// A control that does not apply to this provider must not be scored
+		// or reported here. A GitHub-only rule can still FIRE on a GitLab
+		// pipeline when its rego reads generic IR fields with no provider
+		// guard (e.g. workflowMustPinPackageInstalls matching a bare
+		// `pip install` in a GitLab `script:`). Such a finding is not benched
+		// on GitLab and has no GitLab DisabledControlNames entry, so without
+		// this gate it would survive into result.Findings, inflate
+		// plumberScore.counts and leak into SARIF/PBOM while no GitLab catalog
+		// can render it (getplumber/plumber#349). controlsMeta already
+		// declares each control's providers; honour it. Placed after the
+		// info-nil guard so it only ever evaluates registered controls.
+		if !configuration.IsControlApplicableTo(info.ControlName, provider) {
 			continue
 		}
 		if configuration.IsBenched(provider, info.ControlName) {
@@ -444,6 +557,18 @@ func MarkSkippedByFilter(entries []ControlEntry, includeOnly, skip []string) {
 	}
 }
 
+// MarkAllSkipped marks every entry skipped with the given reason. It backs
+// --no-controls: the catalog still describes what Plumber COULD have checked,
+// but nothing was evaluated, so no entry may report a verdict. Without this,
+// a zero-findings run stamps `status: "passed"` on every control that never
+// ran, which is the false green the flag exists to avoid.
+func MarkAllSkipped(entries []ControlEntry, reason string) {
+	for i := range entries {
+		entries[i].Skipped = true
+		entries[i].SkipReason = reason
+	}
+}
+
 // GitHubControlCompliance returns the binary compliance percentage for a
 // single GitHub control: 100 when no findings, 0 otherwise. The stats
 // parameter is reserved for future per-control percentage overrides.
@@ -452,19 +577,4 @@ func GitHubControlCompliance(_ string, _ *GitHubAnalysisStats, findings int) flo
 		return 0
 	}
 	return 100
-}
-
-// ApplyFindings fills in Compliance for each catalog entry based on
-// whether any finding matches its ControlName. The rule is binary: 100
-// when the control fires no finding (or is skipped), 0 otherwise.
-func ApplyFindings(entries []ControlEntry, findingsByControl map[string]int) []ControlEntry {
-	out := make([]ControlEntry, len(entries))
-	for i, e := range entries {
-		e.Compliance = 100.0
-		if !e.Skipped && findingsByControl[e.ControlName] > 0 {
-			e.Compliance = 0.0
-		}
-		out[i] = e
-	}
-	return out
 }

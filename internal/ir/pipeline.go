@@ -23,6 +23,14 @@ type NormalizedPipeline struct {
 	Branches      []Branch          `json:"branches,omitempty"`
 	Dependabot    *DependabotConfig `json:"dependabot,omitempty"`
 
+	// SelfActionMutableExec is set when the scanned repository is itself
+	// a GitHub Action (has an action.yml) whose own source fetches and
+	// executes mutable remote code at runtime. This is the producer-side
+	// counterpart of the per-`uses:` action.metadata.mutableRemoteExec:
+	// scanning the action's own repo must flag that the action it
+	// publishes is the mutable-remote-exec vector. Nil otherwise.
+	SelfActionMutableExec *MutableRemoteExec `json:"selfActionMutableExec,omitempty"`
+
 	// WorkflowFileCount is the number of workflow files the GitHub
 	// collector fetched in remote (--github-url) mode. Used by
 	// TotalProgressStepsForPipeline to size the progress bar across
@@ -58,27 +66,72 @@ type NormalizedPipeline struct {
 	// (root, .github/, or docs/). Empty when the file is absent.
 	SecurityPolicyPath string `json:"securityPolicyPath,omitempty"`
 
+	// MRApprovalRules are the project's merge-request approval rules
+	// (GitLab: Settings > Merge requests > Approval rules), each with the
+	// number of approvals it requires and its protected-branch coverage.
+	// Projected from the same protection collection as Branches; empty on
+	// providers without approval rules. Read by the
+	// mergeRequestApprovalRulesMust* controls (ISSUE-502/504).
+	MRApprovalRules []MRApprovalRule `json:"mrApprovalRules,omitempty"`
+
+	// MRApprovalRulesKnown is true when the approval-rules listing was
+	// fetched authoritatively (an empty MRApprovalRules then means "no
+	// rules", a real state the rules reason about). It is false when the
+	// listing could not be read — a 401/403 on the approvals API (commonly
+	// a non-premium GitLab, or a token without scope) — so a control keyed
+	// on these rules reports not-evaluable rather than a false pass.
+	// Mirrors Branch.ProtectionDetailsKnown.
+	MRApprovalRulesKnown bool `json:"mrApprovalRulesKnown,omitempty"`
+
+	// SettingsVariables are the project's CI/CD settings variables
+	// (GitLab: Settings > CI/CD > Variables), each with its security
+	// flags — NOT the CI file's `variables:` block (that lives in
+	// GlobalVariables / job Variables). The value is deliberately never
+	// projected, per the #370 variable-sensitivity tiers, so a scan
+	// report never carries secret material. Empty on providers without
+	// settings variables.
+	SettingsVariables []SettingsVariable `json:"settingsVariables,omitempty"`
+
+	// SettingsVariablesKnown is true when the settings-variable listing
+	// was fetched authoritatively (an empty SettingsVariables then means
+	// "no variables", a pass). It is false when the listing could not be
+	// read — a 401/403 on the settings API, or a provider that has no
+	// such concept — so a control keyed on these variables reports
+	// not-evaluable rather than a false pass. Mirrors Branch.
+	// ProtectionDetailsKnown.
+	SettingsVariablesKnown bool `json:"settingsVariablesKnown,omitempty"`
+
+	// MRApprovalSettings are the project's merge-request approval settings
+	// (GitLab: Settings > Merge requests), normalized to positive-security
+	// form. nil when the settings could not be read (a 401/403 from a token
+	// without scope), so the mergeRequestApprovalSettingsMustBeCompliant
+	// control (ISSUE-503) abstains and reports not-evaluable rather than a
+	// false pass. Projected from the same protection collection as
+	// MRApprovalRules.
+	MRApprovalSettings *MRApprovalSettings `json:"mrApprovalSettings,omitempty"`
+
+	// MRSettings are the project's merge-request/merge settings (GitLab:
+	// Settings > Merge requests — merge method, squash, merge trains, etc.),
+	// carried in raw form so the mergeRequestSettingsMustBeCompliant control
+	// (ISSUE-506) can compare each against the configured expectation. nil when
+	// the project payload could not be read, so the control abstains and reports
+	// not-evaluable rather than a false pass. Projected from the same protection
+	// collection as MRApprovalSettings.
+	MRSettings *MRSettings `json:"mrSettings,omitempty"`
+
+	// SecurityPolicyProject is the GitLab security policy project linked to this
+	// project (Settings > Security & Compliance > Policies), projected from the
+	// protection collection. nil when the linkage was not collected (the control
+	// is disabled) or could not be read authoritatively, so the
+	// projectMustHaveSecurityPolicySource control (ISSUE-601) abstains and
+	// reports not-evaluable. Distinct from SecurityPolicyPath above, which is the
+	// repository's SECURITY.md file (a GitHub-oriented, unrelated control).
+	SecurityPolicyProject *SecurityPolicyProjectState `json:"securityPolicyProject,omitempty"`
+
 	// Dockerfiles lists every Dockerfile the collector scanned at the
 	// repo root and under common build directories, with each FROM
 	// base-image extracted so policies can check pinning state.
 	Dockerfiles []Dockerfile `json:"dockerfiles,omitempty"`
-
-	// GitleaksHits lists redacted matches reported by gitleaks against
-	// the resolved pipeline configuration (GitLab) or workflow files
-	// (GitHub). The raw secret value is never stored — only a redacted
-	// preview, rule id, line number and a logical source file. Empty
-	// when the pipelineMustNotLeakSecretsInConfig control is disabled,
-	// gitleaks is not installed, or no matches are found.
-	GitleaksHits []GitleaksHit `json:"gitleaksHits,omitempty"`
-
-	// GitleaksAbstainReason is non-empty when the gitleaks scan was
-	// supposed to run (control enabled) but could not complete —
-	// binary unresolvable, exec failure, timeout. The renderer routes
-	// this through the normal "skipped" lane so the operator sees an
-	// explicit "could not scan" instead of a misleading 100% green.
-	// Empty when the scan ran (with or without hits) or when the
-	// control is disabled in config.
-	GitleaksAbstainReason string `json:"gitleaksAbstainReason,omitempty"`
 
 	// AdvisoryWarnings collects one human-readable line per action whose
 	// known-CVE check could not be completed because the pinned commit
@@ -92,28 +145,19 @@ type NormalizedPipeline struct {
 	Raw map[string]any `json:"raw,omitempty"`
 }
 
-// GitleaksHit is a single redacted finding produced by the gitleaks
-// scan. The Secret field from gitleaks's JSON output is NEVER stored:
-// the collector replaces it with Preview (first few + last few chars
-// with "***" between) before constructing the IR entry. This means
-// the rego layer and downstream output formats only ever see the
-// redacted form, even if a user dumps the IR with --output.
-type GitleaksHit struct {
-	// RuleID is the gitleaks rule that matched (e.g. "github-pat",
-	// "aws-access-token", "private-key").
-	RuleID string `json:"ruleId"`
-	// Description is the human-friendly explanation from gitleaks's
-	// rule catalogue (e.g. "GitHub Personal Access Token").
-	Description string `json:"description,omitempty"`
-	// Preview is the redacted form of the matched secret: first 4 and
-	// last 4 characters, separated by "***", or "***" only for matches
-	// shorter than 8 characters.
-	Preview string `json:"preview"`
-	// File is the logical name of the scanned source (e.g.
-	// "merged-gitlab-ci.yml" or ".github/workflows/release.yml").
-	File string `json:"file,omitempty"`
-	// Line is the 1-based line number where the match starts.
-	Line int `json:"line,omitempty"`
+// SecurityPolicyProjectState is the GitLab security policy project linkage
+// projected onto the IR. Known is true when the linkage was read
+// authoritatively; a Known projection with LinkedProjectID == 0 means no policy
+// project is linked. When Known is false the rule abstains (not-evaluable).
+type SecurityPolicyProjectState struct {
+	// Known is true when the linkage was read authoritatively.
+	Known bool `json:"known"`
+	// LinkedProjectID is the numeric ID of the linked security policy project,
+	// or 0 when none is linked.
+	LinkedProjectID int `json:"linkedProjectId"`
+	// LinkedProjectPath is the full path of the linked security policy project,
+	// or "" when none is linked.
+	LinkedProjectPath string `json:"linkedProjectPath"`
 }
 
 // Dockerfile captures the result of parsing a single Dockerfile's
@@ -277,6 +321,12 @@ type Job struct {
 type Action struct {
 	Uses string         `json:"uses"`
 	With map[string]any `json:"with,omitempty"`
+	// Name is the step's `name:` from the workflow YAML, when the author
+	// provided one. It is the only stable discriminator between two steps in
+	// the same job that reference the same action: the line number tells them
+	// apart within a scan but moves whenever unrelated code above them is
+	// edited, so the name is what a run-over-run identifier can rely on.
+	Name string `json:"name,omitempty"`
 	// Line is the 1-based line number of the `uses:` directive in the
 	// source workflow file. Populated by the provider collector so
 	// action-level findings can point the reviewer at the exact step
@@ -290,9 +340,20 @@ type Action struct {
 // Kept in internal/ir so policies can consume it via the serialised
 // JSON input without internal/ir importing the collector package.
 type ActionMetadata struct {
-	RepoArchived     bool     `json:"repoArchived,omitempty"`
-	RefExists        bool     `json:"refExists,omitempty"`
-	RefKind          string   `json:"refKind,omitempty"`
+	RepoArchived bool `json:"repoArchived,omitempty"`
+	RefExists    bool `json:"refExists,omitempty"`
+	// RefKnownAbsent is true ONLY when the upstream API definitively
+	// answered that the ref does not exist (a 404 / 422 on a readable
+	// repo). It stays false when the ref could not be verified (private
+	// repo, rate limit, network error) so impostor-commit (ISSUE-707)
+	// never flags a valid SHA it merely failed to reach.
+	RefKnownAbsent bool   `json:"refKnownAbsent,omitempty"`
+	RefKind        string `json:"refKind,omitempty"`
+	// RefCommitSha is set only when the pinned ref is the SHA of an
+	// annotated tag OBJECT: it carries the commit that tag object
+	// dereferences to. Empty for every other ref shape, including a
+	// plain commit pin (there the ref already IS the commit).
+	RefCommitSha     string   `json:"refCommitSha,omitempty"`
 	TagSha           string   `json:"tagSha,omitempty"`
 	LatestTag        string   `json:"latestTag,omitempty"`
 	LatestReleaseSha string   `json:"latestReleaseSha,omitempty"`
@@ -306,6 +367,28 @@ type ActionMetadata struct {
 	// threshold. Zero when enrichment did not run or the repo was
 	// unreachable — policies must abstain rather than flag on absence.
 	StargazersCount int `json:"stargazersCount,omitempty"`
+	// MutableRemoteExec, when set, records that the action's own source
+	// fetches code or a download-steering manifest from a MOVING ref
+	// (main/master/HEAD/…) at runtime — so pinning this action by SHA
+	// does not make its execution immutable. Nil when the source was not
+	// analysed (offline, non-github.com host, trusted owner) or nothing
+	// mutable was found. Consumed by the mutable-remote-exec control.
+	MutableRemoteExec *MutableRemoteExec `json:"mutableRemoteExec,omitempty"`
+}
+
+// MutableRemoteExec describes a mutable-remote-code signal found inside
+// a third-party action's own source. Tier separates the two risk levels
+// the control reports:
+//
+//   - "exec" — a script (.sh/.py/…) fetched from a moving ref and
+//     executed, or a `curl … | sh` pipe. Direct remote code execution.
+//   - "data" — a data manifest (.json/.yaml) pulled from a moving ref
+//     that steers a later binary download. Weaker: not executed itself.
+type MutableRemoteExec struct {
+	Tier string `json:"tier"`
+	URL  string `json:"url"`
+	Ref  string `json:"ref,omitempty"`
+	File string `json:"file"`
 }
 
 // Image references a container image (job image, service, step base).
@@ -320,6 +403,15 @@ type Image struct {
 	Digest              string `json:"digest,omitempty"`
 	Registry            string `json:"registry,omitempty"`
 	CredentialsPassword string `json:"credentialsPassword,omitempty"`
+	// Unresolved reports that the reference still held a `$VARIABLE` when it
+	// was parsed, so Registry, Name and Tag describe a placeholder rather
+	// than an image. A rule that judges a registry or a tag must skip such an
+	// image: those fields are present and WRONG, not absent, so a rule that
+	// merely checks for emptiness would answer confidently over a guess.
+	//
+	// The zero value is "resolved", so every hand-built fixture and every
+	// provider that does not set it behaves exactly as before.
+	Unresolved bool `json:"unresolved,omitempty"`
 }
 
 // Include models an external pipeline fragment pulled into the current one.
@@ -393,4 +485,117 @@ type Branch struct {
 	MinPushAccessLevel        int    `json:"minPushAccessLevel,omitempty"`
 	MinMergeAccessLevel       int    `json:"minMergeAccessLevel,omitempty"`
 	ProtectionDetailsKnown    bool   `json:"protectionDetailsKnown,omitempty"`
+}
+
+// MRApprovalRule is one merge-request approval rule (GitLab: Settings >
+// Merge requests > Approval rules). It carries the rule's stable identity
+// and the fields the approval-rule controls check: how many approvals it
+// requires and whether it covers all protected branches.
+type MRApprovalRule struct {
+	// ID is GitLab's approval-rule ID, stringified. It is stable for the
+	// rule's lifetime (it churns only on delete-and-recreate, which is a
+	// new rule), so ISSUE-502 keys its finding identity on ID rather than
+	// on the renameable Name, per the #370 volatile-field discipline.
+	ID string `json:"id"`
+	// Name is the human label. It renders in findings but is deliberately
+	// NOT an identity field: renaming a rule must not re-key its finding.
+	Name string `json:"name,omitempty"`
+	// ApprovalsRequired is how many approvals the rule mandates.
+	ApprovalsRequired int `json:"approvalsRequired"`
+	// AppliesToAllProtectedBranches is GitLab's explicit "all protected
+	// branches" flag. ISSUE-504 requires at least one rule to carry it.
+	AppliesToAllProtectedBranches bool `json:"appliesToAllProtectedBranches,omitempty"`
+	// ProtectedBranchCount is how many specific protected branches the rule
+	// is scoped to. Zero means it is scoped to none in particular, which
+	// GitLab treats as covering all branches; ISSUE-502 checks a rule that
+	// covers all protected branches (the explicit flag OR a zero count).
+	ProtectedBranchCount int `json:"protectedBranchCount"`
+}
+
+// SettingsVariable is one project CI/CD settings variable (GitLab: Settings >
+// CI/CD > Variables). It carries the variable's identity and its
+// security-relevant flags only: the value is never projected, per the #370
+// variable-sensitivity tiers, so a finding can name an exposed variable
+// without carrying its secret. Type is GitLab's variable_type ("env_var" or
+// "file"); Environment is the environment scope ("*" for all).
+type SettingsVariable struct {
+	Name string `json:"name"`
+	// Type and Environment always serialize (no omitempty): both are
+	// identity fields for the cicdVariablesMustBe* controls, and the rules
+	// read them unconditionally, so an absent key would break the finding
+	// or leave an inconsistent identity. GitLab always supplies both
+	// ("env_var"/"file" and the environment scope, "*" for all).
+	Type        string `json:"type"`
+	Environment string `json:"environment"`
+	Protected   bool   `json:"protected"`
+	Masked      bool   `json:"masked"`
+}
+
+// BehaviorWhenCommitIsAdded values, ordered by strictness: what happens to
+// existing approvals when a new commit lands on an open merge request.
+// ISSUE-503 treats the configured expectation as a minimum on this ladder
+// (keep < remove code-owner approvals < remove all), matching the legacy
+// platform's ordinal comparison.
+const (
+	MRApprovalBehaviorKeepApprovals            = "keep_approvals"
+	MRApprovalBehaviorRemoveCodeOwnerApprovals = "remove_approvals_by_code_owners"
+	MRApprovalBehaviorRemoveAllApprovals       = "remove_all_approvals"
+)
+
+// MRApprovalSettings are the project-level merge-request approval settings
+// (GitLab: Settings > Merge requests), normalized to positive-security form:
+// every boolean is true when the safer choice is in effect, regardless of the
+// polarity GitLab's API uses (merge_requests_author_approval, for example, is
+// inverted at projection). Read by the
+// mergeRequestApprovalSettingsMustBeCompliant control (ISSUE-503).
+type MRApprovalSettings struct {
+	// PreventApprovalByAuthor is true when MR authors cannot approve their
+	// own merge requests (GitLab: !merge_requests_author_approval).
+	PreventApprovalByAuthor bool `json:"preventApprovalByAuthor"`
+	// PreventApprovalsByCommitters is true when users who committed to an MR
+	// cannot approve it (GitLab: merge_requests_disable_committers_approval).
+	PreventApprovalsByCommitters bool `json:"preventApprovalsByCommitters"`
+	// PreventEditingApprovalRulesInMR is true when approval rules cannot be
+	// overridden per merge request
+	// (GitLab: disable_overriding_approvers_per_merge_request).
+	PreventEditingApprovalRulesInMR bool `json:"preventEditingApprovalRulesInMR"`
+	// RequireReAuthToApprove is true when approving requires
+	// re-authentication (GitLab: require_password_to_approve).
+	RequireReAuthToApprove bool `json:"requireReAuthToApprove"`
+	// BehaviorWhenCommitIsAdded is one of the MRApprovalBehavior* values,
+	// derived from GitLab's reset_approvals_on_push and
+	// selective_code_owner_removals flags.
+	BehaviorWhenCommitIsAdded string `json:"behaviorWhenCommitIsAdded"`
+}
+
+// MRSettings are the project-level merge-request/merge settings, carried in raw
+// form (not positive-security) so the mergeRequestSettingsMustBeCompliant
+// control (ISSUE-506) can compare each field against the operator's configured
+// expectation for exact equality. Field semantics mirror GitLab's project
+// payload (Settings > Merge requests).
+type MRSettings struct {
+	// MergeMethod is the project's merge method: "merge", "ff", or
+	// "rebase_merge" (GitLab: merge_method).
+	MergeMethod string `json:"mergeMethod"`
+	// SquashOption is the project's squash policy: "never", "always",
+	// "default_on", or "default_off" (GitLab: squash_option).
+	SquashOption string `json:"squashOption"`
+	// MergePipelinesEnabled is true when merged results pipelines are enabled
+	// (GitLab: merge_pipelines_enabled; Premium/Ultimate).
+	MergePipelinesEnabled bool `json:"mergePipelinesEnabled"`
+	// MergeTrainsEnabled is true when merge trains are enabled
+	// (GitLab: merge_trains_enabled; Premium/Ultimate).
+	MergeTrainsEnabled bool `json:"mergeTrainsEnabled"`
+	// AllowMergeOnSkippedPipeline is true when an MR can be merged while its
+	// pipeline is skipped (GitLab: allow_merge_on_skipped_pipeline).
+	AllowMergeOnSkippedPipeline bool `json:"allowMergeOnSkippedPipeline"`
+	// ResolveOutdatedDiffDiscussions is true when outdated diff discussions are
+	// auto-resolved on push (GitLab: resolve_outdated_diff_discussions).
+	ResolveOutdatedDiffDiscussions bool `json:"resolveOutdatedDiffDiscussions"`
+	// PrintingMergeRequestLinkEnabled is true when the MR-creation link is
+	// printed on push (GitLab: printing_merge_request_link_enabled).
+	PrintingMergeRequestLinkEnabled bool `json:"printingMergeRequestLinkEnabled"`
+	// RemoveSourceBranchAfterMerge is true when the source branch is deleted by
+	// default after merge (GitLab: remove_source_branch_after_merge).
+	RemoveSourceBranchAfterMerge bool `json:"removeSourceBranchAfterMerge"`
 }

@@ -7,9 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/getplumber/plumber/configuration"
 	"github.com/getplumber/plumber/control"
-	opaengine "github.com/getplumber/plumber/internal/engine/opa"
+	"github.com/spf13/cobra"
 )
 
 // loadConfigOrOffer — non-interactive paths (no TTY in CI or test runner).
@@ -92,6 +91,42 @@ func TestParseControlsFilters_BothSet(t *testing.T) {
 	}
 }
 
+// --no-controls means "evaluate nothing"; --controls / --skip-controls mean
+// "evaluate this subset". Asking for both is a contradiction, and silently
+// letting one win would hide a broken CI invocation, so it is a usage error.
+func TestParseControlsFilters_NoControlsConflicts(t *testing.T) {
+	origInclude, origSkip, origNone := controlsFilter, skipControls, noControls
+	defer func() { controlsFilter, skipControls, noControls = origInclude, origSkip, origNone }()
+
+	for _, tc := range []struct{ name, include, skip string }{
+		{"with --controls", "pipelineMustNotEnableDebugTrace", ""},
+		{"with --skip-controls", "", "pipelineMustNotEnableDebugTrace"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			controlsFilter, skipControls, noControls = tc.include, tc.skip, true
+			_, _, err := parseControlsFilters()
+			if err == nil || !strings.Contains(err.Error(), "--no-controls") {
+				t.Fatalf("expected a --no-controls conflict error, got %v", err)
+			}
+		})
+	}
+}
+
+// --no-controls on its own is not a conflict.
+func TestParseControlsFilters_NoControlsAlone(t *testing.T) {
+	origInclude, origSkip, origNone := controlsFilter, skipControls, noControls
+	defer func() { controlsFilter, skipControls, noControls = origInclude, origSkip, origNone }()
+
+	controlsFilter, skipControls, noControls = "", "", true
+	include, skip, err := parseControlsFilters()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(include) != 0 || len(skip) != 0 {
+		t.Fatalf("expected no filters, got include=%v skip=%v", include, skip)
+	}
+}
+
 func TestParseControlsFilters_IncludeOnly(t *testing.T) {
 	origInclude, origSkip := controlsFilter, skipControls
 	controlsFilter = "pipelineMustNotEnableDebugTrace,containerImageMustNotUseForbiddenTags"
@@ -125,126 +160,6 @@ func TestParseControlsFilters_SkipOnly(t *testing.T) {
 	}
 	if len(skip) != 1 || skip[0] != "pipelineMustNotEnableDebugTrace" {
 		t.Fatalf("skip: got %v", skip)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// computeGitLabCompliance
-// ---------------------------------------------------------------------------
-
-func confWithDebugTrace() *configuration.Configuration {
-	enabled := true
-	pc := &configuration.PlumberConfig{
-		Version: "2.0",
-		GitLab: &configuration.ProviderConfig{
-			Controls: configuration.ControlsConfig{
-				PipelineMustNotEnableDebugTrace: &configuration.DebugTraceControlConfig{
-					Enabled: &enabled,
-				},
-			},
-		},
-	}
-	conf := configuration.NewDefaultConfiguration()
-	conf.PlumberConfig = pc
-	return conf
-}
-
-func TestComputeGitLabCompliance_CiMissing(t *testing.T) {
-	result := &control.AnalysisResult{CiMissing: true, CiValid: true}
-	compliance, count := computeGitLabCompliance(result, confWithDebugTrace())
-	if compliance != 0 || count != 0 {
-		t.Fatalf("CiMissing: want 0/0, got %v/%v", compliance, count)
-	}
-}
-
-func TestComputeGitLabCompliance_CiInvalid(t *testing.T) {
-	result := &control.AnalysisResult{CiMissing: false, CiValid: false}
-	compliance, count := computeGitLabCompliance(result, confWithDebugTrace())
-	if compliance != 0 || count != 0 {
-		t.Fatalf("CiInvalid: want 0/0, got %v/%v", compliance, count)
-	}
-}
-
-func TestComputeGitLabCompliance_NoFindings(t *testing.T) {
-	result := &control.AnalysisResult{CiValid: true, CiMissing: false}
-	compliance, count := computeGitLabCompliance(result, confWithDebugTrace())
-	if count == 0 {
-		t.Fatal("expected at least one control to be counted")
-	}
-	if compliance != 100.0 {
-		t.Fatalf("no findings → want 100%%, got %.1f%%", compliance)
-	}
-}
-
-func TestComputeGitLabCompliance_WithFinding(t *testing.T) {
-	result := &control.AnalysisResult{
-		CiValid:   true,
-		CiMissing: false,
-		Findings: []opaengine.Finding{
-			{Code: string(control.CodeDebugTraceEnabled)},
-		},
-	}
-	compliance, count := computeGitLabCompliance(result, confWithDebugTrace())
-	if count == 0 {
-		t.Fatal("expected at least one control to be counted")
-	}
-	if compliance >= 100.0 {
-		t.Fatalf("finding present → compliance should be <100, got %.1f", compliance)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// buildComplianceRows
-// ---------------------------------------------------------------------------
-
-func TestBuildComplianceRows_SkippedShowsDash(t *testing.T) {
-	controls := []controlSummary{
-		{name: "ctrl", compliance: 100, skipped: true},
-	}
-	rows := buildComplianceRows(controls, 100.0, 100.0)
-	// rows[0] = the control; rows[1] = total
-	if rows[0].compStr != "-" || rows[0].status != "-" {
-		t.Fatalf("skipped row: want compStr='-' status='-', got %q %q", rows[0].compStr, rows[0].status)
-	}
-}
-
-func TestBuildComplianceRows_PassingControl(t *testing.T) {
-	controls := []controlSummary{
-		{name: "ctrl", compliance: 100, skipped: false},
-	}
-	rows := buildComplianceRows(controls, 100.0, 100.0)
-	if rows[0].compStr != "100.0%" {
-		t.Fatalf("passing row: want '100.0%%', got %q", rows[0].compStr)
-	}
-	if !rows[0].compOK {
-		t.Fatal("passing row: compOK should be true")
-	}
-	if rows[0].status != "🟢" {
-		t.Fatalf("passing row: status want 🟢, got %q", rows[0].status)
-	}
-}
-
-func TestBuildComplianceRows_FailingControl(t *testing.T) {
-	controls := []controlSummary{
-		{name: "ctrl", compliance: 0, skipped: false},
-	}
-	rows := buildComplianceRows(controls, 0.0, 100.0)
-	if rows[0].status != "🔴" {
-		t.Fatalf("failing row: status want 🔴, got %q", rows[0].status)
-	}
-}
-
-func TestBuildComplianceRows_TotalRow(t *testing.T) {
-	rows := buildComplianceRows(nil, 75.0, 80.0)
-	total := rows[len(rows)-1]
-	if !total.isTotal {
-		t.Fatal("last row should be the total row")
-	}
-	if total.compStr != "75.0%" {
-		t.Fatalf("total compStr: got %q", total.compStr)
-	}
-	if total.status != "🔴" {
-		t.Fatalf("total below threshold: want 🔴, got %q", total.status)
 	}
 }
 
@@ -363,7 +278,7 @@ func TestLoadConfigOrOffer_FileExists(t *testing.T) {
 		t.Fatalf("write temp config: %v", err)
 	}
 
-	pc, path, warnings, err := loadConfigOrOffer(cfgPath)
+	pc, path, warnings, err := loadConfigOrOffer(cfgPath, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -376,16 +291,18 @@ func TestLoadConfigOrOffer_FileExists(t *testing.T) {
 	_ = warnings // may be non-empty for a minimal config, that's fine
 }
 
-func TestLoadConfigOrOffer_MissingFile_NonInteractive(t *testing.T) {
-	// Ensure non-interactive mode: CI env var forces isInteractiveInit to false.
+func TestLoadConfigOrOffer_ExplicitMissingFile_Errors(t *testing.T) {
+	// A --config path the user named explicitly (configExplicit=true) must
+	// still fail when absent — we don't silently swap in the default for a
+	// file they asked for.
 	t.Setenv("CI", "true")
 
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "nonexistent.yaml")
 
-	_, _, _, err := loadConfigOrOffer(cfgPath)
+	_, _, _, err := loadConfigOrOffer(cfgPath, true)
 	if err == nil {
-		t.Fatal("expected an error for missing config file")
+		t.Fatal("expected an error for an explicitly-requested missing config file")
 	}
 	msg := err.Error()
 	if !strings.Contains(msg, "configuration file not found") {
@@ -393,6 +310,69 @@ func TestLoadConfigOrOffer_MissingFile_NonInteractive(t *testing.T) {
 	}
 	if !strings.Contains(msg, "plumber config generate") || !strings.Contains(msg, "plumber config init") {
 		t.Errorf("error should include generation hint, got: %s", msg)
+	}
+}
+
+func TestLoadConfigOrOffer_MissingDefault_FallsBackToEmbedded(t *testing.T) {
+	// No local file and no explicit --config (configExplicit=false), non-
+	// interactive: instead of failing, fall back to the binary's embedded
+	// default so a zero-config scan still runs (getplumber/plumber#326).
+	t.Setenv("CI", "true")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, ".plumber.yaml") // does not exist
+
+	pc, path, _, err := loadConfigOrOffer(cfgPath, false)
+	if err != nil {
+		t.Fatalf("expected fallback to the embedded default, got error: %v", err)
+	}
+	if pc == nil {
+		t.Fatal("expected non-nil PlumberConfig from the embedded default")
+	}
+	if path != builtinDefaultConfigSource {
+		t.Errorf("path: got %q, want %q", path, builtinDefaultConfigSource)
+	}
+	// The embedded default is a real config: it should carry provider sections.
+	if pc.GitHub == nil && pc.GitLab == nil {
+		t.Error("embedded default should populate at least one provider section")
+	}
+}
+
+// The GitLab CI component passes the config path via PLUMBER_ANALYZE_CONFIG,
+// not a --config flag. That env value must count as an EXPLICIT config, so a
+// missing path hard-fails instead of silently falling back to the embedded
+// default. This drives the exact wiring runAnalyze uses — apply the env
+// fallback, then derive configExplicitlySet from cmd.Flags().Changed("config")
+// — so a refactor that drops the Flags().Set side effect in envStringFallback
+// (or reorders the assignment) is caught here rather than shipping a
+// misconfigured CI job that scans with default rules.
+func TestConfigExplicit_FromEnvVar_MissingPathHardFails(t *testing.T) {
+	origFile, origExplicit := configFile, configExplicitlySet
+	defer func() { configFile, configExplicitlySet = origFile, origExplicit }()
+
+	missing := filepath.Join(t.TempDir(), "from-env.yaml")
+	t.Setenv(envKeys["config"], missing) // PLUMBER_ANALYZE_CONFIG=<missing>
+
+	cmd := &cobra.Command{Use: "analyze"}
+	cmd.Flags().StringVar(&configFile, "config", ".plumber.yaml", "")
+
+	if err := envStringFallback(cmd, "config", envKeys["config"], &configFile); err != nil {
+		t.Fatalf("envStringFallback: %v", err)
+	}
+	configExplicitlySet = cmd.Flags().Changed("config")
+	if !configExplicitlySet {
+		t.Fatal("PLUMBER_ANALYZE_CONFIG must make --config count as explicit")
+	}
+	if configFile != missing {
+		t.Fatalf("configFile = %q, want %q", configFile, missing)
+	}
+
+	_, _, _, err := loadConfigOrOffer(configFile, configExplicitlySet)
+	if err == nil {
+		t.Fatal("an env-provided missing config must hard-fail, not fall back to the default")
+	}
+	if !strings.Contains(err.Error(), "configuration file not found") {
+		t.Errorf("want 'configuration file not found', got: %v", err)
 	}
 }
 
@@ -405,7 +385,7 @@ func TestLoadConfigOrOffer_InvalidYAML_NonInteractive(t *testing.T) {
 		t.Fatalf("write temp config: %v", err)
 	}
 
-	_, _, _, err := loadConfigOrOffer(cfgPath)
+	_, _, _, err := loadConfigOrOffer(cfgPath, false)
 	if err == nil {
 		t.Fatal("expected an error for invalid YAML")
 	}
@@ -413,5 +393,34 @@ func TestLoadConfigOrOffer_InvalidYAML_NonInteractive(t *testing.T) {
 	msg := err.Error()
 	if !strings.Contains(msg, "configuration error") {
 		t.Errorf("error should mention 'configuration error', got: %s", msg)
+	}
+}
+
+// TestEqualIgnoringScheme pins the checkout-identity comparison's scheme
+// insensitivity. ParseGitRemoteURL normalizes every remote to https://host,
+// so a plain-http --gitlab-url (a self-hosted instance without TLS, or a
+// test rig) could never equal it and the CI-config digest was silently never
+// computed: the operator stood in the analyzed checkout while the verbose
+// line claimed there was none. Host, port and path stay significant; only
+// the scheme and a trailing slash are not identity.
+func TestEqualIgnoringScheme(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"https://127.0.0.1:9501", "http://127.0.0.1:9501", true},
+		{"http://gitlab.example", "https://gitlab.example", true},
+		{"https://gitlab.com", "https://gitlab.com", true},
+		{"https://gitlab.com/", "https://gitlab.com", true},
+		{"https://gitlab.com", "https://gitlab.example", false},
+		{"https://127.0.0.1:9501", "https://127.0.0.1:9601", false},
+		{"", "https://gitlab.com", false},
+		{"https://gitlab.com", "", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		if got := equalIgnoringScheme(c.a, c.b); got != c.want {
+			t.Errorf("equalIgnoringScheme(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
 	}
 }

@@ -49,10 +49,20 @@ const (
 	CodeReleaseWorkflowUnsigned ErrorCode = "ISSUE-712"
 	// ISSUE-713: Third-party GitHub Action comes from an unauthorized source
 	CodeActionUnauthorizedSource ErrorCode = "ISSUE-713"
+	// ISSUE-714: Action fetches and runs remote code from a mutable ref, in the open (no integrity check)
+	CodeActionMutableRemoteExec ErrorCode = "ISSUE-714"
+	// ISSUE-715: Action OBFUSCATES a remote code fetch/exec (decode-then-run)
+	CodeActionObfuscatedRemoteExec ErrorCode = "ISSUE-715"
+	// ISSUE-716: Action source could not be verified (fetch failed) — not a pass
+	CodeActionRemoteExecUnverified ErrorCode = "ISSUE-716"
 )
 
 // Issue codes for CI/CD variable controls (2xx)
 const (
+	// ISSUE-201: CI/CD settings variable is not protected (exposed to pipelines on unprotected branches)
+	CodeCicdVariableUnprotected ErrorCode = "ISSUE-201"
+	// ISSUE-202: CI/CD settings variable is not masked (its value prints in job logs)
+	CodeCicdVariableUnmasked ErrorCode = "ISSUE-202"
 	// ISSUE-203: Pipeline enables CI debug trace (CI_DEBUG_TRACE or CI_DEBUG_SERVICES)
 	CodeDebugTraceEnabled ErrorCode = "ISSUE-203"
 	// ISSUE-204: Unsafe variable expansion in shell re-interpretation context (eval, sh -c, etc.)
@@ -81,11 +91,12 @@ const (
 
 // Issue codes for secret and credential handling controls (3xx)
 const (
-	// ISSUE-301: Pipeline configuration contains hardcoded secrets detected by gitleaks.
-	// Reconciled with the existing downstream mapping (jobs platform), which has
-	// recorded "Secret leak in pipeline configuration" under ISSUE-301 since
-	// before the gitleaks rule was implemented in the CLI.
-	CodePipelineLeaksSecrets ErrorCode = "ISSUE-301"
+	// ISSUE-301 is RETIRED — do not reuse. It carried the gitleaks-based
+	// "secret leak in pipeline configuration" rule until the integration
+	// was removed (#310, advisory GHSA-w2xj-4v44-6rqr), and the
+	// downstream jobs platform has mapped that meaning to 301 since
+	// before the CLI rule existed, so the slot must stay vacant forever.
+
 	// ISSUE-302: Reusable workflow called with `secrets: inherit`
 	CodeSecretsInherit ErrorCode = "ISSUE-302"
 	// ISSUE-303: Secret dereferenced via fromJSON bypasses log redaction
@@ -96,7 +107,8 @@ const (
 	CodeSecretsOutsideEnv ErrorCode = "ISSUE-305"
 	// ISSUE-306: GitHub App token issued with revocation disabled
 	CodeGitHubAppSkipRevoke ErrorCode = "ISSUE-306"
-	// ISSUE-307: Checkout persists credentials in .git/config (artipacked)
+	// ISSUE-307: Checkout persists credentials in .git/config — latent
+	// hygiene (low). The demonstrable-leak escalation is ISSUE-310.
 	CodeArtipacked ErrorCode = "ISSUE-307"
 	// ISSUE-308: Workflow reads a secret via a dynamic index (secrets[expr])
 	CodeSecretsDynamicIndex ErrorCode = "ISSUE-308"
@@ -104,6 +116,9 @@ const (
 	// Moved from ISSUE-301 in the 301/309 swap so the leaked-secrets rule could
 	// take the slot already used by the downstream jobs platform.
 	CodeOverprovisionedSecrets ErrorCode = "ISSUE-309"
+	// ISSUE-310: Persisted checkout credentials are packed into an uploaded
+	// artifact (`.git` in the artifact) — the demonstrable ArtiPACKED leak.
+	CodeArtipackedExfiltrated ErrorCode = "ISSUE-310"
 )
 
 // Issue codes for pipeline composition controls (4xx)
@@ -143,10 +158,10 @@ const (
 	CodeRequiredActionMissing ErrorCode = "ISSUE-417"
 )
 
-// Issue codes for workflow-hygiene controls (6xx)
+// Issue codes for workflow-hygiene controls (4xx, plus the 9xx repo-hygiene codes)
 const (
-	// ISSUE-601: Workflow has no explicit `name:` field
-	CodeAnonymousDefinition ErrorCode = "ISSUE-601"
+	// ISSUE-422: Workflow has no explicit `name:` field
+	CodeAnonymousDefinition ErrorCode = "ISSUE-422"
 	// ISSUE-418: Workflow has no `concurrency:` block at either level
 	CodeMissingConcurrency ErrorCode = "ISSUE-418"
 	// ISSUE-419: Workflow uses a misfeature pattern (shell: cmd, inline pip install curl|sh, …)
@@ -171,10 +186,24 @@ const (
 const (
 	// ISSUE-501: Branch is not protected
 	CodeBranchUnprotected ErrorCode = "ISSUE-501"
+	// ISSUE-502: A merge-request approval rule covering all protected branches requires fewer approvals than the configured minimum
+	CodeMRApprovalRulesBelowMinimum ErrorCode = "ISSUE-502"
+	// ISSUE-503: The project's merge-request approval settings do not meet the configured expectations
+	CodeMRApprovalSettingsNonCompliant ErrorCode = "ISSUE-503"
+	// ISSUE-504: No merge-request approval rule applies to all protected branches
+	CodeMRApprovalRulesAllBranchesMissing ErrorCode = "ISSUE-504"
 	// ISSUE-505: Branch has non-compliant protection settings
 	CodeBranchNonCompliant ErrorCode = "ISSUE-505"
+	// ISSUE-506: The project's merge-request/merge settings do not meet the configured expectations
+	CodeMRSettingsNonCompliant ErrorCode = "ISSUE-506"
 	// ISSUE-803: Job runs with overly broad permissions (write-all)
 	CodeExcessivePermissions ErrorCode = "ISSUE-803"
+)
+
+// Issue codes for security-policy-source controls (6xx)
+const (
+	// ISSUE-601: No (or the wrong) GitLab security policy project is linked
+	CodeSecurityPolicyProjectNotSet ErrorCode = "ISSUE-601"
 )
 
 // ErrorCodeInfo provides metadata about an issue code.
@@ -293,12 +322,39 @@ var errorCodeRegistry = map[ErrorCode]ErrorCodeInfo{
 		DocURL:      docsBaseURL + string(CodeActionUnauthorizedSource),
 		ControlName: "githubActionMustComeFromAuthorizedSources",
 	},
+	CodeActionMutableRemoteExec: {
+		Code:        CodeActionMutableRemoteExec,
+		Severity:    SeverityHigh,
+		Title:       "Action fetches and runs remote code from a mutable ref (in the open)",
+		Description: "A third-party action's own source fetches and executes a script from a MOVING ref (a branch such as main/master, not a tag or SHA) of another repository at runtime, and does not verify the download against a checksum. Pinning the action by commit SHA does not reach this: the fetched code can change with nothing committed where the pin can see it, so a compromise or retag of that upstream branch runs arbitrary code in the job with its token and secrets. The canonical example is anchore/scan-action, which fetches `raw.githubusercontent.com/anchore/grype/main/install.sh` and runs it. This is a static, text-level match on the action's source: it catches the in-the-open shape, not an author who deliberately hides the fetch (see ISSUE-715), so a clean result asserts 'no known pattern seen', not 'safe'.",
+		Remediation: "Prefer an action that pins its downloads to an immutable ref AND verifies a checksum. Otherwise install the tool yourself from a pinned release, verify it against a checksum committed to your repo, and run it directly; or vendor the action and pin its internal fetch. A fetch that already verifies a pinned checksum is content-pinned and is not flagged here.",
+		DocURL:      docsBaseURL + string(CodeActionMutableRemoteExec),
+		ControlName: "actionsMustNotExecuteMutableRemoteCode",
+	},
+	CodeActionObfuscatedRemoteExec: {
+		Code:        CodeActionObfuscatedRemoteExec,
+		Severity:    SeverityCritical,
+		Title:       "Action obfuscates a remote code fetch/exec",
+		Description: "The action's own source decodes and then executes code: `base64 -d | sh`, `eval \"$(… | base64 -d)\"`, `eval(atob(…))`, `new Function(atob(x))`, a hex/xxd decode piped to a shell, and similar. No legitimate action needs to hide what it runs at runtime, so obfuscation-then-execute is treated as the strongest signal regardless of the host, ref, or encoding used. This deliberately does NOT chase every possible encoding (an unbounded space); it flags the act of hiding itself, which is what makes a clean result meaningful here.",
+		Remediation: "Remove the obfuscation. If the action is a dependency, drop or vendor it and replace the hidden fetch with an explicit, pinned, checksum-verified install. An action that must decode data at runtime should not feed that decoded value into a shell or eval.",
+		DocURL:      docsBaseURL + string(CodeActionObfuscatedRemoteExec),
+		ControlName: "actionsMustNotExecuteMutableRemoteCode",
+	},
+	CodeActionRemoteExecUnverified: {
+		Code:        CodeActionRemoteExecUnverified,
+		Severity:    SeverityLow,
+		Title:       "Action source could not be verified",
+		Description: "Plumber could not fetch the action's own source (a network error, API rate limit, GitHub Enterprise Server host, private repo, or a Docker-image action) so it could not confirm whether the action fetches mutable remote code at runtime. This is surfaced as an explicit could-not-verify finding rather than a silent pass, because a silent pass would let the same repository score differently across CI environments and would over-claim safety on an unchecked dependency.",
+		Remediation: "Re-run where the action source is reachable (authenticated token, network access) to get a definitive result, or vendor the action so its source is local and auditable. This finding is informational: it flags an unchecked dependency, not a confirmed problem.",
+		DocURL:      docsBaseURL + string(CodeActionRemoteExecUnverified),
+		ControlName: "actionsMustNotExecuteMutableRemoteCode",
+	},
 	CodeImpostorCommit: {
 		Code:        CodeImpostorCommit,
 		Severity:    SeverityCritical,
 		Title:       "Pinned commit SHA does not belong to the action's repository",
 		Description: "A workflow pins an action to a commit SHA that does not resolve in the action's upstream repository. That means either the SHA was mistyped (the reference silently runs whatever tag/branch GitHub falls back to, typically the default branch) or — far worse — the author was tricked by a PR comment / stargazer dashboard showing a detached commit that was never merged upstream. The name-and-SHA combination is the precise form of the `impostor commit` attack documented in academic supply-chain literature.",
-		Remediation: "Replace the reference with a SHA that actually belongs to the action's repository. Use `gh api repos/<owner>/<repo>/commits/<sha>` to verify before committing the change.",
+		Remediation: "Replace the reference with a SHA that actually belongs to the action's repository. Use `gh api repos/<owner>/<repo>/commits/<sha>` to verify before committing the change. That endpoint only accepts commit SHAs, so a pin naming an annotated tag object answers 422 there; check it with `gh api repos/<owner>/<repo>/git/tags/<sha>` instead, which also reports the tag name and the commit it points at.",
 		DocURL:      docsBaseURL + string(CodeImpostorCommit),
 		ControlName: "actionRefsMustExistUpstream",
 	},
@@ -367,6 +423,24 @@ var errorCodeRegistry = map[ErrorCode]ErrorCodeInfo{
 	},
 
 	// CI/CD variable controls (2xx)
+	CodeCicdVariableUnprotected: {
+		Code:        CodeCicdVariableUnprotected,
+		Severity:    SeverityMedium,
+		Title:       "CI/CD settings variable is not protected",
+		Description: "A project CI/CD settings variable is not marked protected, so it is injected into pipelines running on unprotected branches. Anyone who can push to such a branch can exfiltrate its value.",
+		Remediation: "Mark the variable protected in Settings > CI/CD > Variables so it is only exposed to pipelines on protected branches and tags.",
+		DocURL:      docsBaseURL + string(CodeCicdVariableUnprotected),
+		ControlName: "cicdVariablesMustBeProtected",
+	},
+	CodeCicdVariableUnmasked: {
+		Code:        CodeCicdVariableUnmasked,
+		Severity:    SeverityMedium,
+		Title:       "CI/CD settings variable is not masked",
+		Description: "A project CI/CD settings variable is not masked, so its value prints verbatim in every job log a project member can read.",
+		Remediation: "Enable masking in Settings > CI/CD > Variables. GitLab requires a value of at least 8 characters; restructure the secret if it cannot be masked by length.",
+		DocURL:      docsBaseURL + string(CodeCicdVariableUnmasked),
+		ControlName: "cicdVariablesMustBeMasked",
+	},
 	CodeDebugTraceEnabled: {
 		Code:        CodeDebugTraceEnabled,
 		Severity:    SeverityCritical,
@@ -516,6 +590,33 @@ var errorCodeRegistry = map[ErrorCode]ErrorCodeInfo{
 		DocURL:      docsBaseURL + string(CodeBranchUnprotected),
 		ControlName: "branchMustBeProtected",
 	},
+	CodeMRApprovalRulesBelowMinimum: {
+		Code:        CodeMRApprovalRulesBelowMinimum,
+		Severity:    SeverityHigh,
+		Title:       "Merge request approval rule requires too few approvals",
+		Description: "A merge request approval rule that covers all protected branches requires fewer approvals than the configured minimum, so a protected branch can be merged with too little review.",
+		Remediation: "Raise the rule's required approvals in Settings > Merge requests > Approval rules to at least your configured minimum, or narrow the rule's scope if it is not meant to cover all protected branches.",
+		DocURL:      docsBaseURL + string(CodeMRApprovalRulesBelowMinimum),
+		ControlName: "mergeRequestApprovalRulesMustRequireMinimumApprovals",
+	},
+	CodeMRApprovalSettingsNonCompliant: {
+		Code:        CodeMRApprovalSettingsNonCompliant,
+		Severity:    SeverityHigh,
+		Title:       "MR approval settings are not compliant",
+		Description: "The project's merge request approval settings fall short of the configured expectations (authors or committers can approve, rules can be overridden per MR, no re-authentication, or approvals survive new commits), so approvals can be weakened at the project level regardless of any approval rule.",
+		Remediation: "Tighten the project's approval settings in Settings > Merge requests: prevent approval by the author and by committers, prevent editing approval rules in merge requests, require re-authentication to approve, and remove approvals when new commits are added, as your policy requires.",
+		DocURL:      docsBaseURL + string(CodeMRApprovalSettingsNonCompliant),
+		ControlName: "mergeRequestApprovalSettingsMustBeCompliant",
+	},
+	CodeMRApprovalRulesAllBranchesMissing: {
+		Code:        CodeMRApprovalRulesAllBranchesMissing,
+		Severity:    SeverityHigh,
+		Title:       "No approval rule covers all protected branches",
+		Description: "No merge request approval rule applies to all protected branches, so a protected branch can exist with no required approval and be merged without review.",
+		Remediation: "Add a merge request approval rule that applies to all protected branches in Settings > Merge requests > Approval rules.",
+		DocURL:      docsBaseURL + string(CodeMRApprovalRulesAllBranchesMissing),
+		ControlName: "mergeRequestApprovalRulesMustCoverAllProtectedBranches",
+	},
 	CodeBranchNonCompliant: {
 		Code:        CodeBranchNonCompliant,
 		Severity:    SeverityHigh,
@@ -524,6 +625,24 @@ var errorCodeRegistry = map[ErrorCode]ErrorCodeInfo{
 		Remediation: "Update branch protection settings in GitLab: Settings > Repository > Protected Branches. Ensure force push is disabled, access levels meet the minimum, and code owner approval is required per your .plumber.yaml configuration.",
 		DocURL:      docsBaseURL + string(CodeBranchNonCompliant),
 		ControlName: "branchMustBeProtected",
+	},
+	CodeMRSettingsNonCompliant: {
+		Code:        CodeMRSettingsNonCompliant,
+		Severity:    SeverityMedium,
+		Title:       "MR settings are not compliant",
+		Description: "The project's merge-request/merge settings (merge method, squash policy, merge trains, source-branch removal, and related options) do not match the configured expectations, so merges can happen in a way the policy does not allow.",
+		Remediation: "Align the project's merge-request settings in Settings > Merge requests with your policy: set the required merge method and squash option, and toggle the merge-train, skipped-pipeline, discussion-resolution, and source-branch-removal options to the expected values.",
+		DocURL:      docsBaseURL + string(CodeMRSettingsNonCompliant),
+		ControlName: "mergeRequestSettingsMustBeCompliant",
+	},
+	CodeSecurityPolicyProjectNotSet: {
+		Code:        CodeSecurityPolicyProjectNotSet,
+		Severity:    SeverityCritical,
+		Title:       "Missing security policy source on project",
+		Description: "The project does not directly link the expected GitLab security policy project (none is linked, or a different one than the configured expectation). This checks the project's own link only, so a security policy source inherited from a parent group is not detected.",
+		Remediation: "Link the expected security policy project in Settings > Security & Compliance > Policies (or set it via the API). If your policies are enforced at a parent group and inherited, this project-scoped check will not see them, so link at the project level too or disable this control. Security policies require GitLab Ultimate.",
+		DocURL:      docsBaseURL + string(CodeSecurityPolicyProjectNotSet),
+		ControlName: "projectMustHaveSecurityPolicySource",
 	},
 	CodeTemplateInjection: {
 		Code:        CodeTemplateInjection,
@@ -599,7 +718,7 @@ var errorCodeRegistry = map[ErrorCode]ErrorCodeInfo{
 	},
 	CodeGitHubEnvInjection: {
 		Code:        CodeGitHubEnvInjection,
-		Severity:    SeverityCritical,
+		Severity:    SeverityHigh,
 		Title:       "Untrusted content written to $GITHUB_ENV or $GITHUB_PATH",
 		Description: "A GitHub Actions `run:` step appends a user-controlled value (PR title, issue body, fork branch name, ...) to `$GITHUB_ENV` or `$GITHUB_PATH`. The appended value becomes an environment variable or PATH entry for every subsequent step in the job. An attacker who controls the value can override existing variables (for example `NODE_OPTIONS=--require=./exfil.js`) or inject a malicious directory at the front of PATH, hijacking any later `npm`, `bash`, etc. invocation and exfiltrating secrets from privileged triggers.",
 		Remediation: "Do not write user-controlled values into `$GITHUB_ENV` or `$GITHUB_PATH`. If you must propagate a value derived from user input, bind it through an `env:` block first (`env: { TITLE: ${{ github.event.issue.title }} }`) and validate/escape it before writing — or pass it as a step output instead. Restrict workflows touching these files to non-PR triggers when possible.",
@@ -608,11 +727,20 @@ var errorCodeRegistry = map[ErrorCode]ErrorCodeInfo{
 	},
 	CodeArtipacked: {
 		Code:        CodeArtipacked,
-		Severity:    SeverityHigh,
-		Title:       "Checkout persists credentials in .git/config",
-		Description: "A GitHub Actions job runs `actions/checkout` without disabling credential persistence. By default the action writes GITHUB_TOKEN into the cloned repository's .git/config. Any subsequent step that uploads `.git` as part of an artifact, or executes fork-controlled code, can exfiltrate the token.",
+		Severity:    SeverityLow,
+		Title:       "Checkout persists credentials in .git/config (latent)",
+		Description: "A GitHub Actions job runs `actions/checkout` without disabling credential persistence. By default the action writes GITHUB_TOKEN into the cloned repository's .git/config, where it survives for the lifetime of the job. On its own this is latent hygiene: the token is discarded when the job ends. It becomes a demonstrable leak only when a later step packs `.git` into an uploaded artifact (escalated to ISSUE-310) or when fork-controlled code runs in the job (covered by ISSUE-802 / ISSUE-804).",
 		Remediation: "Add `with: { persist-credentials: false }` on every `uses: actions/checkout@*` step unless the job legitimately needs to push back. When push is required, scope the token with an explicit `permissions:` block.",
 		DocURL:      docsBaseURL + string(CodeArtipacked),
+		ControlName: "checkoutMustNotPersistCredentials",
+	},
+	CodeArtipackedExfiltrated: {
+		Code:        CodeArtipackedExfiltrated,
+		Severity:    SeverityHigh,
+		Title:       "Persisted checkout credentials packed into an uploaded artifact",
+		Description: "A GitHub Actions job runs `actions/checkout` with credential persistence enabled and then a later `actions/upload-artifact` step uploads a `.git`-inclusive path (the workspace root, `.`, or a path naming `.git`). The GITHUB_TOKEN written into `.git/config` is packed into the artifact, which is downloadable (anonymously, on public repos), so the token is exfiltrable. This is the canonical, demonstrable ArtiPACKED leak.",
+		Remediation: "Add `with: { persist-credentials: false }` on the `actions/checkout@*` step, or upload a scoped path that excludes `.git` (e.g. `path: dist/` instead of `path: .`). When push is required, scope the token with an explicit `permissions:` block.",
+		DocURL:      docsBaseURL + string(CodeArtipackedExfiltrated),
 		ControlName: "checkoutMustNotPersistCredentials",
 	},
 	CodeUnredactedSecrets: {
@@ -632,27 +760,6 @@ var errorCodeRegistry = map[ErrorCode]ErrorCodeInfo{
 		Remediation: "Declare the narrowest permissions explicitly: `permissions: { contents: read }` at the workflow level and widen per-job only when a step needs to push, comment on issues, etc. This enforces the principle of least privilege regardless of the repo default setting.",
 		DocURL:      docsBaseURL + string(CodeUndocumentedPermissions),
 		ControlName: "workflowsMustDeclarePermissions",
-	},
-	CodePipelineLeaksSecrets: {
-		Code:        CodePipelineLeaksSecrets,
-		Severity:    SeverityCritical,
-		Title:       "Secret leak in pipeline configuration",
-		Description: "The resolved pipeline configuration contains a pattern that matches a hardcoded secret (API token, private key, password, or other credential) embedded directly in the YAML. Secrets committed to pipeline configuration are exposed to everyone with read access to the repository, appear in version history, and are forwarded to every runner that executes the pipeline.",
-		Remediation: "Remove the hardcoded value and store it as a masked, protected CI/CD variable. Reference it in the pipeline as `$MY_SECRET` rather than embedding the value directly.",
-		DocURL:      docsBaseURL + string(CodePipelineLeaksSecrets),
-		ControlName: "pipelineMustNotLeakSecretsInConfig",
-		// Per-provider overrides for SARIF / JSON / GLSAST output. The
-		// terminal renderer already gets per-provider naming via the
-		// catalog DisplayName. The GitLab default above mirrors the
-		// downstream jobs-platform mapping; the GitHub override mirrors
-		// the workflow-flavoured naming used in the rest of the GitHub
-		// catalog entries.
-		TitleByProvider: map[string]string{
-			"github": "Secret leak in workflow configuration",
-		},
-		DescriptionByProvider: map[string]string{
-			"github": "A file under `.github/workflows/` contains a pattern that matches a hardcoded secret (API token, private key, password, or other credential) embedded directly in the YAML. Workflows committed to a repository are exposed to every collaborator, every fork, and the entire commit history, and are forwarded to every runner that executes the workflow.",
-		},
 	},
 	CodeSecretsDynamicIndex: {
 		Code:        CodeSecretsDynamicIndex,

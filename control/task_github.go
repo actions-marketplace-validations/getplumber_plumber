@@ -2,16 +2,56 @@ package control
 
 import (
 	"errors"
-	"path/filepath"
+	"os"
 	"strings"
 
 	"github.com/getplumber/plumber/configuration"
 	githubpkg "github.com/getplumber/plumber/github"
-	"github.com/getplumber/plumber/gitlab"
 	"github.com/getplumber/plumber/internal/ir"
 	"github.com/getplumber/plumber/utils"
 	"github.com/sirupsen/logrus"
 )
+
+// fetchGitHubDefaultBranch is a test seam over the repo-metadata lookup.
+// The default honors PLUMBER_DISABLE_GITHUB_API (same contract as the
+// metadata client) so offline test suites never hit the network.
+var fetchGitHubDefaultBranch = func(host, owner, repo string) (string, error) {
+	if v := os.Getenv(githubpkg.EnvDisableGitHubAPI); v == "1" || v == "true" {
+		return "", nil
+	}
+	return githubpkg.FetchGitHubDefaultBranch(host, owner, repo)
+}
+
+// scanGitHubWorkflowsRemote is a test seam over the remote workflow fetch,
+// which otherwise needs network and auth.
+var scanGitHubWorkflowsRemote = githubpkg.ScanGitHubWorkflowsRemote
+
+// resolveGitHubDefaultBranch overwrites pipeline.DefaultBranch with the
+// forge's answer. The scan seeds the field with the branch being ANALYZED
+// (the --branch flag locally, the fetched ref remotely), which is only a
+// stand-in: the seed is kept when the lookup degrades (no auth, API down),
+// never preferred. This runs
+// regardless of which controls are enabled: the score service only updates
+// the public badge when the pushed report's defaultBranch matches the
+// OIDC-attested branch, so a missing value silently strands every push on
+// a per-branch record.
+func resolveGitHubDefaultBranch(l *logrus.Entry, pipeline *ir.NormalizedPipeline, host, projectPath string) {
+	if pipeline == nil {
+		return
+	}
+	parts := strings.SplitN(projectPath, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return
+	}
+	def, err := fetchGitHubDefaultBranch(host, parts[0], parts[1])
+	if err != nil {
+		l.WithError(err).Debug("default-branch lookup failed; keeping the analyze-branch stand-in")
+		return
+	}
+	if def != "" {
+		pipeline.DefaultBranch = def
+	}
+}
 
 // enrichGitHubBranches populates pipeline.Branches via the GitHub
 // REST API when the user has enabled the branchMustBeProtected
@@ -43,23 +83,18 @@ func enrichGitHubBranches(l *logrus.Entry, pipeline *ir.NormalizedPipeline, host
 		return false
 	}
 
-	// Resolve the repo's actual default branch FIRST: the targeted
-	// fetch list below needs the real default-branch name to know
-	// what to ask for. Best-effort: if the repo metadata fetch fails
-	// we keep whatever the caller pre-populated (the --branch flag
-	// or empty), and the targeted-fetch loop simply skips an empty
-	// name.
-	if pipeline.DefaultBranch == "" {
-		if def, derr := githubpkg.FetchGitHubDefaultBranch(host, parts[0], parts[1]); derr == nil && def != "" {
-			pipeline.DefaultBranch = def
-		}
-	}
+	// pipeline.DefaultBranch is resolved by the caller (see
+	// resolveGitHubDefaultBranch) before this runs; the targeted-fetch
+	// loop simply skips an empty name when that lookup degraded. An
+	// invisible repo is not detectable from that lookup either
+	// (FetchGitHubDefaultBranch folds 404/401 into a silent empty success
+	// by contract), so the zero-branch probe below owns that case.
 
 	// Build the targeted-fetch set from non-glob patterns plus the
 	// default branch (when defaultMustBeProtected is on). Wildcard
 	// patterns trip the listing fallthrough; on a typical config —
 	// `main`, `master`, `default` — we never list at all.
-	exact := make([]string, 0, len(cfg.NamePatterns)+1)
+	exact := make([]string, 0, len(cfg.NamePatterns))
 	listing := false
 	for _, p := range cfg.NamePatterns {
 		if isBranchGlob(p) {
@@ -108,6 +143,26 @@ func enrichGitHubBranches(l *logrus.Entry, pipeline *ir.NormalizedPipeline, host
 		l.WithError(err).Warn("GitHub branch-protection fetch failed; branchMustBeProtected will see zero branches")
 		return true
 	}
+	if len(branches) == 0 {
+		// Zero branches is ambiguous: legitimately nothing in scope, or
+		// a repo that is nonexistent, renamed, or invisible to the
+		// token, whose per-branch lookups all 404-swallowed (the fetch
+		// correctly treats a 404 as "branch absent" for a real repo).
+		// Disambiguate with the visibility probe: every visible GitHub
+		// repo answers its metadata endpoint. Without this, an
+		// invisible repo reads as a vacuous branch-protection pass
+		// (caught empirically: a scan against an unreachable remote
+		// reported branchMustBeProtected as passed).
+		visible, derr := githubpkg.GitHubRepoVisible(host, parts[0], parts[1])
+		if derr != nil {
+			l.WithError(derr).Warn("GitHub repo visibility probe failed with zero branches fetched; branch protection cannot be evaluated")
+			return true
+		}
+		if !visible {
+			l.Warn("GitHub repo is not visible with the current credentials (nonexistent, renamed, or unauthorized); branch protection cannot be evaluated")
+			return true
+		}
+	}
 	pipeline.Branches = branches
 	return false
 }
@@ -148,6 +203,7 @@ func RunGitHubAnalysis(conf *configuration.Configuration) (*AnalysisResult, erro
 		conf.GitRepoRoot,
 		conf.GithubAPIHost,
 		configuration.ProviderNeedsActionMetadata("github"),
+		shouldScanMutableExec(conf),
 		progressFn,
 	)
 	if err != nil {
@@ -157,6 +213,8 @@ func RunGitHubAnalysis(conf *configuration.Configuration) (*AnalysisResult, erro
 	for _, perr := range partial {
 		l.WithError(perr).Warn("GitHub workflow parse: partial failure (file skipped)")
 	}
+
+	resolveGitHubDefaultBranch(l, pipeline, conf.GithubAPIHost, conf.ProjectPath)
 
 	branchFetchFailed := false
 	if shouldRunControl(controlBranchMustBeProtected, conf) {
@@ -180,32 +238,23 @@ func RunGitHubAnalysis(conf *configuration.Configuration) (*AnalysisResult, erro
 		total := githubpkg.TotalProgressStepsForPipeline(pipeline)
 		conf.ProgressFunc(total-1, total, "Evaluating policies")
 	}
-	defaultBranch := conf.Branch
+	// The forge-resolved default branch is authoritative; conf.Branch is
+	// the branch being ANALYZED and only stands in when the lookup degraded.
+	defaultBranch := pipeline.DefaultBranch
 	if defaultBranch == "" {
-		defaultBranch = pipeline.DefaultBranch
-	}
-	// Optional gitleaks enrichment for pipelineMustNotLeakSecretsInConfig
-	// (ISSUE-301). The scanner abstains silently when the control is
-	// disabled or gitleaks is not installed. Runs only on the local-
-	// clone path where we have on-disk files; the remote path has no
-	// equivalent (workflow contents are fetched into the IR, not
-	// materialised on disk, so gitleaks has nothing to scan).
-	if conf.GitRepoRoot != "" {
-		workflowsDir := filepath.Join(conf.GitRepoRoot, ".github", "workflows")
-		_ = gitlab.ScanGitleaksForGitHub(l, conf, workflowsDir, ".github/workflows", pipeline)
+		defaultBranch = conf.Branch
 	}
 	result := &AnalysisResult{
-		ProjectPath:           conf.ProjectPath,
-		DefaultBranch:         defaultBranch,
-		AnalyzeBranch:         conf.Branch,
-		CIConfigSource:        "local",
-		CiValid:               len(pipeline.Jobs) > 0,
-		CiMissing:             len(pipeline.Jobs) == 0,
-		Findings:              evaluatePolicies(l, conf, "github", pipeline),
-		GitHubStats:           AggregateGitHubStats(pipeline, conf.PlumberConfig),
-		GitHubPipeline:        pipeline,
-		GitleaksAbstainReason: pipeline.GitleaksAbstainReason,
-		Warnings:              pipeline.AdvisoryWarnings,
+		ProjectPath:    conf.ProjectPath,
+		DefaultBranch:  defaultBranch,
+		AnalyzeBranch:  conf.Branch,
+		CIConfigSource: "local",
+		CiValid:        len(pipeline.Jobs) > 0,
+		CiMissing:      len(pipeline.Jobs) == 0,
+		Findings:       evaluatePolicies(l, conf, "github", pipeline),
+		GitHubStats:    AggregateGitHubStats(pipeline, conf.PlumberConfig),
+		GitHubPipeline: pipeline,
+		Warnings:       pipeline.AdvisoryWarnings,
 	}
 	// Local scans read workflow files from disk, so a skipped file is a
 	// parse/read problem (user-fixable), not a degraded collection — only
@@ -259,10 +308,11 @@ func RunGitHubAnalysisRemote(conf *configuration.Configuration, owner, repo, ref
 	if conf.ProgressFunc != nil {
 		progressFn = githubpkg.ProgressFunc(conf.ProgressFunc)
 	}
-	pipeline, partial, err := githubpkg.ScanGitHubWorkflowsRemote(
+	pipeline, partial, err := scanGitHubWorkflowsRemote(
 		conf.GithubAPIHost,
 		owner, repo, ref,
 		configuration.ProviderNeedsActionMetadata("github"),
+		shouldScanMutableExec(conf),
 		progressFn,
 	)
 	if err != nil {
@@ -278,6 +328,8 @@ func RunGitHubAnalysisRemote(conf *configuration.Configuration, owner, repo, ref
 	for _, perr := range partial {
 		l.WithError(perr).Warn("GitHub workflow parse: partial failure (file skipped)")
 	}
+
+	resolveGitHubDefaultBranch(l, pipeline, conf.GithubAPIHost, owner+"/"+repo)
 
 	branchFetchFailed := false
 	if shouldRunControl(controlBranchMustBeProtected, conf) {
@@ -298,9 +350,12 @@ func RunGitHubAnalysisRemote(conf *configuration.Configuration, owner, repo, ref
 		total := githubpkg.TotalProgressStepsForPipeline(pipeline)
 		conf.ProgressFunc(total-1, total, "Evaluating policies")
 	}
-	defaultBranch := ref
+	// Same precedence as the local path: the forge-resolved default branch
+	// wins; ref is the analyzed ref and only stands in when the lookup
+	// degraded.
+	defaultBranch := pipeline.DefaultBranch
 	if defaultBranch == "" {
-		defaultBranch = pipeline.DefaultBranch
+		defaultBranch = ref
 	}
 	result := &AnalysisResult{
 		ProjectPath:    owner + "/" + repo,

@@ -1,5 +1,5 @@
-name: "Plumber Compliance Scanner"
-description: "CI/CD compliance scanner for GitHub Actions workflows and repository settings. Uploads SARIF to Code Scanning."
+name: "Plumber Score"
+description: "Plumber detects CI/CD security issues in your GitHub workflows and gives you a score."
 author: "Plumber (getplumber.io)"
 
 branding:
@@ -8,8 +8,8 @@ branding:
 
 inputs:
   version:
-    description: "Plumber release tag to install (e.g. v0.3.72). Downloaded from GitHub Releases and verified against checksums.txt and SLSA attestation"
-    default: "v0.3.72"
+    description: "Plumber release tag to install (e.g. v0.4.51). Downloaded from GitHub Releases and verified against checksums.txt and SLSA attestation"
+    default: "v0.4.51"
   verify-attestation:
     description: "Verify the downloaded binary's build-provenance attestation (sigstore/SLSA) against the getplumber/plumber release workflow, using the gh CLI. This anchors the binary to a trusted build regardless of the mutable release tag. Disable for air-gapped or GHES setups without attestation access."
     default: "true"
@@ -25,11 +25,17 @@ inputs:
   github-url:
     description: "GitHub Enterprise Server host, e.g. ghes.example.com. Default: github.com."
     default: ""
+  min-points:
+    description: "Minimum Plumber Score points to pass (0-100). Default: 100 — any finding fails, same as the previous default behavior. A repo with no workflows passes when its enabled controls report no findings; the gate only force-fails when zero controls are enabled."
+    default: ""
+  min-score:
+    description: "Minimum Plumber Score letter to pass (A-E), e.g. B fails on C, D, E. When set without min-points, the letter alone gates."
+    default: ""
   threshold:
-    description: "Minimum compliance percentage to pass (0-100)."
-    default: "100"
+    description: "Deprecated: minimum percentage of passing controls (0-100). Use min-points / min-score to gate on the Plumber Score instead. The value 100 is treated as unset (same as the GitLab component): the default score gate also fails on any finding."
+    default: ""
   config-file:
-    description: "Path to a .plumber.yaml config. Default: the repo's .plumber.yaml (required — the run fails if absent; generate one with 'plumber config generate')."
+    description: "Path to a .plumber.yaml config. Default: the repo's .plumber.yaml if present, otherwise the default config embedded in the binary (zero-config runs work out of the box; see it with 'plumber config view')."
     default: ""
   controls:
     description: "Run only these controls (comma-separated). Mutually exclusive with skip-controls."
@@ -38,8 +44,17 @@ inputs:
     description: "Skip these controls (comma-separated). Mutually exclusive with controls."
     default: ""
   score:
-    description: "Include the full Plumber points breakdown. The score is shown by default; set false for the banner without the per-issue-code breakdown."
-    default: "true"
+    description: "Add the full Plumber points breakdown (beta) on top of the score banner. Off by default; set true to also include the per-issue-code breakdown."
+    default: "false"
+  score-push:
+    description: "Publish this repo's Plumber Score to the hosted badge service (score.getplumber.io) via CI-native OIDC (no secret). The calling workflow MUST grant 'permissions: id-token: write' — it cannot be set from inside a composite action."
+    default: "false"
+  score-endpoint:
+    description: "Score service base URL. Override only for a self-hosted score service; the minted OIDC audience follows this value so it always matches the target."
+    default: "https://score.getplumber.io"
+  platform:
+    description: "Plumber platform base URL. Setting it pushes this run's full results there over CI OIDC, and takes precedence over score-push. The calling workflow MUST grant 'permissions: id-token: write'."
+    default: ""
   fail-warnings:
     description: "Fail the run on warnings: unknown configuration keys (exit 2) and 'could not verify' checks such as a skipped known-CVE lookup when an action version cannot be resolved (exit 3). soft-fail does not mask exit 3."
     default: "false"
@@ -54,7 +69,7 @@ inputs:
     default: "true"
   artifact-name:
     description: "Name of the uploaded artifact bundle."
-    default: "plumber-compliance"
+    default: "plumber-report"
   output:
     description: "JSON report output path. Empty to skip."
     default: "plumber-report.json"
@@ -69,11 +84,8 @@ inputs:
     default: "plumber.sarif"
 
 outputs:
-  compliance:
-    description: "Overall compliance percentage from the run."
-    value: ${{ steps.run.outputs.compliance }}
   passed:
-    description: "'true' when compliance is at or above the threshold."
+    description: "'true' when the run met its gate (min-points / min-score, or the deprecated threshold)."
     value: ${{ steps.run.outputs.passed }}
   report:
     description: "Path to the JSON report."
@@ -155,11 +167,16 @@ runs:
         PLUMBER_METADATA_TOKEN: ${{ inputs.metadata-token }}
         IN_PROJECT: ${{ inputs.project }}
         IN_GITHUB_URL: ${{ inputs.github-url }}
+        IN_MIN_POINTS: ${{ inputs.min-points }}
+        IN_MIN_SCORE: ${{ inputs.min-score }}
         IN_THRESHOLD: ${{ inputs.threshold }}
         IN_CONFIG: ${{ inputs.config-file }}
         IN_CONTROLS: ${{ inputs.controls }}
         IN_SKIP_CONTROLS: ${{ inputs.skip-controls }}
         IN_SCORE: ${{ inputs.score }}
+        IN_SCORE_PUSH: ${{ inputs.score-push }}
+        IN_SCORE_ENDPOINT: ${{ inputs.score-endpoint }}
+        IN_PLATFORM: ${{ inputs.platform }}
         IN_FAIL_WARNINGS: ${{ inputs.fail-warnings }}
         IN_OUTPUT: ${{ inputs.output }}
         IN_PBOM: ${{ inputs.pbom }}
@@ -167,7 +184,18 @@ runs:
         IN_SARIF: ${{ inputs.sarif }}
       run: |
         set -uo pipefail
-        args=(analyze --threshold "$IN_THRESHOLD")
+        args=(analyze)
+        # The default gate is the Plumber Score (min-points 100: any finding
+        # fails). threshold is deprecated and only forwarded when set to a
+        # custom value: an explicit 100 is treated as unset and gates on the
+        # score instead (mirrors the GitLab component). A repo with no
+        # workflows passes when its enabled controls report no findings; the
+        # gate only force-fails when zero controls are enabled.
+        [ -n "$IN_MIN_POINTS" ] && args+=(--min-points "$IN_MIN_POINTS")
+        [ -n "$IN_MIN_SCORE" ]  && args+=(--min-score "$IN_MIN_SCORE")
+        if [ -n "$IN_THRESHOLD" ] && [ "$IN_THRESHOLD" != "100" ]; then
+          args+=(--threshold "$IN_THRESHOLD")
+        fi
         if [ -n "$IN_PROJECT" ]; then
           # Remote-fetch: scan an upstream repo via the API (no checkout).
           gh_url="${IN_GITHUB_URL:-github.com}"
@@ -182,21 +210,25 @@ runs:
         [ -n "$IN_CONTROLS" ]       && args+=(--controls "$IN_CONTROLS")
         [ -n "$IN_SKIP_CONTROLS" ]  && args+=(--skip-controls "$IN_SKIP_CONTROLS")
         [ "$IN_SCORE" = "true" ]    && args+=(--score-point)
+        [ "$IN_SCORE_PUSH" = "true" ] && args+=(--score-push)
+        [ -n "$IN_SCORE_ENDPOINT" ] && args+=(--score-endpoint "$IN_SCORE_ENDPOINT")
+        [ -n "$IN_PLATFORM" ] && args+=(--platform "$IN_PLATFORM")
         [ "$IN_FAIL_WARNINGS" = "true" ] && args+=(--fail-warnings)
         [ -n "$IN_OUTPUT" ]         && args+=(--output "$IN_OUTPUT")
         [ -n "$IN_PBOM" ]           && args+=(--pbom "$IN_PBOM")
         [ -n "$IN_PBOM_CDX" ]       && args+=(--pbom-cyclonedx "$IN_PBOM_CDX")
         [ -n "$IN_SARIF" ]          && args+=(--sarif "$IN_SARIF")
 
-        plumber "${args[@]}"
-        code=$?
+        # Composite steps run under `bash -e`; capture the exit code inside an
+        # || list so a gate failure doesn't kill the step before exit_code and
+        # passed are written (the enforce step owns pass/fail).
+        code=0
+        plumber "${args[@]}" || code=$?
         echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
 
-        # Surface compliance / passed as step outputs from the JSON report.
+        # Surface the gate verdict as a step output from the JSON report.
         if [ -n "$IN_OUTPUT" ] && [ -f "$IN_OUTPUT" ]; then
-          comp="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('compliance',''))" "$IN_OUTPUT" 2>/dev/null || true)"
           passed="$(python3 -c "import json,sys;print(str(json.load(open(sys.argv[1])).get('passed','')).lower())" "$IN_OUTPUT" 2>/dev/null || true)"
-          echo "compliance=${comp}" >> "$GITHUB_OUTPUT"
           echo "passed=${passed}" >> "$GITHUB_OUTPUT"
         fi
         exit 0
@@ -206,22 +238,20 @@ runs:
       shell: bash
       env:
         IN_OUTPUT: ${{ inputs.output }}
-        IN_THRESHOLD: ${{ inputs.threshold }}
-        COMPLIANCE: ${{ steps.run.outputs.compliance }}
         PASSED: ${{ steps.run.outputs.passed }}
         EXIT_CODE: ${{ steps.run.outputs.exit_code }}
       run: |
         set -uo pipefail
         {
-          echo "## Plumber compliance"
+          echo "## Plumber"
           echo ""
-          if [ -n "${COMPLIANCE:-}" ]; then
+          if [ -n "${PASSED:-}" ]; then
             status="❌ failed"; [ "${PASSED:-}" = "true" ] && status="✅ passed"
             # A degraded run (exit 3: --fail-warnings + a check that could not be
-            # verified) can still be at/above threshold, so PASSED is "true".
+            # verified) can still meet its gate, so PASSED is "true".
             # Surface it here instead of printing a bare green.
             [ "${EXIT_CODE:-0}" = "3" ] && status="⚠️ could not fully verify (exit 3)"
-            echo "**Compliance:** ${COMPLIANCE}% (threshold ${IN_THRESHOLD}%): ${status}"
+            echo "**Plumber check:** ${status}"
           else
             echo "_Plumber ran; see the job log for the full report._"
           fi
@@ -232,7 +262,13 @@ runs:
         d=json.load(open(sys.argv[1]))
         s=d.get("plumberScore") or {}
         if s:
-            print(f"**Plumber Score:** {s.get('score','?')} ({s.get('finalPoints','?')}/100)")
+            gate=""
+            if d.get("minScore") or d.get("minPoints") is not None:
+                parts=[]
+                if d.get("minPoints") is not None: parts.append(f"≥ {d['minPoints']:g} pts")
+                if d.get("minScore"): parts.append(f"≥ {d['minScore']}")
+                gate=f" — required {' and '.join(parts)}"
+            print(f"**Plumber Score:** {s.get('score','?')} ({s.get('finalPoints','?')}/100){gate}")
             c=s.get('counts',{})
             print("")
             print(f"Critical {c.get('critical',0)} · High {c.get('high',0)} · Medium {c.get('medium',0)} · Low {c.get('low',0)}")
@@ -242,7 +278,7 @@ runs:
 
     - name: Upload SARIF to Code Scanning
       if: ${{ always() && inputs.upload-sarif == 'true' && inputs.sarif != '' && hashFiles(inputs.sarif) != '' }}
-      uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+      uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
       with:
         sarif_file: ${{ inputs.sarif }}
 
@@ -259,12 +295,13 @@ runs:
         if-no-files-found: ignore
         retention-days: 30
 
-    - name: Enforce threshold
+    - name: Enforce gate
       if: ${{ always() }}
       shell: bash
       env:
         EXIT_CODE: ${{ steps.run.outputs.exit_code }}
         SOFT_FAIL: ${{ inputs.soft-fail }}
+        IN_THRESHOLD: ${{ inputs.threshold }}
       run: |
         set -uo pipefail
         code="${EXIT_CODE:-2}"
@@ -279,17 +316,23 @@ runs:
           3)
             # --fail-warnings is on and at least one check could not be
             # verified (e.g. an action version that could not be resolved).
-            # Distinct from a compliance failure; soft-fail does not mask it.
+            # Distinct from a gate failure; soft-fail does not mask it.
             echo "::error::Plumber could not verify one or more checks and fail-warnings is enabled (exit 3). See the 'Could not verify' warnings in the analyze step log."
             exit 1
             ;;
           1)
-            # Compliance below threshold.
+            # Gate failure: the Plumber Score gate (min-points / min-score),
+            # or the deprecated threshold gate when that input is set to a
+            # custom value (100 is treated as unset, see the analyze step).
+            gate="The Plumber Score is below the configured gate (min-points / min-score)."
+            if [ -n "${IN_THRESHOLD:-}" ] && [ "${IN_THRESHOLD}" != "100" ]; then
+              gate="The percentage of passing controls is below the deprecated threshold input (migrate to min-points / min-score)."
+            fi
             if [ "$SOFT_FAIL" = "true" ]; then
-              echo "::warning::Compliance is below the threshold, but soft-fail is enabled."
+              echo "::warning::${gate} soft-fail is enabled, not failing the job."
               exit 0
             fi
-            echo "::error::Compliance is below the configured threshold."
+            echo "::error::${gate}"
             exit 1
             ;;
           *)

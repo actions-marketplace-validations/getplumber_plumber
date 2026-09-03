@@ -10,7 +10,10 @@
 #
 # Two ruled cases:
 #   1. Pinned ref is a SHA, comment names a version, the version
-#      resolves to a different SHA. The classic mismatch.
+#      resolves to a different SHA. The classic mismatch. A pin naming
+#      the annotated tag OBJECT of the commented version is NOT a
+#      mismatch: the collector records the commit it dereferences to in
+#      refCommitSha and the rule compares that too (ISSUE-401).
 #   2. Pinned ref is a tag, the comment names a different version.
 #      Caught by string comparison; the API data is not needed here
 #      so the rule still fires in degraded (offline) mode.
@@ -29,14 +32,25 @@ deny contains finding if {
 	action.metadata
 	action.metadata.commentVersion != ""
 	action.metadata.commentTagSha != ""
-	ref := _ref_of(action.uses)
+	# SHAs are case-insensitive in git / the API; lowercase both the
+	# match and the comparison so an uppercase pin is handled like its
+	# lowercase equivalent (API SHAs are lowercase hex).
+	ref := lower(_ref_of(action.uses))
 	regex.match(sha_pattern, ref)
 	action.metadata.commentTagSha != ref
+	# A pin can name the annotated tag OBJECT rather than the commit
+	# that tag points at (ISSUE-401). The collector records the
+	# dereferenced commit in refCommitSha, and commentTagSha is always a
+	# dereferenced commit, so the two must be compared before calling
+	# the comment a lie.
+	action.metadata.commentTagSha != _ref_commit_sha(action)
 	finding := {
 		"code":     "ISSUE-708",
 		"severity": "medium",
 		"message":  sprintf("job %q pins %q but comment %q names tag %q which resolves to %q — reviewers will misread the version", [job.name, action.uses, action.comment, action.metadata.commentVersion, action.metadata.commentTagSha]),
 		"job":      job.name,
+		"uses":     action.uses,
+		"comment":  action.comment,
 		"line":     object.get(action, "line", 0),
 	}
 }
@@ -57,9 +71,16 @@ deny contains finding if {
 		"severity": "medium",
 		"message":  sprintf("job %q pins tag %q with comment %q — ref and comment name different versions", [job.name, action.uses, action.comment]),
 		"job":      job.name,
+		"uses":     action.uses,
+		"comment":  action.comment,
 		"line":     object.get(action, "line", 0),
 	}
 }
+
+# _ref_commit_sha is the commit a tag-object pin dereferences to,
+# lowercased. Defaults to "" (never equal to a non-empty commentTagSha)
+# for every other ref shape, so the comparison above is a no-op there.
+_ref_commit_sha(action) := lower(object.get(action.metadata, "refCommitSha", ""))
 
 _ref_of(uses) := ref if {
 	idx := indexof(uses, "@")

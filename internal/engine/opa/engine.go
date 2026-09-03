@@ -14,12 +14,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
 
 	"github.com/open-policy-agent/opa/v1/rego"
 
+	"github.com/getplumber/plumber/finding/identity"
 	"github.com/getplumber/plumber/internal/ir"
 )
 
@@ -45,8 +48,13 @@ type Finding struct {
 	// host forge; locally it is the absolute filesystem path with the
 	// :line suffix that VS Code / iTerm recognise as a source reference.
 	// Empty when no useful link can be built (missing file/line, etc.).
-	URL  string         `json:"-"`
-	Data map[string]any `json:"-"`
+	URL string `json:"-"`
+	// Fingerprint is a stable, line-independent identifier for this finding,
+	// stamped once by StampFingerprints so every output format carries the same
+	// value and a consumer can track the same finding across runs even as line
+	// numbers drift. Empty until stamped, and for codeless findings.
+	Fingerprint string         `json:"-"`
+	Data        map[string]any `json:"-"`
 }
 
 // MarshalJSON flattens the canonical fields and the Data payload into
@@ -79,7 +87,95 @@ func (f Finding) MarshalJSON() ([]byte, error) {
 	if f.URL != "" {
 		out["url"] = f.URL
 	}
+	if f.Fingerprint != "" {
+		out["fingerprint"] = f.Fingerprint
+	}
 	return json.Marshal(out)
+}
+
+// Identity returns the finding's identity field set: the fields the shared
+// recipe selects as identifying this one finding instance across runs, as data.
+// ok is false for a codeless finding, which has no identity.
+//
+// The selection lives in finding/identity because Plumber is not its only
+// consumer: a platform grouping findings into long-lived issues needs the same
+// answer, and a second list maintained alongside this one would drift.
+func (f Finding) Identity() (identity.Fields, bool) {
+	return identity.Of(f.identityInput())
+}
+
+// identityInput projects a finding onto the view the recipe reads. Line and URL
+// are not passed on: they move whenever unrelated code above the finding is
+// edited, and the whole point of the fingerprint is to survive that drift.
+func (f Finding) identityInput() identity.Finding {
+	return identity.Finding{
+		Code:    f.Code,
+		File:    f.File,
+		Job:     f.Job,
+		Message: f.Message,
+		Data:    f.Data,
+	}
+}
+
+// computeFingerprint hashes the identity field set above into the short, stable
+// identifier every output format carries. It is the same selection, so the
+// fingerprint and the platform's grouping key can never disagree about which
+// findings are the same finding. Codeless findings get no fingerprint.
+func computeFingerprint(f Finding) string {
+	return identity.Fingerprint(f.identityInput())
+}
+
+// repoRelative rewrites an absolute path recorded by a collector into a
+// repository-relative, forward-slashed one, relative to root. The GitHub
+// collector stores absolute paths rooted at the repository (not the
+// process's working directory — see StampFingerprints), and Finding.File is
+// one of the hashed identity segments, so leaving it raw makes the same
+// finding hash differently on a laptop and on a runner. Paths already
+// relative pass through unchanged. A path outside root (or an empty root) is
+// left alone: there is no correct relative form for it, and an unstable
+// identity is still better than a wrong path.
+func repoRelative(file, root string) string {
+	file = strings.TrimPrefix(file, "./")
+	if file == "" || !filepath.IsAbs(file) {
+		return filepath.ToSlash(file)
+	}
+	if root == "" {
+		return filepath.ToSlash(file)
+	}
+	rel, err := filepath.Rel(root, file)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return filepath.ToSlash(file)
+	}
+	return filepath.ToSlash(rel)
+}
+
+// StampFingerprints sets Fingerprint on every finding in place. Along the
+// way it also rewrites File in place to a repository-relative path (see
+// repoRelative), because the fingerprint is computed from the (possibly
+// just-rewritten) File — so both mutations are part of this call's contract,
+// not just the one named in the function's own name. Call it once, after
+// findings are finalized, so all output writers read the same File and
+// Fingerprint values.
+//
+// root is the repository root absolute File paths should be relativized
+// against. Pass the collector's own root (e.g. conf.GitRepoRoot) rather than
+// the process's current working directory: a collector that walks a
+// configured repo root (the GitHub collector walks conf.GitRepoRoot) keeps
+// recording paths relative to that root regardless of which subdirectory
+// Plumber was invoked from, and relativizing against os.Getwd() instead would
+// make the fingerprint depend on the invocation directory again — reopening
+// the machine-dependence problem this function exists to close. When root is
+// unknown, pass "" and StampFingerprints falls back to os.Getwd().
+func StampFingerprints(findings []Finding, root string) {
+	if root == "" {
+		if wd, err := os.Getwd(); err == nil {
+			root = wd
+		}
+	}
+	for i := range findings {
+		findings[i].File = repoRelative(findings[i].File, root)
+		findings[i].Fingerprint = computeFingerprint(findings[i])
+	}
 }
 
 // UnmarshalJSON splits an incoming flat object into the canonical
@@ -101,6 +197,10 @@ func (f *Finding) UnmarshalJSON(b []byte) error {
 	if v, ok := raw["message"].(string); ok {
 		f.Message = v
 		delete(raw, "message")
+	}
+	if v, ok := raw["fingerprint"].(string); ok {
+		f.Fingerprint = v
+		delete(raw, "fingerprint")
 	}
 	if v, ok := raw["job"].(string); ok {
 		f.Job = v
@@ -141,20 +241,16 @@ func (e *Engine) LoadModule(name, source string) {
 	e.modules[name] = source
 }
 
-// LoadFromFS loads every .rego file at the root of fsys. The module's
-// logical name is the file's base name without its extension. Nested
-// subdirectories are ignored for now; the concern-based layout lands
-// with the first real policies in Phase 2.
-func (e *Engine) LoadFromFS(fsys fs.FS) error {
-	return e.LoadFromFSFiltered(fsys, nil)
-}
-
-// LoadFromFSFiltered is LoadFromFS with an optional skip predicate.
-// When skip is non-nil and returns true for a (filename, content)
-// pair, that file is excluded from the engine — it never executes,
-// never produces findings, never costs evaluation time. Used to
-// gate dev-side benched policies out of production runs without
-// touching the policy files themselves.
+// LoadFromFSFiltered loads every .rego file at the root of fsys. The
+// module's logical name is the file's base name without its extension.
+// Nested subdirectories are ignored.
+//
+// skip is an optional predicate: when it is non-nil and returns true
+// for a (filename, content) pair, that file is excluded from the
+// engine — it never executes, never produces findings, never costs
+// evaluation time. Used to gate dev-side benched policies out of
+// production runs without touching the policy files themselves. Pass
+// nil to load everything.
 func (e *Engine) LoadFromFSFiltered(fsys fs.FS, skip func(filename string, content []byte) bool) error {
 	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
@@ -178,6 +274,22 @@ func (e *Engine) LoadFromFSFiltered(fsys fs.FS, skip func(filename string, conte
 		e.LoadModule(strings.TrimSuffix(fileName, ".rego"), string(content))
 	}
 	return nil
+}
+
+// FindingsObserver, when non-nil, receives every finding slice Evaluate
+// returns. It exists for the identity harness in policies_test, which must
+// see every emission the test suite produces to prove each control keeps
+// emitting the fields its declared identity depends on. Production code never
+// sets it; the harness sets it in TestMain before m.Run and clears it after,
+// so the write happens-before every read and no lock is needed. It is a
+// settable var rather than a Set* function so the whole-program deadcode gate
+// (make deadcode) does not read a test-only setter as unreachable.
+var FindingsObserver func([]Finding)
+
+func notifyFindingsObserver(fs []Finding) {
+	if FindingsObserver != nil {
+		FindingsObserver(fs)
+	}
 }
 
 // Evaluate runs every loaded policy against pipeline and returns the
@@ -214,6 +326,7 @@ func (e *Engine) Evaluate(ctx context.Context, pipeline *ir.NormalizedPipeline, 
 	}
 	enrichFindingsWithJobLocation(findings, pipeline)
 	sortFindingsInPlace(findings)
+	notifyFindingsObserver(findings)
 	return findings, nil
 }
 
@@ -284,6 +397,26 @@ func enrichFindingsWithJobLocation(findings []Finding, pipeline *ir.NormalizedPi
 		job, ok := byName[f.Job]
 		if !ok {
 			continue
+		}
+		// Resolve the step name for action-level findings. Rules emit the
+		// action's own `uses:` line, so matching on it is exact within this
+		// scan; what gets stored is the step NAME, which (unlike the line)
+		// survives edits above it. Two steps in the same job referencing the
+		// same action are otherwise indistinguishable, so this is what keeps
+		// their fingerprints apart. Runs before the Line fallback below so a
+		// job-level finding never matches an action by the job header line.
+		if f.Line != 0 {
+			for k := range job.Uses {
+				if job.Uses[k].Line == f.Line && job.Uses[k].Name != "" {
+					if f.Data == nil {
+						f.Data = map[string]any{}
+					}
+					if _, has := f.Data["step"]; !has {
+						f.Data["step"] = job.Uses[k].Name
+					}
+					break
+				}
+			}
 		}
 		if f.File == "" {
 			f.File = job.OriginFile

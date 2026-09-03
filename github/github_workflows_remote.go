@@ -27,7 +27,7 @@ import (
 // remote mode — controls that depend on them simply see absent
 // inputs and produce no findings. Same degraded-mode contract as
 // missing API auth elsewhere.
-func ScanGitHubWorkflowsRemote(host, owner, repo, ref string, enrichActionMetadata bool, progressFn ProgressFunc) (*ir.NormalizedPipeline, []error, error) {
+func ScanGitHubWorkflowsRemote(host, owner, repo, ref string, enrichActionMetadata, scanMutableExec bool, progressFn ProgressFunc) (*ir.NormalizedPipeline, []error, error) {
 	if owner == "" || repo == "" {
 		return nil, nil, fmt.Errorf("owner and repo are required for remote scan")
 	}
@@ -36,6 +36,14 @@ func ScanGitHubWorkflowsRemote(host, owner, repo, ref string, enrichActionMetada
 		Provider:      ir.ProviderGitHub,
 		ProjectPath:   owner + "/" + repo,
 		DefaultBranch: ref,
+	}
+
+	// Producer-side check: if the scanned repo is itself an action whose
+	// own source fetches mutable remote code, flag it (fetched over raw).
+	// Gated on the control being active so a disabled control performs no
+	// network fetch of the repo's own action source.
+	if scanMutableExec && host == "" {
+		pipeline.SelfActionMutableExec = ScanRemoteSelfAction(owner, repo, ref)
 	}
 
 	rest, err := newGitHubRESTClient(host)
@@ -105,7 +113,7 @@ func ScanGitHubWorkflowsRemote(host, owner, repo, ref string, enrichActionMetada
 		// and can switch to the grand total. wrapProgressRemote maps
 		// the enrichment's local 1..M counter into global slots
 		// (2+N)..(1+N+M).
-		enrichActionsWithAPIMetadata(pipeline, host, wrapProgressRemote(progressFn, pipeline))
+		enrichActionsWithAPIMetadata(pipeline, host, scanMutableExec, wrapProgressRemote(progressFn, pipeline))
 	}
 
 	return pipeline, partialErrors, nil

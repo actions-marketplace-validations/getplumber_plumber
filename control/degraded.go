@@ -55,6 +55,29 @@ func markDegraded(result *AnalysisResult, reason string) {
 	result.DegradedReasons = append(result.DegradedReasons, reason)
 }
 
+// degradedReasonBranchProtectionPrefix is the shared prefix of every
+// branch-protection-fetch degraded reason, on both providers. It is the
+// compile-time contract between the two writers below / in task.go and
+// the StatusFor classifier (degradedReasonIsBranchProtection): rewording
+// a reason without keeping this prefix would silently break per-control
+// status classification, so both writers build their strings from it.
+const degradedReasonBranchProtectionPrefix = "branch protection could not be fetched"
+
+// degradedReasonVariablesPrefix is the shared prefix of the settings-variable
+// fetch degraded reason. Like the branch-protection prefix, it is the
+// compile-time contract between task.go (the writer) and StatusFor's
+// degradedReasonIsVariables classifier, so a network failure fetching the
+// variables listing degrades only the two variable controls rather than
+// flipping every unrelated CI-file control to error.
+const degradedReasonVariablesPrefix = "CI/CD variables could not be fetched"
+
+// degradedReasonSecurityPolicyPrefix is the shared prefix of the
+// security-policy-linkage fetch degraded reason. Same contract as the two
+// above: a transient network failure on the GraphQL read degrades the run so a
+// blip cannot read as a clean exit-0 pass, while the carve-out in StatusFor
+// keeps every unrelated control from flipping to error over it.
+const degradedReasonSecurityPolicyPrefix = "security policy project could not be fetched"
+
 // degradedReasonsFromGitHubCollection builds the human-readable list of
 // collection failures behind a degraded GitHub run (#220). partialCount
 // is the number of workflow files that could not be fetched/parsed and
@@ -67,7 +90,7 @@ func degradedReasonsFromGitHubCollection(partialCount int, branchFetchFailed boo
 		reasons = append(reasons, fmt.Sprintf("%d workflow file(s) could not be fetched and were skipped", partialCount))
 	}
 	if branchFetchFailed {
-		reasons = append(reasons, "branch protection could not be fetched; branch controls were not evaluated")
+		reasons = append(reasons, degradedReasonBranchProtectionPrefix+"; branch controls were not evaluated")
 	}
 	return reasons
 }
